@@ -1,0 +1,21 @@
+[package]
+name = "rustqueue-queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rustqueue-storage = { path = "../storage" }
+rustqueue-protocol = { path = "../protocol" }
+
+[dev-dependencies]
+tempfile.workspace = true

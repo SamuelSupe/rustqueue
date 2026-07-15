@@ -1,0 +1,94 @@
+services:
+  auth:
+    image: python:3.12-slim
+    command: ["python", "/work/server.py"]
+    volumes:
+      - ../tests/compat/auth/server.py:/work/server.py:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4181/health', timeout=1)"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+
+  rustqueue-plain:
+    image: rustqueue:dev
+    command: ["--config", "/etc/rustqueue/rustqueue.toml"]
+    volumes:
+      - ../tests/compat/config/plain.toml:/etc/rustqueue/rustqueue.toml:ro
+      - plain-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4151/v1/health"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  rustqueue-1:
+    image: rustqueue:dev
+    command: ["--config", "/etc/rustqueue/rustqueue.toml"]
+    depends_on:
+      auth:
+        condition: service_healthy
+    volumes:
+      - ../tests/compat/config/secure.toml:/etc/rustqueue/rustqueue.toml:ro
+      - ./dev-certs:/certs:ro
+      - secure-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4151/v1/health"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  go-core:
+    image: golang:1.26-alpine
+    profiles: ["tests"]
+    environment:
+      GOTOOLCHAIN: local
+    working_dir: /work
+    command: ["go", "run", ".", "core", "rustqueue-plain:4150", "rustqueue-plain:4151"]
+    volumes:
+      - ../tests/compat/go:/work:ro
+
+  go-secure:
+    image: golang:1.26-alpine
+    profiles: ["tests"]
+    environment:
+      GOTOOLCHAIN: local
+    working_dir: /work
+    command:
+      - go
+      - run
+      - .
+      - secure
+      - rustqueue-1:4150
+      - rustqueue-1:4151
+      - /certs/ca.pem
+      - /certs/node-1.pem
+      - /certs/node-1.key
+      - rustqueue-1
+    volumes:
+      - ../tests/compat/go:/work:ro
+      - ./dev-certs:/certs:ro
+
+  python-core:
+    image: python:3.12-slim
+    profiles: ["tests"]
+    working_dir: /work
+    command: ["sh", "-c", "pip install -q --disable-pip-version-check --root-user-action=ignore -r requirements.txt && python main.py core rustqueue-plain:4150 rustqueue-plain:4151"]
+    volumes:
+      - ../tests/compat/python:/work:ro
+
+  python-secure:
+    image: python:3.12-slim
+    profiles: ["tests"]
+    working_dir: /work
+    command:
+      - sh
+      - -c
+      - pip install -q --disable-pip-version-check --root-user-action=ignore -r requirements.txt && python main.py secure rustqueue-1:4150 rustqueue-1:4151 /certs/ca.pem /certs/node-1.pem /certs/node-1.key
+    volumes:
+      - ../tests/compat/python:/work:ro
+      - ./dev-certs:/certs:ro
+
+volumes:
+  plain-data:
+  secure-data:

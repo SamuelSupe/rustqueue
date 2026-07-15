@@ -1,0 +1,25 @@
+log_format = "text"
+
+[node]
+id = 1
+broadcast_address = "rustqueue-plain"
+
+[network]
+tcp_address = "0.0.0.0:4150"
+http_address = "0.0.0.0:4151"
+advertised_tcp_port = 4150
+advertised_http_port = 4151
+
+[storage]
+data_path = "/data"
+
+[queue]
+default_partitions = 2
+
+[limits]
+heartbeat_interval_ms = 1000
+output_buffer_size = 16384
+max_output_buffer_size = 65536
+output_buffer_timeout_ms = 250
+min_output_buffer_timeout_ms = 25
+max_output_buffer_timeout_ms = 30000

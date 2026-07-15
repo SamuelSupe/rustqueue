@@ -1,0 +1,10 @@
+RustQueue Operator is installed in {{ .Release.Namespace }}.
+{{- if .Values.cluster.create }}
+
+Watch the cluster become Ready:
+  kubectl -n {{ .Release.Namespace }} get rustqueuecluster {{ .Values.cluster.name }} -w
+
+In-cluster NSQ endpoints:
+  TCP:  {{ .Values.cluster.name }}.{{ .Release.Namespace }}.svc:4150
+  HTTP: http://{{ .Values.cluster.name }}.{{ .Release.Namespace }}.svc:4151
+{{- end }}

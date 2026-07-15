@@ -1,0 +1,63 @@
+services:
+  rustqueue-1:
+    image: rustqueue:bench
+    cpus: 2
+    mem_limit: 2g
+    command: ["--config", "/etc/rustqueue.toml"]
+    hostname: rustqueue-1
+    ports: ["17150:4150", "17151:4151"]
+    volumes:
+      - benchmark-1:/data
+      - ./dev-certs:/certs:ro
+      - ./generated/5/node-1.toml:/etc/rustqueue.toml:ro
+  rustqueue-2:
+    image: rustqueue:bench
+    cpus: 2
+    mem_limit: 2g
+    command: ["--config", "/etc/rustqueue.toml"]
+    hostname: rustqueue-2
+    ports: ["18150:4150", "18151:4151"]
+    volumes:
+      - benchmark-2:/data
+      - ./dev-certs:/certs:ro
+      - ./generated/5/node-2.toml:/etc/rustqueue.toml:ro
+  rustqueue-3:
+    image: rustqueue:bench
+    cpus: 2
+    mem_limit: 2g
+    command: ["--config", "/etc/rustqueue.toml"]
+    hostname: rustqueue-3
+    ports: ["19150:4150", "19151:4151"]
+    volumes:
+      - benchmark-3:/data
+      - ./dev-certs:/certs:ro
+      - ./generated/5/node-3.toml:/etc/rustqueue.toml:ro
+  rustqueue-4:
+    image: rustqueue:bench
+    cpus: 2
+    mem_limit: 2g
+    command: ["--config", "/etc/rustqueue.toml"]
+    hostname: rustqueue-4
+    ports: ["20150:4150", "20151:4151"]
+    volumes:
+      - benchmark-4:/data
+      - ./dev-certs:/certs:ro
+      - ./generated/5/node-4.toml:/etc/rustqueue.toml:ro
+  rustqueue-5:
+    image: rustqueue:bench
+    cpus: 2
+    mem_limit: 2g
+    command: ["--config", "/etc/rustqueue.toml"]
+    hostname: rustqueue-5
+    ports: ["21150:4150", "21151:4151"]
+    volumes:
+      - benchmark-5:/data
+      - ./dev-certs:/certs:ro
+      - ./generated/5/node-5.toml:/etc/rustqueue.toml:ro
+
+volumes:
+  benchmark-1:
+  benchmark-2:
+  benchmark-3:
+  benchmark-4:
+  benchmark-5:

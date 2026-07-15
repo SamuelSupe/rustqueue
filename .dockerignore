@@ -1,0 +1,8 @@
+.git
+target
+fuzz/corpus
+fuzz/artifacts
+data
+certs
+benchmarks/results
+.DS_Store

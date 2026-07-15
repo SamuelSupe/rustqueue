@@ -1,0 +1,126 @@
+log_format = "text"
+
+[node]
+id = 1
+broadcast_address = "127.0.0.1"
+
+[network]
+tcp_address = "0.0.0.0:4150"
+http_address = "0.0.0.0:4151"
+internal_address = "0.0.0.0:4250"
+advertised_tcp_port = 4150
+advertised_http_port = 4151
+snappy_enabled = true
+deflate_enabled = true
+max_deflate_level = 6
+
+[storage]
+data_path = "/data"
+max_segment_bytes = 104857600
+scrub_interval_seconds = 3600
+entry_cache_bytes = 67108864
+payload_read_workers = 0
+payload_read_queue = 4096
+dedup_max_entries = 1000000
+dedup_ttl_seconds = 600
+disk_high_watermark_percent = 85
+disk_low_watermark_percent = 75
+min_free_bytes = 10737418240
+# After throttling and migration have had this long to recover space, the
+# cluster may quorum-evict one oldest complete segment per reconciliation.
+protective_eviction_enabled = true
+disk_pressure_grace_seconds = 60
+
+[queue]
+default_partitions = 4
+max_partitions_per_topic = 1024
+# Raise up to 33554432 for workloads that need 10-20 MiB messages.
+max_message_bytes = 1048576
+message_timeout_ms = 60000
+max_message_timeout_ms = 900000
+max_defer_ms = 3600000
+max_ack_gap = 65536
+max_backlog_messages_per_partition = 10000000
+# 0 disables age-based expiration. Expired or repeatedly failed messages are
+# quorum-published to a per-channel DLQ before the source FIN is committed.
+message_retention_seconds = 0
+max_delivery_attempts = 16
+dead_letter_suffix = ".DLQ"
+
+[limits]
+# Aggregate MPUB/HTTP request limit; the hard maximum is 64 MiB.
+max_body_bytes = 67108864
+node_publish_inflight_bytes = 536870912
+connection_publish_inflight_bytes = 67108864
+max_rdy_count = 2500
+max_connections = 10000
+client_handshake_timeout_ms = 5000
+heartbeat_interval_ms = 30000
+max_heartbeat_interval_ms = 60000
+output_buffer_size = 16384
+max_output_buffer_size = 65536
+output_buffer_timeout_ms = 250
+min_output_buffer_timeout_ms = 25
+max_output_buffer_timeout_ms = 30000
+auth_response_bytes = 1048576
+auth_timeout_ms = 5000
+auth_max_ttl_seconds = 3600
+auth_cache_max_entries = 10000
+
+[cluster]
+enabled = false
+bootstrap = false
+name = "rustqueue"
+initial_voters = []
+snapshot_max_bytes = 536870912
+default_replication_factor = 3
+metadata_replication_factor = 3
+
+[cluster.federation]
+# Federation removes the global node-count ceiling by keeping partition Raft
+# groups inside bounded 3-9 node Cells. Every configured Cell member must set
+# the same cell_id in its cluster.nodes entry. In 0.6 this enables the
+# Cell-scoped data plane, independent Root/Catalog Raft groups, transparent
+# cross-Cell forwarding, and the recoverable partition migration executor.
+enabled = false
+cell_id = 1
+root_voters = []
+# Required once more than one Cell is present. Ranges are Root grants and must
+# be identical in every node's static bootstrap config, non-overlapping, and
+# never reassigned before the old Cell's message lifetime has fully ended.
+max_home_cells_per_topic = 128
+route_cache_ms = 5000
+retry_after_ms = 1000
+cell_min_nodes = 3
+cell_target_nodes = 5
+cell_max_nodes = 9
+routers_per_cell = 3
+catalog_state_split_bytes = 268435456
+catalog_topic_split_count = 100000
+catalog_ops_split_per_second = 5000
+catalog_apply_p99_split_ms = 50
+
+[cluster.discovery]
+enabled = false
+listen_address = "/ip4/0.0.0.0/tcp/4350"
+seed_addresses = []
+mdns = true
+join_token_file = "/run/secrets/rustqueue-discovery-token"
+announce_interval_seconds = 15
+max_known_peers = 128
+
+[cluster.automation]
+enabled = true
+poll_interval_seconds = 15
+node_stabilization_seconds = 60
+node_down_grace_seconds = 600
+group_cooldown_seconds = 600
+max_concurrent_migrations = 2
+max_migrations_per_node = 1
+auto_replace_metadata = true
+operation_history_limit = 1000
+
+[cluster.shutdown]
+grace_seconds = 30
+maintenance_default_ttl_seconds = 1800
+maintenance_max_ttl_seconds = 86400

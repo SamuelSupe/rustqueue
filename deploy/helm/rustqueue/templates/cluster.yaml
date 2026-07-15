@@ -1,0 +1,64 @@
+{{- if .Values.cluster.create }}
+apiVersion: rustqueue.io/v1alpha1
+kind: RustQueueCluster
+metadata:
+  name: {{ .Values.cluster.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rustqueue.labels" . | nindent 4 }}
+spec:
+  image: {{ .Values.cluster.image | quote }}
+  imagePullPolicy: {{ .Values.cluster.imagePullPolicy }}
+  storage:
+    className: {{ .Values.cluster.storage.className | quote }}
+    size: {{ .Values.cluster.storage.size | quote }}
+    retainOnDelete: {{ .Values.cluster.storage.retainOnDelete }}
+    minFreeBytes: {{ .Values.cluster.storage.minFreeBytes }}
+    diskHighWatermarkPercent: {{ .Values.cluster.storage.diskHighWatermarkPercent }}
+    diskLowWatermarkPercent: {{ .Values.cluster.storage.diskLowWatermarkPercent }}
+    protectiveEvictionEnabled: {{ .Values.cluster.storage.protectiveEvictionEnabled }}
+  nodes:
+    selector:
+      {{- toYaml .Values.cluster.nodes.selector | nindent 6 }}
+    dedicated: {{ .Values.cluster.nodes.dedicated }}
+    taintKey: {{ .Values.cluster.nodes.taintKey | quote }}
+    failureDomainLabel: {{ .Values.cluster.nodes.failureDomainLabel | quote }}
+    autoScaleFromNodes: {{ .Values.cluster.nodes.autoScaleFromNodes }}
+    {{- if ne .Values.cluster.nodes.replicas nil }}
+    replicas: {{ .Values.cluster.nodes.replicas }}
+    {{- end }}
+  cells:
+    minNodes: {{ .Values.cluster.cells.minNodes }}
+    targetNodes: {{ .Values.cluster.cells.targetNodes }}
+    maxNodes: {{ .Values.cluster.cells.maxNodes }}
+    routersPerCell: {{ .Values.cluster.cells.routersPerCell }}
+    maxHomeCellsPerTopic: {{ .Values.cluster.cells.maxHomeCellsPerTopic }}
+  replication:
+    metadata: {{ .Values.cluster.replication.metadata }}
+    partitions: {{ .Values.cluster.replication.partitions }}
+  queue:
+    defaultPartitions: {{ .Values.cluster.queue.defaultPartitions }}
+    maxPartitionsPerTopic: {{ .Values.cluster.queue.maxPartitionsPerTopic }}
+    maxMessageBytes: {{ .Values.cluster.queue.maxMessageBytes }}
+    maxBodyBytes: {{ .Values.cluster.queue.maxBodyBytes }}
+    maxBacklogMessagesPerPartition: {{ .Values.cluster.queue.maxBacklogMessagesPerPartition }}
+    messageRetentionSeconds: {{ .Values.cluster.queue.messageRetentionSeconds }}
+    maxDeliveryAttempts: {{ .Values.cluster.queue.maxDeliveryAttempts }}
+  security:
+    caValidityDays: {{ .Values.cluster.security.caValidityDays }}
+    certificateValidityDays: {{ .Values.cluster.security.certificateValidityDays }}
+    renewBeforeDays: {{ .Values.cluster.security.renewBeforeDays }}
+  upgrade:
+    automatic: {{ .Values.cluster.upgrade.automatic }}
+    maxUnavailablePerCell: {{ .Values.cluster.upgrade.maxUnavailablePerCell }}
+    progressDeadlineSeconds: {{ .Values.cluster.upgrade.progressDeadlineSeconds }}
+    retryGeneration: {{ .Values.cluster.upgrade.retryGeneration }}
+  resources:
+    cpuRequest: {{ .Values.cluster.resources.cpuRequest | quote }}
+    memoryRequest: {{ .Values.cluster.resources.memoryRequest | quote }}
+    cpuLimit: {{ .Values.cluster.resources.cpuLimit | quote }}
+    memoryLimit: {{ .Values.cluster.resources.memoryLimit | quote }}
+  development:
+    allowSingleNode: {{ .Values.cluster.development.allowSingleNode }}
+    virtualReplicas: {{ .Values.cluster.development.virtualReplicas }}
+{{- end }}

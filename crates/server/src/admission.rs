@@ -1,0 +1,133 @@
+use crate::metrics::Metrics;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const PERMIT_BYTES: usize = 4096;
+
+pub struct PublishAdmission {
+    permits: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
+}
+
+pub struct ConnectionBudget {
+    permits: Arc<Semaphore>,
+}
+
+pub struct PublishReservation {
+    bytes: usize,
+    metrics: Arc<Metrics>,
+    _node: OwnedSemaphorePermit,
+    _connection: Option<OwnedSemaphorePermit>,
+}
+
+impl std::fmt::Debug for PublishReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishReservation")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublishAdmission {
+    pub fn new(capacity_bytes: usize, metrics: Arc<Metrics>) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(units(capacity_bytes))),
+            metrics,
+        }
+    }
+
+    pub fn try_reserve(&self, bytes: usize) -> Option<PublishReservation> {
+        self.try_reserve_inner(bytes, None)
+    }
+
+    pub fn try_reserve_connection(
+        &self,
+        bytes: usize,
+        connection: &ConnectionBudget,
+    ) -> Option<PublishReservation> {
+        let connection = match connection.try_acquire(bytes) {
+            Some(permit) => Some(permit),
+            None => {
+                self.record_rejected(bytes);
+                return None;
+            }
+        };
+        self.try_reserve_inner(bytes, connection)
+    }
+
+    fn try_reserve_inner(
+        &self,
+        bytes: usize,
+        connection: Option<OwnedSemaphorePermit>,
+    ) -> Option<PublishReservation> {
+        let count = u32::try_from(units(bytes)).ok()?;
+        let node = match Arc::clone(&self.permits).try_acquire_many_owned(count) {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.record_rejected(bytes);
+                return None;
+            }
+        };
+        self.metrics
+            .publish_inflight_bytes
+            .fetch_add(bytes as i64, Ordering::Relaxed);
+        Some(PublishReservation {
+            bytes,
+            metrics: Arc::clone(&self.metrics),
+            _node: node,
+            _connection: connection,
+        })
+    }
+
+    fn record_rejected(&self, bytes: usize) {
+        self.metrics
+            .publish_throttled_requests
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .publish_throttled_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+impl ConnectionBudget {
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(units(capacity_bytes))),
+        }
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let count = u32::try_from(units(bytes)).ok()?;
+        Arc::clone(&self.permits).try_acquire_many_owned(count).ok()
+    }
+}
+
+impl Drop for PublishReservation {
+    fn drop(&mut self) {
+        self.metrics
+            .publish_inflight_bytes
+            .fetch_sub(self.bytes as i64, Ordering::Relaxed);
+    }
+}
+
+fn units(bytes: usize) -> usize {
+    bytes.max(1).div_ceil(PERMIT_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_is_bounded_by_bytes_and_releases_on_drop() {
+        let metrics = Arc::new(Metrics::default());
+        let admission = PublishAdmission::new(8192, Arc::clone(&metrics));
+        let first = admission.try_reserve(5000).unwrap();
+        assert!(admission.try_reserve(4096).is_none());
+        assert_eq!(metrics.publish_inflight_bytes.load(Ordering::Relaxed), 5000);
+        drop(first);
+        assert!(admission.try_reserve(8192).is_some());
+    }
+}

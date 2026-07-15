@@ -1,0 +1,52 @@
+[package]
+name = "rustqueue-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flate2 = "1"
+snap = "1"
+rustqueue-consensus = { path = "../crates/consensus" }
+rustqueue-protocol = { path = "../crates/protocol" }
+rustqueue-storage = { path = "../crates/storage" }
+serde_json = "1"
+
+[[bin]]
+name = "protocol"
+path = "fuzz_targets/protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_record"
+path = "fuzz_targets/storage_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_manifest"
+path = "fuzz_targets/snapshot_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compression"
+path = "fuzz_targets/compression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topology_operation"
+path = "fuzz_targets/topology_operation.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+    "crates/storage",
+    "crates/queue",
+    "crates/consensus",
+    "crates/server",
+    "crates/bench",
+    "crates/operator",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0.95"
+async-compression = { version = "0.4.42", features = ["tokio", "deflate"] }
+flate2 = "1.1"
+async-trait = "0.1.85"
+axum = "0.8.1"
+axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+bincode = "1.3.3"
+bytes = { version = "1.9.0", features = ["serde"] }
+clap = { version = "4.5.26", features = ["derive", "env"] }
+crc32c = "0.6.8"
+futures = "0.3.31"
+hex = "0.4.3"
+libc = "0.2.186"
+hdrhistogram = "7.5.4"
+hmac = "0.12.1"
+libp2p = { version = "=0.56.0", default-features = false, features = [
+    "cbor",
+    "dns",
+    "ed25519",
+    "gossipsub",
+    "identify",
+    "kad",
+    "macros",
+    "mdns",
+    "noise",
+    "ping",
+    "request-response",
+    "tcp",
+    "tokio",
+    "yamux",
+] }
+openraft = { version = "=0.9.24", features = ["serde", "storage-v2"] }
+parking_lot = "0.12.3"
+pin-project-lite = "0.2.16"
+rand = "0.8.5"
+regex = "1.11.1"
+reqwest = { version = "0.12.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
+rustls = "0.23.21"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.217", features = ["derive", "rc"] }
+serde_json = "1.0.137"
+sha2 = "0.10.8"
+tempfile = "3.15.0"
+thiserror = "2.0.11"
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-rustls = "0.26.1"
+tokio-snappy = "0.2.0"
+toml = "0.8.19"
+tower = "0.5.2"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+uuid = { version = "1.12.1", features = ["v4", "serde"] }
+x509-parser = "0.17.0"
+k8s-openapi = { version = "0.28.0", features = ["v1_33", "schemars"] }
+kube = { version = "4.0.0", features = ["derive", "runtime"] }
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
+schemars = "1.0.4"
+serde_yaml = "0.9.34"
+time = { version = "0.3.41", features = ["formatting"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

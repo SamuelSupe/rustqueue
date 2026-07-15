@@ -1,0 +1,129 @@
+use super::*;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::BufWriter;
+
+pub(super) struct ClientWriter {
+    inner: BufWriter<WriteHalf<BoxIo>>,
+    buffering: bool,
+    dirty: bool,
+}
+
+impl ClientWriter {
+    pub fn new(inner: WriteHalf<BoxIo>, output_buffer_size: usize) -> Self {
+        let buffering = output_buffer_size > 1;
+        Self {
+            inner: BufWriter::with_capacity(output_buffer_size.max(1), inner),
+            buffering,
+            dirty: false,
+        }
+    }
+
+    pub async fn write_message_parts(&mut self, header: &[u8], body: &[u8]) -> anyhow::Result<()> {
+        self.write_all(header).await?;
+        self.write_all(body).await?;
+        if !self.buffering {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.dirty
+    }
+
+    pub async fn flush_pending(&mut self) -> anyhow::Result<()> {
+        if self.dirty {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+impl AsyncWrite for ClientWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match Pin::new(&mut self.inner).poll_write(context, buffer) {
+            Poll::Ready(Ok(written)) => {
+                self.dirty |= written > 0;
+                Poll::Ready(Ok(written))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match Pin::new(&mut self.inner).poll_flush(context) {
+            Poll::Ready(Ok(())) => {
+                self.dirty = false;
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn buffers_messages_until_flushed() {
+        let (mut peer, server) = tokio::io::duplex(1024);
+        let io: BoxIo = Box::new(server);
+        let (_, write) = tokio::io::split(io);
+        let mut writer = ClientWriter::new(write, 128);
+
+        writer.write_message_parts(b"", b"message").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), peer.read_u8())
+                .await
+                .is_err()
+        );
+
+        writer.flush_pending().await.unwrap();
+        let mut received = [0; 7];
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"message");
+    }
+
+    #[tokio::test]
+    async fn disabled_buffering_flushes_each_message() {
+        let (mut peer, server) = tokio::io::duplex(1024);
+        let io: BoxIo = Box::new(server);
+        let (_, write) = tokio::io::split(io);
+        let mut writer = ClientWriter::new(write, 1);
+
+        writer.write_message_parts(b"", b"message").await.unwrap();
+        let mut received = [0; 7];
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"message");
+    }
+
+    #[tokio::test]
+    async fn writes_message_header_and_body_without_a_combined_buffer() {
+        let (mut peer, server) = tokio::io::duplex(1024);
+        let io: BoxIo = Box::new(server);
+        let (_, write) = tokio::io::split(io);
+        let mut writer = ClientWriter::new(write, 1);
+
+        writer.write_message_parts(b"head", b"body").await.unwrap();
+        let mut received = [0; 8];
+        peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"headbody");
+    }
+}

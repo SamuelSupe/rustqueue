@@ -1,0 +1,56 @@
+log_format = "text"
+[node]
+id = 2
+broadcast_address = "host.docker.internal"
+[network]
+tcp_address = "0.0.0.0:4150"
+http_address = "0.0.0.0:4151"
+internal_address = "0.0.0.0:4250"
+advertised_tcp_port = 5150
+advertised_http_port = 5151
+[storage]
+data_path = "/data"
+max_segment_bytes = 104857600
+[queue]
+default_partitions = 4
+max_ack_gap = 65536
+[security.internal_tls]
+certificate_file = "/certs/node-2.pem"
+private_key_file = "/certs/node-2.key"
+client_ca_file = "/certs/ca.pem"
+root_ca_file = "/certs/ca.pem"
+require_client_certificate = true
+required = true
+[cluster]
+enabled = true
+bootstrap = false
+name = "rustqueue-dev"
+default_replication_factor = 3
+metadata_replication_factor = 3
+[cluster.discovery]
+enabled = true
+listen_address = "/ip4/0.0.0.0/tcp/4350"
+seed_addresses = ["/dns4/rustqueue-1/tcp/4350"]
+mdns = false
+join_token_file = "/certs/discovery.token"
+[cluster.nodes.1]
+raft_address = "https://rustqueue-1:4250"
+broadcast_address = "host.docker.internal"
+tcp_port = 4150
+http_port = 4151
+tls_server_name = "rustqueue-1"
+failure_domain = "zone-1"
+[cluster.nodes.2]
+raft_address = "https://rustqueue-2:4250"
+broadcast_address = "host.docker.internal"
+tcp_port = 5150
+http_port = 5151
+tls_server_name = "rustqueue-2"
+failure_domain = "zone-2"
+[cluster.nodes.3]
+raft_address = "https://rustqueue-3:4250"
+broadcast_address = "host.docker.internal"
+tcp_port = 6150
+http_port = 6151
+tls_server_name = "rustqueue-3"
+failure_domain = "zone-3"

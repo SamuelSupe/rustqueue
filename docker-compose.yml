@@ -1,0 +1,22 @@
+services:
+  rustqueue:
+    image: rustqueue:dev
+    build: .
+    command: ["--config", "/etc/rustqueue/rustqueue.toml"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "4150:4150"
+      - "4151:4151"
+    volumes:
+      - rustqueue-data:/data
+      - ./rustqueue.example.toml:/etc/rustqueue/rustqueue.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4151/v1/health"]
+      interval: 2s
+      timeout: 1s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  rustqueue-data:

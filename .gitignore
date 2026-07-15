@@ -1,0 +1,18 @@
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/.docker-bin
+/data
+/.env
+*.pem
+*.key
+*.crt
+*.prof
+deploy/dev-certs/
+deploy/generated/
+benchmarks/results/
+.DS_Store
+/.workflow/
+/README 2.md
+* 2.rs
