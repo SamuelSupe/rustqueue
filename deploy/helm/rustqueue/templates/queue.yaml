@@ -14,6 +14,7 @@ spec:
   eligibleNodeSelector: {{ .Values.queue.eligibleNodeSelector | quote }}
   storageClassName: {{ .Values.queue.storageClassName | quote }}
   storageSize: {{ .Values.queue.storageSize | quote }}
+  storageFeatureLevel: {{ .Values.queue.storageFeatureLevel }}
   minFreeBytes: {{ .Values.queue.minFreeBytes | int64 }}
   diskHighWatermarkPercent: {{ .Values.queue.diskHighWatermarkPercent }}
   diskLowWatermarkPercent: {{ .Values.queue.diskLowWatermarkPercent }}

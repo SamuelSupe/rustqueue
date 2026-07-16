@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 const QUEUE_CAPACITY: usize = 1024;
@@ -37,6 +37,7 @@ struct PublishRequest {
     bodies: Vec<Bytes>,
     delay: Duration,
     encoded_bytes: usize,
+    enqueued_at: Instant,
     reply: oneshot::Sender<PublishResult>,
 }
 
@@ -87,6 +88,7 @@ impl Broker {
     where
         B: Into<Bytes> + Send + 'static,
     {
+        let _ack_timer = self.inner.metrics.publish_ack.timer();
         self.ensure_storage_healthy()?;
         let bodies: Vec<Bytes> = bodies.into_iter().map(Into::into).collect();
         let encoded_bytes = self.validate_publish_request(topic, &bodies)?;
@@ -97,6 +99,7 @@ impl Broker {
                 bodies,
                 delay,
                 encoded_bytes,
+                enqueued_at: Instant::now(),
                 reply,
             })
             .await
@@ -132,9 +135,14 @@ impl Broker {
             let PublishRequest {
                 bodies,
                 delay,
+                enqueued_at,
                 reply,
                 ..
             } = request;
+            self.inner
+                .metrics
+                .group_commit_wait
+                .observe(enqueued_at.elapsed());
             match self.append_publish_to_topic(&mut topic_state, &bodies, delay, false) {
                 Ok(ids) => pending.push(PendingPublish { ids, reply }),
                 Err(error) if is_storage_error(&error) => {
@@ -154,12 +162,18 @@ impl Broker {
         if pending.is_empty() {
             return;
         }
-        if let Err(error) = topic_state.sync_log() {
+        rustqueue_storage::crash_failpoint("publish_after_append_before_fsync");
+        let sync_result = {
+            let _timer = self.inner.metrics.fsync.timer();
+            topic_state.sync_log()
+        };
+        if let Err(error) = sync_result {
             self.observe_storage_result::<()>(Err(copy_error(&error)))
                 .ok();
             fail_pending(pending);
             return;
         }
+        rustqueue_storage::crash_failpoint("publish_after_fsync_before_reply");
         drop(topic_state);
         self.inner.publish_groups.record(pending.len());
         handle.signal();
@@ -285,6 +299,7 @@ mod tests {
             bodies: Vec::new(),
             delay: Duration::ZERO,
             encoded_bytes,
+            enqueued_at: Instant::now(),
             reply,
         }
     }

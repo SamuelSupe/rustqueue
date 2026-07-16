@@ -292,7 +292,8 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
 
 fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
     let mut output = format!(
-        "[storage]\ndata_path = \"/data\"\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_backlog_messages = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\n# secret: {secret_name}\n",
+        "[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_backlog_messages = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\n# secret: {secret_name}\n",
+        cluster.spec.storage_feature_level,
         cluster.spec.min_free_bytes,
         cluster.spec.disk_high_watermark_percent,
         cluster.spec.disk_low_watermark_percent,
@@ -363,6 +364,7 @@ mod tests {
                 eligible_node_selector: "rustqueue.io/eligible=true".into(),
                 storage_class_name: "ssd".into(),
                 storage_size: "100Gi".into(),
+                storage_feature_level: 1,
                 min_free_bytes: 1024,
                 disk_high_watermark_percent: 85,
                 disk_low_watermark_percent: 75,

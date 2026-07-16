@@ -27,6 +27,8 @@ pub struct RustQueueSpec {
     pub storage_class_name: String,
     #[serde(default = "default_storage_size")]
     pub storage_size: String,
+    #[serde(default = "default_storage_feature_level")]
+    pub storage_feature_level: u32,
     #[serde(default = "default_min_free_bytes")]
     pub min_free_bytes: u64,
     #[serde(default = "default_disk_high_watermark")]
@@ -61,6 +63,7 @@ pub struct RustQueueStatus {
     pub ready_brokers: i32,
     pub phase: String,
     pub message: String,
+    pub active_storage_feature_level: u32,
 }
 
 fn default_min_brokers() -> i32 {
@@ -80,6 +83,9 @@ fn default_storage_class() -> String {
 }
 fn default_storage_size() -> String {
     "100Gi".into()
+}
+fn default_storage_feature_level() -> u32 {
+    1
 }
 fn default_min_free_bytes() -> u64 {
     10 * 1024 * 1024 * 1024

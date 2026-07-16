@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+crash-injection = ["rustqueue-storage/crash-injection"]
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
@@ -17,6 +21,8 @@ thiserror.workspace = true
 tokio.workspace = true
 rustqueue-storage = { path = "../storage" }
 rustqueue-protocol = { path = "../protocol" }
+rustqueue-telemetry.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 tempfile.workspace = true

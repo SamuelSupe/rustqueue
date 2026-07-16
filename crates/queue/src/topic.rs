@@ -6,7 +6,7 @@ mod maintenance;
 use crate::batch::{self, EncodedBatch};
 use crate::channel::{ChannelCommand, ChannelRuntime, ChannelState};
 use crate::channel_store::{checkpoint_paths, ChannelStore};
-use crate::metadata::{load_optional, store_atomic, TopicManifest};
+use crate::metadata::{load_topic_manifest, store_atomic, TopicManifest};
 use crate::model::MessageMeta;
 use crate::BrokerError;
 use parking_lot::Mutex;
@@ -39,12 +39,14 @@ impl TopicHandle {
         max_segment_bytes: u64,
         max_backlog_messages: usize,
         max_ack_gap: usize,
+        storage_feature_level: u32,
     ) -> Result<Arc<Self>, BrokerError> {
         let mut topic = Topic::open(
             directory,
             max_segment_bytes,
             max_backlog_messages,
             max_ack_gap,
+            storage_feature_level,
         )?;
         let (wake, _) = tokio::sync::watch::channel(0);
         topic.recover_channels()?;
@@ -60,6 +62,7 @@ impl TopicHandle {
         max_segment_bytes: u64,
         max_backlog_messages: usize,
         max_ack_gap: usize,
+        storage_feature_level: u32,
     ) -> Result<Arc<Self>, BrokerError> {
         std::fs::create_dir_all(directory.join("segments"))?;
         std::fs::create_dir_all(directory.join("channels"))?;
@@ -71,7 +74,12 @@ impl TopicHandle {
             next_position: 1,
         };
         store_atomic(&directory.join("manifest"), &manifest)?;
-        let log = SegmentLog::open(directory.join("segments"), max_segment_bytes)?;
+        let log = SegmentLog::open_with_feature_level(
+            directory.join("segments"),
+            max_segment_bytes,
+            1,
+            storage_feature_level,
+        )?;
         let (wake, _) = tokio::sync::watch::channel(0);
         Ok(Arc::new(Self {
             state: Mutex::new(Topic {
@@ -101,16 +109,22 @@ impl Topic {
         max_segment_bytes: u64,
         max_backlog_messages: usize,
         max_ack_gap: usize,
+        storage_feature_level: u32,
     ) -> Result<Self, BrokerError> {
         let manifest_path = directory.join("manifest");
-        let mut manifest: TopicManifest = load_optional(&manifest_path)?
+        let mut manifest: TopicManifest = load_topic_manifest(&manifest_path)?
             .ok_or_else(|| BrokerError::InvalidRecord("topic manifest is missing".into()))?;
         if manifest.format != 7 || manifest.deleted {
             return Err(BrokerError::InvalidRecord(
                 "topic manifest is not an active v7 topic".into(),
             ));
         }
-        let log = SegmentLog::open(directory.join("segments"), max_segment_bytes)?;
+        let log = SegmentLog::open_with_feature_level(
+            directory.join("segments"),
+            max_segment_bytes,
+            1,
+            storage_feature_level,
+        )?;
         let mut messages = VecDeque::new();
         let mut expected_position = None;
         for location in log.locations().to_vec() {

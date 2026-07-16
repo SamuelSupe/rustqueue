@@ -109,14 +109,20 @@ For a functional validation on local OrbStack Kubernetes:
 
 ```sh
 make k8s-acceptance
+make k8s-multi-acceptance
 ```
 
-The acceptance uses one real OrbStack node and validates the operator,
-StatefulSet/PVC attachment, discovery, proxy, official Go client behavior, Pod
-restart with the same PVC, durable backlog recovery, and the safety gate that
-refuses to roll the only broker. A synthetic unit fixture separately covers
-discovery indexing for 500 brokers; multi-node drain behavior is covered by
-controller tests rather than a fake same-node topology.
+The first acceptance validates the operator, StatefulSet/PVC attachment,
+discovery, proxy, official Go client behavior, Pod restart with the same PVC,
+durable backlog recovery, and the safety gate that refuses to roll the only
+broker. The second runs three real broker Pods with three independent RWO PVCs,
+first proves that an unsupported storage feature is blocked without replacing
+a Pod, then publishes and consumes through discovery during an image rollout.
+The acknowledged-message ledger must finish with `missing=0`. OrbStack has one
+physical node, so this test uses capacity-only Kubernetes Node objects and
+test-only direct Pod placement; production anti-affinity is unchanged. A unit
+fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
+load test is part of the functional gate.
 
 ## Disk pressure
 
@@ -154,26 +160,40 @@ Native broker endpoints:
 
 - `GET /v1/health`
 - `GET /v1/registry`
+- `GET /v1/capabilities`
 - `GET|POST /v1/drain`
 - `GET /v1/stats`
 - `POST /v1/storage/scrub`
 - `GET /metrics`
 
 Discovery serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, `/info`,
-`/v1/publishers`, and `/v1/health`.
+`/v1/publishers`, `/v1/health`, and `/metrics`. The producer proxy also exposes
+`/metrics` on its HTTP listener.
+
+Latency histograms cover durable fsync, group-commit queueing, publish ACK,
+payload reads, scrub/GC, proxy backend calls, and discovery registry polling.
 
 ## Storage and upgrades
 
 Format v7 is a clean break. A v6 or older directory is refused; there is no
-in-place migration. Within v7, record tags and existing fields are append-only
-so adjacent v7 binaries can be rolled one broker at a time. The operator drains
-the highest outdated ordinal before deleting its Pod, and retained PVC identity
-is preserved.
+in-place migration. Within v7, record tags and existing fields are append-only.
+Every binary declares its reader/writer feature range, and every PVC persists
+its active writer and minimum reader levels in `/data/COMPATIBILITY`. The
+operator probes the target image and every running broker before replacement;
+an incompatible target is blocked before a PVC is touched.
+
+Adding a record kind is a two-step rollout: first roll the capable binary to all
+brokers, then explicitly increase `storageFeatureLevel`. The storage layer
+rejects writes above the active feature level. Once activated, the PVC rollback
+fence rejects a binary that cannot read the enabled level, so recovery is a
+forward upgrade instead of an unsafe rollback. The operator still drains and
+replaces one broker at a time while preserving retained PVC identity.
 
 The on-disk layout is:
 
 ```text
 /data/FORMAT
+/data/COMPATIBILITY
 /data/broker.meta
 /data/topics/<hex-topic>/manifest
 /data/topics/<hex-topic>/segments/*.rqlog
@@ -185,6 +205,17 @@ The on-disk layout is:
 
 Tail short writes are truncated during startup. A complete CRC-corrupt record,
 middle corruption, invalid channel WAL or identity mismatch fails closed.
+
+Crash-boundary integration tests stop worker processes with actual `SIGKILL`
+after append, fsync-before-ACK, checkpoint file fsync-before-rename, and GC
+delete boundaries. Reopened stores are checked against an acknowledged-message
+ledger; ambiguous pre-ACK writes may duplicate, but acknowledged entries may
+not be missing. Injection code is available only under the compile-time
+`crash-injection` test feature and is absent from normal release behavior.
+
+The fuzz smoke matrix covers protocol, compression, storage records, channel
+WAL/checkpoint replay, topic manifests, proxy HTTP metadata, and discovery
+registry responses.
 
 ## Non-goals
 

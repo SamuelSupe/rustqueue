@@ -12,6 +12,25 @@ import (
 
 func main() {
 	mode := argument(1, "core")
+	if mode == "operational-ledger" {
+		if len(os.Args) != 6 {
+			log.Fatal("operational-ledger mode requires proxy HTTP, lookup HTTP, duration seconds, and minimum brokers")
+		}
+		durationSeconds, err := strconv.Atoi(os.Args[4])
+		if err != nil || durationSeconds <= 0 {
+			log.Fatal("operational ledger duration must be a positive integer")
+		}
+		minimumBrokers, err := strconv.Atoi(os.Args[5])
+		if err != nil || minimumBrokers <= 0 {
+			log.Fatal("operational ledger minimum brokers must be a positive integer")
+		}
+		if err := runOperationalLedger(
+			os.Args[2], os.Args[3], time.Duration(durationSeconds)*time.Second, minimumBrokers,
+		); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if mode == "ledger" {
 		if len(os.Args) != 7 {
 			log.Fatal("ledger mode requires lookup, topic, channel, expected file, and timeout seconds")

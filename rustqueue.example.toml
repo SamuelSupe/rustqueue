@@ -15,6 +15,7 @@ max_deflate_level = 6
 
 [storage]
 data_path = "/data"
+feature_level = 1
 max_segment_bytes = 104857600
 scrub_interval_seconds = 3600
 entry_cache_bytes = 67108864

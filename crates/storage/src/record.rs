@@ -31,6 +31,14 @@ impl TryFrom<u8> for RecordKind {
     }
 }
 
+impl RecordKind {
+    pub const fn required_writer_feature_level(self) -> u32 {
+        match self {
+            Self::PublishBatch | Self::EvictionGap | Self::Noop => 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub kind: RecordKind,

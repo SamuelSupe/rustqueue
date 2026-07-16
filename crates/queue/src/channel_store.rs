@@ -1,5 +1,5 @@
 use crate::channel::{ChannelCheckpoint, ChannelCommand, ChannelState};
-use crate::metadata::store_bytes_atomic;
+use crate::metadata::store_bytes_atomic_with_failpoint;
 use crate::BrokerError;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -118,7 +118,9 @@ impl ChannelStore {
     fn append_bytes(&mut self, header: &[u8], body: &[u8]) -> Result<(), BrokerError> {
         self.wal.write_all(header)?;
         self.wal.write_all(body)?;
+        rustqueue_storage::crash_failpoint("channel_after_wal_append_before_fsync");
         self.wal.sync_data()?;
+        rustqueue_storage::crash_failpoint("channel_after_wal_fsync_before_return");
         Ok(())
     }
 
@@ -184,11 +186,20 @@ fn write_checkpoint(path: &Path, checkpoint: &ChannelCheckpoint) -> Result<(), B
     bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&crc32c::crc32c(&body).to_be_bytes());
     bytes.extend_from_slice(&body);
-    store_bytes_atomic(path, &bytes).map_err(Into::into)
+    store_bytes_atomic_with_failpoint(
+        path,
+        &bytes,
+        Some("checkpoint_after_file_fsync_before_rename"),
+    )
+    .map_err(Into::into)
 }
 
 fn read_checkpoint(path: &Path) -> Result<ChannelCheckpoint, BrokerError> {
     let bytes = fs::read(path)?;
+    parse_checkpoint(&bytes)
+}
+
+fn parse_checkpoint(bytes: &[u8]) -> Result<ChannelCheckpoint, BrokerError> {
     if bytes.len() < HEADER_LEN || &bytes[0..4] != CHECKPOINT_MAGIC {
         return Err(BrokerError::InvalidRecord(
             "channel checkpoint header is invalid".into(),
@@ -205,6 +216,45 @@ fn read_checkpoint(path: &Path) -> Result<ChannelCheckpoint, BrokerError> {
     }
     serde_json::from_slice(&bytes[HEADER_LEN..])
         .map_err(|error| BrokerError::InvalidRecord(error.to_string()))
+}
+
+pub(crate) fn fuzz_channel_state(checkpoint: &[u8], wal: &[u8]) {
+    let Ok(checkpoint) = parse_checkpoint(checkpoint) else {
+        return;
+    };
+    let Ok(mut state) = ChannelState::from_checkpoint(checkpoint, 65_536) else {
+        return;
+    };
+    let mut offset = 0usize;
+    while wal.len().saturating_sub(offset) >= HEADER_LEN {
+        let header = &wal[offset..offset + HEADER_LEN];
+        if &header[0..4] != WAL_MAGIC {
+            return;
+        }
+        let len = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+        if len > MAX_COMMAND_BYTES {
+            return;
+        }
+        let Some(end) = offset
+            .checked_add(HEADER_LEN)
+            .and_then(|value| value.checked_add(len))
+        else {
+            return;
+        };
+        if end > wal.len() {
+            return;
+        }
+        let body = &wal[offset + HEADER_LEN..end];
+        if crc32c::crc32c(body) != u32::from_be_bytes(header[8..12].try_into().unwrap()) {
+            return;
+        }
+        let Ok(command) = decode_command(body) else {
+            return;
+        };
+        state.apply(&command);
+        offset = end;
+    }
+    let _ = state.checkpoint();
 }
 
 fn recover_wal(path: &Path) -> Result<Vec<ChannelCommand>, BrokerError> {

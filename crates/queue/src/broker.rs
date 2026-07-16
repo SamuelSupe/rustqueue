@@ -5,13 +5,19 @@ mod io;
 #[path = "broker/maintenance.rs"]
 mod maintenance;
 
-use crate::metadata::{load_optional, store_atomic, topic_directory, BrokerMeta, TopicManifest};
+use crate::metadata::{
+    load_optional, load_topic_manifest, store_atomic, topic_directory, BrokerMeta,
+};
 use crate::model::BrokerStats;
 use crate::payload_reader::PayloadReader;
+use crate::telemetry::QueueMetrics;
 use crate::topic::TopicHandle;
 use parking_lot::{Mutex, RwLock};
 use rustqueue_protocol::validate_name;
-use rustqueue_storage::{ensure_data_format, StorageError};
+use rustqueue_storage::{
+    binary_capabilities, ensure_data_format, prepare_compatibility, BinaryCapabilities,
+    CompatibilityState, StorageError, BASE_STORAGE_FEATURE_LEVEL,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,6 +38,7 @@ pub struct BrokerConfig {
     pub entry_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
+    pub storage_feature_level: u32,
 }
 
 impl Default for BrokerConfig {
@@ -48,6 +55,7 @@ impl Default for BrokerConfig {
             entry_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
+            storage_feature_level: BASE_STORAGE_FEATURE_LEVEL,
         }
     }
 }
@@ -104,6 +112,8 @@ struct BrokerInner {
     registry_revision: AtomicU64,
     storage_healthy: AtomicBool,
     publish_groups: group_commit::PublishGroups,
+    metrics: QueueMetrics,
+    compatibility: CompatibilityState,
 }
 
 struct SequenceState {
@@ -119,6 +129,8 @@ impl Broker {
             ));
         }
         ensure_data_format(&config.data_path)
+            .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
+        let compatibility = prepare_compatibility(&config.data_path, config.storage_feature_level)
             .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
         let topics_root = config.data_path.join("topics");
         std::fs::create_dir_all(&topics_root)?;
@@ -143,10 +155,12 @@ impl Broker {
                 meta
             }
         };
+        let metrics = QueueMetrics::default();
         let payload_reader = PayloadReader::new(
             config.entry_cache_bytes,
             config.payload_read_workers,
             config.payload_read_queue,
+            Arc::clone(&metrics.payload_read),
         );
         let mut topics = HashMap::new();
         for entry in std::fs::read_dir(&topics_root)? {
@@ -154,7 +168,7 @@ impl Broker {
             if !entry.file_type()?.is_dir() || !entry.path().join("manifest").exists() {
                 continue;
             }
-            let manifest: TopicManifest = load_optional(&entry.path().join("manifest"))?
+            let manifest = load_topic_manifest(&entry.path().join("manifest"))?
                 .ok_or_else(|| BrokerError::InvalidRecord("topic manifest disappeared".into()))?;
             if manifest.deleted {
                 std::fs::remove_dir_all(entry.path())?;
@@ -165,6 +179,7 @@ impl Broker {
                 config.max_segment_bytes,
                 config.max_backlog_messages,
                 config.max_ack_gap,
+                compatibility.active_writer_feature_level,
             )?;
             let name = handle.state.lock().name.clone();
             topics.insert(name, handle);
@@ -188,10 +203,16 @@ impl Broker {
                 registry_revision: AtomicU64::new(revision),
                 storage_healthy: AtomicBool::new(true),
                 publish_groups: group_commit::PublishGroups::default(),
+                metrics,
+                compatibility,
             }),
         };
         broker.recover_outbox()?;
         Ok(broker)
+    }
+
+    pub fn capabilities(&self) -> (BinaryCapabilities, CompatibilityState) {
+        (binary_capabilities(), self.inner.compatibility.clone())
     }
 
     pub async fn create_topic(&self, name: &str) -> Result<(), BrokerError> {
@@ -333,6 +354,7 @@ impl Broker {
         topics.sort_by(|left, right| left.name.cmp(&right.name));
         BrokerStats {
             publish_group_commit: self.inner.publish_groups.stats(),
+            latency: self.inner.metrics.snapshot(),
             topics,
         }
     }
@@ -395,6 +417,7 @@ impl Broker {
             self.inner.config.max_segment_bytes,
             self.inner.config.max_backlog_messages,
             self.inner.config.max_ack_gap,
+            self.inner.compatibility.active_writer_feature_level,
         )?;
         topics.insert(name.into(), Arc::clone(&topic));
         drop(topics);

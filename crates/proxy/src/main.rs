@@ -1,10 +1,12 @@
 mod backend;
 mod discovery;
 mod http;
+mod metrics;
 mod tcp;
 
 use backend::BackendPool;
 use clap::Parser;
+use metrics::ProxyMetrics;
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -63,9 +65,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("proxy limits must be non-zero and inflight bytes must fit u32");
     }
     let pool = BackendPool::default();
+    let metrics = ProxyMetrics::default();
     tokio::select! {
-        result = discovery::run(pool.clone(), cli.discovery_urls) => result,
-        result = tcp::serve(cli.tcp_address, pool.clone(), cli.max_connections) => result,
-        result = http::serve(cli.http_address, pool, cli.max_body_bytes, cli.max_inflight_bytes) => result,
+        result = discovery::run(pool.clone(), cli.discovery_urls, metrics.clone()) => result,
+        result = tcp::serve(cli.tcp_address, pool.clone(), cli.max_connections, metrics.clone()) => result,
+        result = http::serve(cli.http_address, pool, cli.max_body_bytes, cli.max_inflight_bytes, metrics) => result,
     }
 }

@@ -37,6 +37,7 @@ pub async fn run_refresh_loop(directory: Directory, config: RefreshConfig) -> an
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        let _refresh_timer = directory.metrics().refresh.timer();
         match api.list(&ListParams::default().labels(&selector)).await {
             Ok(slices) => {
                 let endpoints = endpoints_from_slices(&slices.items, config.fallback_http_port);
@@ -95,8 +96,10 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
         let http = http.clone();
         let token = config.registry_token.clone();
         let permits = Arc::clone(&permits);
+        let metrics = directory.metrics().clone();
         polls.push(async move {
             let _permit = permits.acquire_owned().await.ok()?;
+            let _timer = metrics.registry_poll.timer();
             let mut request = http.get(endpoint.registry_url());
             if let Some(token) = token {
                 request = request.bearer_auth(token);

@@ -173,6 +173,7 @@ audited administrative action.
 ```text
 /data/
   FORMAT
+  COMPATIBILITY
   broker.meta
   topics/
     <encoded-topic>/
@@ -268,12 +269,26 @@ clock, and admission health only; it has no cluster-wide dependency.
 
 - v7 does not read v6 directories or snapshots.
 - v7 record tags and existing fields are append-only.
-- Adjacent v7 releases must read all prior v7 records.
-- Features that emit a new record type remain disabled until the operator has
-  observed every broker running a compatible binary.
-- Activation is explicit configuration, not distributed feature negotiation.
-- After activation, rollback to an incompatible binary is rejected; recovery
-  proceeds by forward upgrade.
+- Every binary exposes its data format and minimum-reader, maximum-reader, and
+  maximum-writer feature levels through `--capabilities-output` and the
+  authenticated `/v1/capabilities` endpoint.
+- Every PVC atomically persists its active writer feature, minimum required
+  reader feature, and generation in `/data/COMPATIBILITY`.
+- Before changing a Pod, the operator runs the target image as a capability
+  probe and polls every current broker. A format mismatch, unsupported desired
+  feature, or target binary behind a PVC fence blocks the rollout.
+- Every record kind declares the feature level required to write it, and the
+  segment append path rejects records above the PVC's active writer feature.
+- A new record kind therefore uses a two-step release: roll a binary capable of
+  reading it to every broker, then explicitly raise `storageFeatureLevel`.
+  Activation is configuration, not distributed feature negotiation.
+- After activation, the durable minimum-reader fence rejects an incompatible
+  binary on startup. Rollback is allowed only while it remains compatible;
+  otherwise recovery proceeds by forward upgrade.
+
+Unknown record kinds continue to fail closed. Safety comes from preventing any
+such kind from being emitted until all old readers have left the fleet, rather
+than from skipping data that an old binary cannot interpret.
 
 ## 8. Removed v6 architecture
 
@@ -294,10 +309,13 @@ No feature flag may restore the v6 mode.
 
 The implementation is complete only when all of the following pass:
 
-1. Acknowledged publishes survive kill boundaries after append/fsync and before
-   response while the PVC remains intact.
-2. Acknowledged FIN/REQ survive kill boundaries around WAL append/fsync and
-   checkpoint replacement.
+1. A child process is stopped with actual `SIGKILL` at append-before-fsync and
+   fsync-before-response boundaries. After reopen, an acknowledged-message
+   ledger has `missing=0`; the pre-response write may be redelivered.
+2. Actual `SIGKILL` at channel WAL append/fsync and checkpoint
+   file-fsync-before-rename boundaries preserves durable FIN/REQ semantics.
+   GC delete boundaries reopen successfully without losing acknowledged live
+   records.
 3. Tail corruption truncates safely; middle corruption isolates the topic.
 4. A new fallback owner is discovered and subscribed within 5 seconds, and the
    30-second bootstrap ledger has `missing=0` with duplicates reported.
@@ -306,15 +324,25 @@ The implementation is complete only when all of the following pass:
 6. Broker restart reattaches its PVC and resumes its local backlog.
 7. StatefulSet scale-up follows eligible nodes; scale-down blocks until the
    highest ordinal drains to zero.
-8. Controller tests cover drain-aware, one-at-a-time adjacent-v7 rolling and
-   refusal to replace a lone broker. OrbStack verifies that lone-broker safety
-   gate and PVC reattachment; a real multi-node rolling exercise belongs to
-   production release qualification rather than this functional gate.
+8. Controller tests cover capability preflight, rollback fences, drain-aware
+   one-at-a-time rolling, and refusal to replace a lone broker. OrbStack runs
+   three actual broker Pods with independent RWO PVCs through a complete image
+   rollout while an official Go-client ledger publishes and consumes through
+   proxy and lookup. It requires `missing=0`, zero publish errors, and three
+   consumer connections. Before rolling, it requests an unsupported feature
+   level and proves preflight blocks without changing any broker Pod UID. The
+   single-node test topology is not evidence of failure-domain behavior.
 9. Disk admission, DLQ outbox recovery, scrub, and protective eviction tests
    pass.
 10. OrbStack Kubernetes functional acceptance passes. A real 500-node cluster
     is not required; discovery behavior is tested with synthetic endpoint and
     registry fixtures representing 500 brokers.
+11. Prometheus histograms expose fsync, group-commit wait, publish ACK, payload
+    read, scrub/GC, proxy backend, and discovery polling latency without
+    per-topic or per-broker cardinality.
+12. Fuzz targets cover protocol and compression plus storage record, channel
+    WAL/checkpoint, topic manifest, proxy HTTP metadata, and registry-response
+    parsing.
 
 ## 10. Explicit non-goals
 

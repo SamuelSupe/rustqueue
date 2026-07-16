@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 impl Broker {
     pub async fn compact(&self) -> Result<usize, BrokerError> {
+        let _timer = self.inner.metrics.gc.timer();
         let broker = self.clone();
         self.storage_task(move || {
             let mut outbox_ids = HashMap::<String, BTreeSet<u64>>::new();
@@ -30,6 +31,7 @@ impl Broker {
     }
 
     pub async fn protective_evict_oldest(&self) -> Result<Option<ProtectiveEviction>, BrokerError> {
+        let _timer = self.inner.metrics.gc.timer();
         let broker = self.clone();
         self.storage_task(move || {
             let topics: Vec<_> = broker.inner.topics.read().values().cloned().collect();
@@ -51,6 +53,7 @@ impl Broker {
     }
 
     pub async fn scrub(&self) -> Result<usize, BrokerError> {
+        let _timer = self.inner.metrics.scrub.timer();
         let broker = self.clone();
         self.storage_task(move || {
             broker
@@ -79,6 +82,18 @@ impl Broker {
         self.storage_task(move || {
             for topic in broker.inner.topics.read().values() {
                 topic.state.lock().sync()?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    #[doc(hidden)]
+    pub async fn checkpoint(&self) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        self.storage_task(move || {
+            for topic in broker.inner.topics.read().values() {
+                topic.state.lock().checkpoint_channels()?;
             }
             Ok(())
         })

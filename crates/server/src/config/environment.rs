@@ -23,6 +23,10 @@ impl Config {
             self.storage.data_path = value.into();
         }
         set_from_env(
+            "RUSTQUEUE_STORAGE_FEATURE_LEVEL",
+            &mut self.storage.feature_level,
+        )?;
+        set_from_env(
             "RUSTQUEUE_MAX_MESSAGE_BYTES",
             &mut self.queue.max_message_bytes,
         )?;

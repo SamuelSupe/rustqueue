@@ -1,10 +1,12 @@
 use crate::backend::BackendPool;
+use crate::metrics::ProxyMetrics;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use rustqueue_proxy::{parse_forward_metadata, ForwardMetadataError};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ struct ProxyState {
     client: reqwest::Client,
     max_body_bytes: usize,
     inflight_bytes: Arc<Semaphore>,
+    metrics: ProxyMetrics,
 }
 
 pub async fn serve(
@@ -23,6 +26,7 @@ pub async fn serve(
     pool: BackendPool,
     max_body_bytes: usize,
     max_inflight_bytes: usize,
+    metrics: ProxyMetrics,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_millis(500))
@@ -34,15 +38,21 @@ pub async fn serve(
         client,
         max_body_bytes,
         inflight_bytes: Arc::new(Semaphore::new(max_inflight_bytes)),
+        metrics,
     };
     let router = Router::new()
         .route("/v1/health", get(health))
+        .route("/metrics", get(prometheus))
         .fallback(any(forward))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "producer HTTP proxy listening");
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+async fn prometheus(State(state): State<ProxyState>) -> String {
+    state.metrics.render()
 }
 
 async fn health(State(state): State<ProxyState>) -> Response {
@@ -61,18 +71,26 @@ async fn health(State(state): State<ProxyState>) -> Response {
 
 async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Response {
     let (parts, body) = request.into_parts();
-    let declared = parts
+    let content_length = parts
         .headers
         .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok());
-    if declared.is_some_and(|bytes| bytes > state.max_body_bytes) {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "E_BAD_BODY body exceeds proxy limit",
-        )
-            .into_response();
-    }
+        .and_then(|value| value.to_str().ok());
+    let metadata = match parse_forward_metadata(
+        &parts.uri.to_string(),
+        content_length,
+        state.max_body_bytes,
+    ) {
+        Ok(metadata) => metadata,
+        Err(ForwardMetadataError::BodyTooLarge) => return body_too_large(),
+        Err(ForwardMetadataError::Invalid) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "E_BAD_REQUEST invalid proxy request",
+            )
+                .into_response()
+        }
+    };
+    let declared = metadata.declared_bytes;
     let reserved = declared.unwrap_or(state.max_body_bytes).max(1);
     let Ok(reserved) = u32::try_from(reserved) else {
         return throttled();
@@ -82,25 +100,16 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
     };
     let body = match axum::body::to_bytes(body, state.max_body_bytes).await {
         Ok(body) => body,
-        Err(_) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "E_BAD_BODY body exceeds proxy limit",
-            )
-                .into_response()
-        }
+        Err(_) => return body_too_large(),
     };
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or("/");
+    let path = metadata.path_and_query;
     let backends = state.pool.shuffled(2);
     if backends.is_empty() {
         return unavailable();
     }
     let mut last_error = None;
     for backend in backends {
+        let _backend_timer = state.metrics.backend.timer();
         let url = format!("{}{path}", backend.http_origin());
         let mut outgoing = state
             .client
@@ -156,6 +165,14 @@ fn unavailable() -> Response {
     response
 }
 
+fn body_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "E_BAD_BODY body exceeds proxy limit",
+    )
+        .into_response()
+}
+
 fn throttled() -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -181,6 +198,7 @@ mod tests {
             client: reqwest::Client::new(),
             max_body_bytes: 1024,
             inflight_bytes: Arc::new(Semaphore::new(1024)),
+            metrics: ProxyMetrics::default(),
         };
         let response = Router::new()
             .fallback(any(forward))
@@ -204,6 +222,7 @@ mod tests {
             client: reqwest::Client::new(),
             max_body_bytes: 1024,
             inflight_bytes: Arc::new(Semaphore::new(1)),
+            metrics: ProxyMetrics::default(),
         };
         let response = Router::new()
             .fallback(any(forward))

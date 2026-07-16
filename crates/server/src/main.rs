@@ -32,12 +32,18 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     check_config: bool,
+    #[arg(long)]
+    capabilities_output: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
+    if let Some(path) = cli.capabilities_output.as_deref() {
+        write_binary_capabilities(path)?;
+        return Ok(());
+    }
     let config = Config::load(cli.config.as_deref())?;
     init_tracing(&config.log_format)?;
     config.validate()?;
@@ -62,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         entry_cache_bytes: config.storage.entry_cache_bytes,
         payload_read_workers: config.storage.payload_read_workers,
         payload_read_queue: config.storage.payload_read_queue,
+        storage_feature_level: config.storage.feature_level,
     })?);
     broker.scrub().await.context("startup data scrub")?;
 
@@ -131,6 +138,11 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+fn write_binary_capabilities(path: &std::path::Path) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(&rustqueue_storage::binary_capabilities())?;
+    std::fs::write(path, bytes).with_context(|| format!("write capabilities to {}", path.display()))
 }
 
 async fn monitor_storage_health(broker: Arc<Broker>) -> anyhow::Result<()> {

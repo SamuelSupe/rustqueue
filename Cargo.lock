@@ -2245,6 +2245,7 @@ dependencies = [
  "parking_lot",
  "reqwest",
  "rustls",
+ "rustqueue-telemetry",
  "serde",
  "serde_json",
  "tokio",
@@ -2298,6 +2299,7 @@ dependencies = [
  "rand 0.8.7",
  "reqwest",
  "rustls",
+ "rustqueue-telemetry",
  "serde",
  "serde_json",
  "tokio",
@@ -2315,9 +2317,11 @@ dependencies = [
  "crc32c",
  "futures",
  "hex",
+ "libc",
  "parking_lot",
  "rustqueue-protocol",
  "rustqueue-storage",
+ "rustqueue-telemetry",
  "serde",
  "serde_json",
  "tempfile",
@@ -2344,6 +2348,7 @@ dependencies = [
  "rustqueue-protocol",
  "rustqueue-queue",
  "rustqueue-storage",
+ "rustqueue-telemetry",
  "serde",
  "serde_json",
  "sha2",
@@ -2369,6 +2374,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "rustqueue-telemetry"
+version = "0.7.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

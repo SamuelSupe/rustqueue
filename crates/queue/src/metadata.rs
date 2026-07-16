@@ -32,17 +32,44 @@ pub(crate) fn load_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Opti
     }
 }
 
+pub(crate) fn load_topic_manifest(path: &Path) -> io::Result<Option<TopicManifest>> {
+    match fs::read(path) {
+        Ok(bytes) => parse_topic_manifest(&bytes).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_topic_manifest(bytes: &[u8]) -> io::Result<TopicManifest> {
+    serde_json::from_slice(bytes).map_err(io::Error::other)
+}
+
+pub(crate) fn fuzz_topic_manifest(bytes: &[u8]) {
+    let _ = parse_topic_manifest(bytes);
+}
+
 pub(crate) fn store_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     store_bytes_atomic(path, &serde_json::to_vec(value).map_err(io::Error::other)?)
 }
 
 pub(crate) fn store_bytes_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    store_bytes_atomic_with_failpoint(path, bytes, None)
+}
+
+pub(crate) fn store_bytes_atomic_with_failpoint(
+    path: &Path,
+    bytes: &[u8],
+    failpoint: Option<&str>,
+) -> io::Result<()> {
     let parent = path.parent().expect("metadata path has parent");
     fs::create_dir_all(parent)?;
     let temporary = temporary_path(path);
     let mut file = File::create(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    if let Some(failpoint) = failpoint {
+        rustqueue_storage::crash_failpoint(failpoint);
+    }
     fs::rename(&temporary, path)?;
     File::open(parent)?.sync_all()
 }

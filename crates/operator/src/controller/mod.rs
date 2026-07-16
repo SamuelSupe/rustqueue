@@ -2,6 +2,7 @@ mod apply;
 mod auth;
 mod drain;
 mod nodes;
+mod preflight;
 
 use crate::crd::RustQueueStatus;
 use crate::resources::{self, BuildInput};
@@ -76,6 +77,30 @@ async fn reconcile_inner(
         .await?
         .and_then(|set| set.spec.and_then(|spec| spec.replicas))
         .unwrap_or(0);
+    let target_preflight = preflight::target_image(&context, &cluster, &namespace).await?;
+    if let Some(action) =
+        preflight_action(&context, &cluster, desired, current, target_preflight).await?
+    {
+        return Ok(action);
+    }
+    let mut active_feature_level = cluster.spec.storage_feature_level;
+    if current > 0 {
+        let broker_preflight =
+            preflight::current_brokers(&context, &cluster, &namespace, &auth).await?;
+        match broker_preflight {
+            preflight::Outcome::Ready {
+                active_feature_level: active,
+            } => active_feature_level = active,
+            outcome => {
+                if let Some(action) =
+                    preflight_action(&context, &cluster, desired, current, outcome).await?
+                {
+                    return Ok(action);
+                }
+            }
+        }
+    }
+    preflight::cleanup_old_probes(&context, &cluster, &namespace).await?;
     let applied_replicas = if current == 0 || desired > current {
         desired
     } else {
@@ -127,10 +152,48 @@ async fn reconcile_inner(
             ready_brokers: ready,
             phase,
             message,
+            active_storage_feature_level: active_feature_level,
         },
     )
     .await?;
     Ok(Action::requeue(Duration::from_secs(5)))
+}
+
+async fn preflight_action(
+    context: &ContextData,
+    cluster: &RustQueue,
+    desired: i32,
+    current: i32,
+    outcome: preflight::Outcome,
+) -> anyhow::Result<Option<Action>> {
+    let (phase, message) = match outcome {
+        preflight::Outcome::Ready { .. } => return Ok(None),
+        preflight::Outcome::Pending(message) => ("Preflight".to_owned(), message),
+        preflight::Outcome::Blocked(message) => ("PreflightBlocked".to_owned(), message),
+    };
+    let ready = nodes::ready_brokers(
+        &context.client,
+        &cluster.namespace().expect("validated namespace"),
+        &cluster.name_any(),
+    )
+    .await?;
+    apply::status(
+        &context.client,
+        cluster,
+        RustQueueStatus {
+            observed_generation: cluster.metadata.generation,
+            desired_brokers: desired,
+            ready_brokers: ready.min(current),
+            phase,
+            message,
+            active_storage_feature_level: cluster
+                .status
+                .as_ref()
+                .map_or(1, |status| status.active_storage_feature_level.max(1)),
+        },
+    )
+    .await?;
+    Ok(Some(Action::requeue(Duration::from_secs(5))))
 }
 
 fn validate(cluster: &RustQueue) -> anyhow::Result<()> {
@@ -144,6 +207,9 @@ fn validate(cluster: &RustQueue) -> anyhow::Result<()> {
         || cluster.spec.storage_size.trim().is_empty()
     {
         bail!("storageClassName and storageSize are required");
+    }
+    if cluster.spec.storage_feature_level == 0 {
+        bail!("storageFeatureLevel must be greater than zero");
     }
     if cluster.spec.disk_low_watermark_percent >= cluster.spec.disk_high_watermark_percent
         || cluster.spec.disk_high_watermark_percent > 100

@@ -38,6 +38,7 @@ spec:
                 eligibleNodeSelector: {type: string, default: rustqueue.io/eligible=true}
                 storageClassName: {type: string, default: local-path}
                 storageSize: {type: string, default: 100Gi}
+                storageFeatureLevel: {type: integer, format: int32, minimum: 1, default: 1}
                 minFreeBytes: {type: integer, format: int64, minimum: 0, default: 10737418240}
                 diskHighWatermarkPercent: {type: integer, format: int32, minimum: 1, maximum: 100, default: 85}
                 diskLowWatermarkPercent: {type: integer, format: int32, minimum: 0, maximum: 99, default: 75}
@@ -62,3 +63,4 @@ spec:
                 readyBrokers: {type: integer, format: int32}
                 phase: {type: string}
                 message: {type: string}
+                activeStorageFeatureLevel: {type: integer, format: int32}

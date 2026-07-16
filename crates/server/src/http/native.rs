@@ -58,6 +58,7 @@ pub(super) async fn registry(
     let publish_ready = process_ready && storage_ready && state.publish_admission.storage_ready();
     let consume_ready =
         storage_ready && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0);
+    let (binary, storage) = state.broker.capabilities();
     Ok(Json(json!({
         "format": 7,
         "revision": state.broker.registry_revision(),
@@ -72,7 +73,17 @@ pub(super) async fn registry(
         "depth": depth,
         "in_flight": in_flight,
         "topics": topics,
+        "compatibility": {"binary": binary, "storage": storage},
     })))
+}
+
+pub(super) async fn capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&headers, state.registry_token.as_deref(), "registry")?;
+    let (binary, storage) = state.broker.capabilities();
+    Ok(Json(json!({"binary": binary, "storage": storage})))
 }
 
 pub(super) fn registry_topics(stats: &BrokerStats) -> Vec<Value> {

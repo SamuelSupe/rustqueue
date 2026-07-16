@@ -1,5 +1,5 @@
 .PHONY: test check fmt clippy release-bin image operator-release-bin operator-image \
-	helm-lint helm-template k8s-acceptance up down compat compat-go compat-python \
+	helm-lint helm-template k8s-acceptance k8s-multi-acceptance up down compat compat-go compat-python \
 	fuzz-smoke benchmark
 
 RUST_IMAGE := rust:1.88-bookworm
@@ -11,16 +11,16 @@ RUN := docker run --rm -e RUSTUP_TOOLCHAIN=1.88.0 -e CARGO_INCREMENTAL=0 \
 	-v $(RUSTUP_CACHE):/usr/local/rustup $(RUST_IMAGE)
 
 test:
-	$(RUN) cargo test --locked --workspace
+	$(RUN) cargo test --locked --workspace --features rustqueue-queue/crash-injection
 
 check:
-	$(RUN) cargo check --locked --workspace
+	$(RUN) cargo check --locked --workspace --all-features
 
 fmt:
 	$(RUN) cargo fmt --all -- --check
 
 clippy:
-	$(RUN) cargo clippy --locked --workspace --all-targets -- -D warnings
+	$(RUN) cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 release-bin:
 	$(RUN) cargo build --locked --release \
@@ -48,6 +48,9 @@ helm-template:
 
 k8s-acceptance:
 	./scripts/acceptance-k8s.sh
+
+k8s-multi-acceptance:
+	./scripts/acceptance-multi-broker-k8s.sh
 
 up: image
 	docker compose up -d --no-build

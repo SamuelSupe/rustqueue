@@ -1,4 +1,5 @@
 use rustqueue_storage::PayloadRef;
+use rustqueue_telemetry::HistogramSnapshot;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -23,7 +24,19 @@ pub(crate) struct MessageMeta {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BrokerStats {
     pub publish_group_commit: PublishGroupCommitStats,
+    #[serde(default)]
+    pub latency: BrokerLatencyStats,
     pub topics: Vec<TopicStats>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct BrokerLatencyStats {
+    pub fsync: HistogramSnapshot,
+    pub group_commit_wait: HistogramSnapshot,
+    pub publish_ack: HistogramSnapshot,
+    pub payload_read: HistogramSnapshot,
+    pub scrub: HistogramSnapshot,
+    pub gc: HistogramSnapshot,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

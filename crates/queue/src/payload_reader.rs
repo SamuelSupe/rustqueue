@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use rustqueue_storage::PayloadRef;
+use rustqueue_telemetry::LatencyHistogram;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::File;
 use std::io;
@@ -44,10 +45,16 @@ pub(crate) struct PayloadReader {
     cache: Mutex<PayloadCache>,
     sender: SyncSender<ReadJob>,
     active_paths: Arc<Mutex<HashMap<std::path::PathBuf, usize>>>,
+    latency: Arc<LatencyHistogram>,
 }
 
 impl PayloadReader {
-    pub fn new(cache_bytes: usize, workers: usize, queue_depth: usize) -> Arc<Self> {
+    pub fn new(
+        cache_bytes: usize,
+        workers: usize,
+        queue_depth: usize,
+        latency: Arc<LatencyHistogram>,
+    ) -> Arc<Self> {
         let (sender, receiver) = sync_channel(queue_depth.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
         let active_paths = Arc::new(Mutex::new(HashMap::new()));
@@ -81,6 +88,7 @@ impl PayloadReader {
             }),
             sender,
             active_paths,
+            latency,
         })
     }
 
@@ -104,6 +112,7 @@ impl PayloadReader {
     }
 
     pub async fn read_retained(&self, lease: PayloadLease) -> io::Result<Vec<Arc<[u8]>>> {
+        let _timer = self.latency.timer();
         let payloads = lease.payloads.clone();
         let mut output = vec![None; payloads.len()];
         let mut missing = Vec::new();
@@ -342,6 +351,7 @@ fn release_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustqueue_telemetry::LatencyHistogram;
     use tempfile::tempdir;
 
     #[test]
@@ -354,7 +364,7 @@ mod tests {
             len: 1,
             crc32c: 0,
         };
-        let reader = PayloadReader::new(1, 1, 1);
+        let reader = PayloadReader::new(1, 1, 1, Arc::new(LatencyHistogram::default()));
         let lease = reader.retain(vec![payload]);
         assert!(reader.retained_paths().contains(&path));
         assert!(reader.has_active_under(root.path()));
@@ -374,7 +384,7 @@ mod tests {
             len: 7,
             crc32c: crc32c::crc32c(b"payload"),
         };
-        let reader = PayloadReader::new(1, 1, 4);
+        let reader = PayloadReader::new(1, 1, 4, Arc::new(LatencyHistogram::default()));
         assert_eq!(
             &*reader
                 .read_many(std::slice::from_ref(&payload))

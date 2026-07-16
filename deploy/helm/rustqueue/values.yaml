@@ -21,6 +21,7 @@ queue:
   eligibleNodeSelector: rustqueue.io/eligible=true
   storageClassName: local-path
   storageSize: 100Gi
+  storageFeatureLevel: 1
   minFreeBytes: 10737418240
   diskHighWatermarkPercent: 85
   diskLowWatermarkPercent: 75

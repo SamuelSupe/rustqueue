@@ -1,4 +1,4 @@
-use crate::{BrokerEndpoint, BrokerRegistry, Producer};
+use crate::{BrokerEndpoint, BrokerRegistry, DiscoveryMetrics, Producer};
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Default)]
 pub struct Directory {
     inner: Arc<RwLock<State>>,
+    metrics: DiscoveryMetrics,
 }
 
 #[derive(Default)]
@@ -21,6 +22,10 @@ struct Observation {
 }
 
 impl Directory {
+    pub fn metrics(&self) -> &DiscoveryMetrics {
+        &self.metrics
+    }
+
     pub fn replace_endpoints(&self, endpoints: BTreeSet<BrokerEndpoint>) {
         self.inner.write().endpoints = endpoints;
     }
@@ -167,6 +172,7 @@ mod tests {
                         channels: vec!["workers".into()],
                         stored_messages: 1,
                     }],
+                    compatibility: None,
                 },
             );
         }

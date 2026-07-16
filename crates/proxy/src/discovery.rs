@@ -1,4 +1,5 @@
 use crate::backend::{Backend, BackendPool};
+use crate::metrics::ProxyMetrics;
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -7,7 +8,11 @@ struct NodesResponse {
     producers: Vec<Backend>,
 }
 
-pub async fn run(pool: BackendPool, addresses: Vec<String>) -> anyhow::Result<()> {
+pub async fn run(
+    pool: BackendPool,
+    addresses: Vec<String>,
+    metrics: ProxyMetrics,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(500))
         .timeout(Duration::from_millis(1500))
@@ -17,6 +22,7 @@ pub async fn run(pool: BackendPool, addresses: Vec<String>) -> anyhow::Result<()
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
+        let _poll_timer = metrics.discovery_poll.timer();
         let mut discovered = Vec::new();
         let mut successful = false;
         for address in &addresses {

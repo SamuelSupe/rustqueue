@@ -36,6 +36,31 @@ pub struct BrokerRegistry {
     #[serde(default)]
     pub in_flight: u64,
     pub topics: Vec<RegistryTopic>,
+    #[serde(default)]
+    pub compatibility: Option<CompatibilityReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CompatibilityReport {
+    pub binary: BinaryCapabilities,
+    pub storage: CompatibilityState,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BinaryCapabilities {
+    pub binary_version: String,
+    pub data_format: u32,
+    pub minimum_reader_feature_level: u32,
+    pub maximum_reader_feature_level: u32,
+    pub maximum_writer_feature_level: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CompatibilityState {
+    pub data_format: u32,
+    pub active_writer_feature_level: u32,
+    pub minimum_reader_feature_level: u32,
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

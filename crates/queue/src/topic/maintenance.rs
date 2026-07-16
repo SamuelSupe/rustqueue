@@ -174,6 +174,15 @@ impl Topic {
         Ok(())
     }
 
+    pub fn checkpoint_channels(&mut self) -> Result<(), BrokerError> {
+        for runtime in self.channels.values_mut() {
+            if let Some(store) = runtime.store.as_mut() {
+                store.checkpoint(&runtime.state)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn mark_deleted(&mut self) -> Result<(), BrokerError> {
         self.manifest.deleted = true;
         store_atomic(&self.manifest_path, &self.manifest)?;

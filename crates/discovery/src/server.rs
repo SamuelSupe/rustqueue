@@ -25,8 +25,13 @@ pub fn router(directory: Directory) -> Router {
         .route("/nodes", get(nodes))
         .route("/v1/publishers", get(publishers))
         .route("/v1/health", get(health))
+        .route("/metrics", get(prometheus))
         .layer(middleware::from_fn(nsq_content_negotiation))
         .with_state(directory)
+}
+
+async fn prometheus(State(directory): State<Directory>) -> String {
+    directory.metrics().render()
 }
 
 async fn nsq_content_negotiation(request: Request<Body>, next: Next) -> Response {

@@ -132,6 +132,7 @@ pub async fn serve(
         .route("/channel/pause", post(pause_channel))
         .route("/channel/unpause", post(unpause_channel))
         .route("/v1/health", get(health))
+        .route("/v1/capabilities", get(capabilities))
         .route("/v1/registry", get(registry))
         .route("/v1/drain", get(drain_status).post(set_drain))
         .route("/v1/stats", get(native_stats))
@@ -252,6 +253,7 @@ mod tests {
     fn registry_exposes_channel_names_instead_of_internal_stats() {
         let topics = registry_topics(&BrokerStats {
             publish_group_commit: Default::default(),
+            latency: Default::default(),
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,

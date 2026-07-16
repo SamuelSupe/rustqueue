@@ -10,7 +10,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let mut output = Vec::new();
-    let _ = DeflateDecoder::new(data).take(1024 * 1024).read_to_end(&mut output);
+    let _ = DeflateDecoder::new(data)
+        .take(1024 * 1024)
+        .read_to_end(&mut output);
     output.clear();
-    let _ = FrameDecoder::new(data).take(1024 * 1024).read_to_end(&mut output);
+    let _ = FrameDecoder::new(data)
+        .take(1024 * 1024)
+        .read_to_end(&mut output);
 });

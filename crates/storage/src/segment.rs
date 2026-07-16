@@ -1,7 +1,7 @@
 #[path = "segment/files.rs"]
 mod files;
 
-use crate::{Record, HEADER_LEN};
+use crate::{crash_failpoint, Record, BASE_STORAGE_FEATURE_LEVEL, HEADER_LEN};
 use files::{
     read_record, scan_segment, scan_segment_readonly, segment_base_index, segment_path,
     segment_paths,
@@ -57,17 +57,32 @@ pub struct SegmentLog {
     start_index: u64,
     checksums: BTreeMap<PathBuf, (u64, u32)>,
     isolated: AtomicBool,
+    active_writer_feature_level: u32,
 }
 
 impl SegmentLog {
     pub fn open(directory: impl AsRef<Path>, max_segment_bytes: u64) -> Result<Self, StorageError> {
-        Self::open_with_start_index(directory, max_segment_bytes, 1)
+        Self::open_with_feature_level(directory, max_segment_bytes, 1, BASE_STORAGE_FEATURE_LEVEL)
     }
 
     pub fn open_with_start_index(
         directory: impl AsRef<Path>,
         max_segment_bytes: u64,
         start_index: u64,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_feature_level(
+            directory,
+            max_segment_bytes,
+            start_index,
+            BASE_STORAGE_FEATURE_LEVEL,
+        )
+    }
+
+    pub fn open_with_feature_level(
+        directory: impl AsRef<Path>,
+        max_segment_bytes: u64,
+        start_index: u64,
+        active_writer_feature_level: u32,
     ) -> Result<Self, StorageError> {
         fs::create_dir_all(directory.as_ref())?;
         let directory = directory.as_ref().to_path_buf();
@@ -130,6 +145,7 @@ impl SegmentLog {
             start_index: expected.unwrap_or(start_index),
             checksums,
             isolated: AtomicBool::new(false),
+            active_writer_feature_level,
         })
     }
 
@@ -167,6 +183,16 @@ impl SegmentLog {
         durable: bool,
     ) -> Result<RecordLocation, StorageError> {
         self.ensure_available()?;
+        let required = record.kind.required_writer_feature_level();
+        if required > self.active_writer_feature_level {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "record kind {:?} requires writer feature level {required}, active level is {}",
+                    record.kind, self.active_writer_feature_level
+                ),
+            )));
+        }
         if self.records.is_empty() && self.current_len == 0 && record.index >= self.start_index {
             self.start_index = record.index;
         }
@@ -352,6 +378,7 @@ impl SegmentLog {
             return Ok(0);
         }
         self.current.sync_all()?;
+        crash_failpoint("gc_before_segment_delete");
         for path in &removable {
             fs::remove_file(path)?;
             self.checksums.remove(path);
@@ -363,6 +390,7 @@ impl SegmentLog {
         } else {
             self.start_index = through_index.saturating_add(1);
         }
+        crash_failpoint("gc_after_segment_delete_before_dir_fsync");
         File::open(&self.directory)?.sync_all()?;
         Ok(removable.len())
     }

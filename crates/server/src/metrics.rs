@@ -1,4 +1,5 @@
 use rustqueue_queue::BrokerStats;
+use rustqueue_telemetry::render_prometheus;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 #[derive(Default)]
@@ -63,6 +64,40 @@ pub fn render_broker(stats: &BrokerStats) -> String {
                 channel.depth, channel.in_flight_count, channel.deferred_count, channel.ack_gap,
             ));
         }
+    }
+    for (name, help, snapshot) in [
+        (
+            "rustqueue_storage_fsync_duration_seconds",
+            "Time spent making a publish group durable.",
+            &stats.latency.fsync,
+        ),
+        (
+            "rustqueue_group_commit_wait_duration_seconds",
+            "Time a publish request waits before group commit processing.",
+            &stats.latency.group_commit_wait,
+        ),
+        (
+            "rustqueue_publish_ack_duration_seconds",
+            "End-to-end broker publish acknowledgement latency.",
+            &stats.latency.publish_ack,
+        ),
+        (
+            "rustqueue_payload_read_duration_seconds",
+            "Payload cache and disk read latency.",
+            &stats.latency.payload_read,
+        ),
+        (
+            "rustqueue_storage_scrub_duration_seconds",
+            "Storage scrub operation latency.",
+            &stats.latency.scrub,
+        ),
+        (
+            "rustqueue_storage_gc_duration_seconds",
+            "Segment compaction and protective GC latency.",
+            &stats.latency.gc,
+        ),
+    ] {
+        output.push_str(&render_prometheus(name, help, snapshot));
     }
     output
 }

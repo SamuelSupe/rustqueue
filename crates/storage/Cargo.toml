@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+crash-injection = []
+
 [dependencies]
 anyhow.workspace = true
 crc32c.workspace = true

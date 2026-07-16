@@ -48,6 +48,7 @@ pub struct NetworkConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub data_path: PathBuf,
+    pub feature_level: u32,
     pub max_segment_bytes: u64,
     pub scrub_interval_seconds: u64,
     pub entry_cache_bytes: usize,
@@ -165,6 +166,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_path: "data".into(),
+            feature_level: rustqueue_storage::BASE_STORAGE_FEATURE_LEVEL,
             max_segment_bytes: 100 * 1024 * 1024,
             scrub_interval_seconds: 3600,
             entry_cache_bytes: 64 * 1024 * 1024,
@@ -286,6 +288,15 @@ impl Config {
         }
         if self.storage.max_segment_bytes < self.limits.max_body_bytes as u64 + 64 {
             bail!("storage.max_segment_bytes must fit one maximum command body");
+        }
+        if self.storage.feature_level < rustqueue_storage::BASE_STORAGE_FEATURE_LEVEL
+            || self.storage.feature_level > rustqueue_storage::MAX_WRITER_FEATURE_LEVEL
+        {
+            bail!(
+                "storage.feature_level must fit this binary's writer range {}..={}",
+                rustqueue_storage::BASE_STORAGE_FEATURE_LEVEL,
+                rustqueue_storage::MAX_WRITER_FEATURE_LEVEL
+            );
         }
         if self.storage.scrub_interval_seconds == 0
             || self.storage.entry_cache_bytes == 0

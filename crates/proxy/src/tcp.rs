@@ -1,4 +1,5 @@
 use crate::backend::BackendPool;
+use crate::metrics::ProxyMetrics;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -7,6 +8,7 @@ pub async fn serve(
     address: SocketAddr,
     pool: BackendPool,
     max_connections: usize,
+    metrics: ProxyMetrics,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let connections = Arc::new(Semaphore::new(max_connections));
@@ -21,8 +23,10 @@ pub async fn serve(
             tracing::debug!(%peer, "rejecting producer because no broker is ready");
             continue;
         };
+        let metrics = metrics.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let connect_timer = metrics.backend.timer();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 tokio::net::TcpStream::connect(backend.tcp_address()),
@@ -30,6 +34,7 @@ pub async fn serve(
             .await
             {
                 Ok(Ok(mut broker)) => {
+                    drop(connect_timer);
                     let _ = client.set_nodelay(true);
                     let _ = broker.set_nodelay(true);
                     if let Err(error) =
@@ -39,9 +44,11 @@ pub async fn serve(
                     }
                 }
                 Ok(Err(error)) => {
+                    drop(connect_timer);
                     tracing::debug!(%peer, %error, node_id = backend.node_id, "broker connect failed")
                 }
                 Err(_) => {
+                    drop(connect_timer);
                     tracing::debug!(%peer, node_id = backend.node_id, "broker connect timed out")
                 }
             }

@@ -12,8 +12,12 @@ libfuzzer-sys = "0.4"
 flate2 = "1"
 snap = "1"
 serde_json = "1"
+crc32c = "0.6"
 rustqueue-protocol = { path = "../crates/protocol" }
 rustqueue-storage = { path = "../crates/storage" }
+rustqueue-queue = { path = "../crates/queue" }
+rustqueue-proxy = { path = "../crates/proxy" }
+rustqueue-discovery = { path = "../crates/discovery" }
 
 [[bin]]
 name = "protocol"
@@ -32,6 +36,34 @@ bench = false
 [[bin]]
 name = "compression"
 path = "fuzz_targets/compression.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel_state"
+path = "fuzz_targets/channel_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_http"
+path = "fuzz_targets/proxy_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_response"
+path = "fuzz_targets/registry_response.rs"
 test = false
 doc = false
 bench = false
