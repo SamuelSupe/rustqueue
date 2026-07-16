@@ -54,6 +54,61 @@ spec:
                   additionalProperties: {type: string}
                   default: {}
                 discoveryReplicas: {type: integer, format: int32, minimum: 2, default: 2}
+                maintenance:
+                  type: object
+                  nullable: true
+                  required: [broker]
+                  properties:
+                    broker: {type: string, minLength: 1}
+                    enabled: {type: boolean, default: true}
+                rollout:
+                  type: object
+                  default:
+                    paused: false
+                    requireCanaryApproval: false
+                    approvedRevision: null
+                    timeoutSeconds: 600
+                    rollbackToImage: null
+                    retryNonce: ""
+                  properties:
+                    paused: {type: boolean, default: false}
+                    requireCanaryApproval: {type: boolean, default: false}
+                    approvedRevision: {type: string, nullable: true}
+                    timeoutSeconds: {type: integer, format: int64, minimum: 1, maximum: 86400, default: 600}
+                    rollbackToImage: {type: string, nullable: true}
+                    retryNonce: {type: string, default: ""}
+                brokerScheduling:
+                  type: object
+                  default:
+                    topologyKey: kubernetes.io/hostname
+                    priorityClassName: null
+                    tolerations: []
+                  properties:
+                    topologyKey: {type: string, minLength: 1, default: kubernetes.io/hostname}
+                    priorityClassName: {type: string, nullable: true}
+                    tolerations:
+                      type: array
+                      default: []
+                      items:
+                        type: object
+                        properties:
+                          key: {type: string, nullable: true}
+                          operator: {type: string, nullable: true}
+                          value: {type: string, nullable: true}
+                          effect: {type: string, nullable: true}
+                          tolerationSeconds: {type: integer, format: int64, nullable: true}
+                brokerResources:
+                  type: object
+                  default:
+                    cpuRequest: 100m
+                    memoryRequest: 256Mi
+                    cpuLimit: null
+                    memoryLimit: null
+                  properties:
+                    cpuRequest: {type: string, minLength: 1, default: 100m}
+                    memoryRequest: {type: string, minLength: 1, default: 256Mi}
+                    cpuLimit: {type: string, nullable: true}
+                    memoryLimit: {type: string, nullable: true}
             status:
               type: object
               nullable: true
@@ -64,3 +119,45 @@ spec:
                 phase: {type: string}
                 message: {type: string}
                 activeStorageFeatureLevel: {type: integer, format: int32}
+                conditions:
+                  type: array
+                  default: []
+                  items:
+                    type: object
+                    required: [type, status, reason, message, lastTransitionTime]
+                    properties:
+                      type: {type: string}
+                      status: {type: string, enum: ["True", "False", "Unknown"]}
+                      reason: {type: string}
+                      message: {type: string}
+                      observedGeneration: {type: integer, format: int64, nullable: true}
+                      lastTransitionTime: {type: string, format: date-time}
+                currentOperation:
+                  nullable: true
+                  type: object
+                  required: [id, kind, phase, target, revision, message, startedAt, updatedAt]
+                  properties: &operationStatusProperties
+                    id: {type: string}
+                    kind: {type: string}
+                    phase: {type: string}
+                    target: {type: string}
+                    revision: {type: string}
+                    message: {type: string}
+                    startedAt: {type: string, format: date-time}
+                    updatedAt: {type: string, format: date-time}
+                    completedAt: {type: string, format: date-time, nullable: true}
+                    previousImage: {type: string, nullable: true}
+                    currentBroker: {type: string, nullable: true}
+                operationHistory:
+                  type: array
+                  default: []
+                  maxItems: 20
+                  items:
+                    type: object
+                    required: [id, kind, phase, target, revision, message, startedAt, updatedAt]
+                    properties: *operationStatusProperties
+                orphanedPvcs:
+                  type: array
+                  default: []
+                  items: {type: string}
+                desiredStorageSize: {type: string, default: ""}

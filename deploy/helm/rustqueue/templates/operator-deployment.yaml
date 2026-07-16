@@ -7,9 +7,12 @@ metadata:
     {{- include "rustqueue.labels" . | nindent 4 }}
     app.kubernetes.io/component: operator
 spec:
-  replicas: 1
+  replicas: {{ .Values.operator.replicas }}
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/instance: {{ .Release.Name }}
@@ -25,6 +28,28 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: {{ include "rustqueue.operatorServiceAccount" . }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.operator.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.operator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.operator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name }}
+                    app.kubernetes.io/component: operator
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -36,6 +61,10 @@ spec:
           image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: WATCH_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: RUST_LOG

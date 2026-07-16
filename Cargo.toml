@@ -10,6 +10,7 @@ members = [
     "crates/proxy",
     "crates/bench",
     "crates/operator",
+    "crates/rustqueuectl",
 ]
 exclude = ["fuzz"]
 
@@ -26,6 +27,7 @@ flate2 = "1.1"
 axum = "0.8.1"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bytes = { version = "1.9.0", features = ["serde"] }
+chrono = { version = "0.4.39", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5.26", features = ["derive", "env"] }
 crc32c = "0.6.8"
 futures = "0.3.31"

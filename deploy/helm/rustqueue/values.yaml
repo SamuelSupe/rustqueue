@@ -2,6 +2,7 @@ nameOverride: ""
 fullnameOverride: ""
 
 operator:
+  replicas: 2
   image:
     repository: rustqueue-operator
     tag: "0.7.0"
@@ -10,6 +11,11 @@ operator:
   resources:
     requests: {cpu: 100m, memory: 128Mi}
     limits: {cpu: "1", memory: 512Mi}
+  nodeSelector: {}
+  tolerations: []
+  priorityClassName: ""
+  podDisruptionBudget:
+    enabled: true
 
 queue:
   create: true
@@ -34,3 +40,26 @@ queue:
   clientTlsSecretName: ""
   discoveryReplicas: 2
   proxyNodeSelector: {}
+  rollout:
+    paused: false
+    requireCanaryApproval: false
+    approvedRevision: ""
+    timeoutSeconds: 600
+    rollbackToImage: ""
+    retryNonce: ""
+  brokerScheduling:
+    topologyKey: kubernetes.io/hostname
+    priorityClassName: ""
+    tolerations: []
+  brokerResources:
+    cpuRequest: 100m
+    memoryRequest: 256Mi
+    cpuLimit: ""
+    memoryLimit: ""
+
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+  prometheusRule:
+    enabled: false

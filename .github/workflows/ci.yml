@@ -1,0 +1,21 @@
+name: production-gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+      - name: Core, compatibility, fuzz and packaging gates
+        run: FULL=1 K8S_ACCEPTANCE=0 FUZZ_SECONDS=1 ./scripts/release-gate.sh

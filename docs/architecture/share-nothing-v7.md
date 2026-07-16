@@ -157,8 +157,19 @@ membership reconciler. It manages:
 - required one-broker-per-node anti-affinity;
 - automatic scale-up to the count of eligible labelled nodes;
 - conservative highest-ordinal scale-down;
-- drain and one-Pod-at-a-time rolling replacement;
+- declarative targeted Broker maintenance;
+- durable operation status and bounded operation history;
+- drain, canary approval, pause/retry and one-Pod-at-a-time replacement;
+- compatibility-gated rollback and TLS Secret revision rollout;
+- online PVC request expansion with shrink prevention;
+- Broker/discovery disruption budgets;
 - discovery and proxy Deployments/DaemonSet, Services, RBAC, and NetworkPolicy.
+
+Two Operator replicas coordinate through one namespaced Lease. A standby does
+not mutate resources until the previous holder expires. Each operation stage is
+persisted in RustQueue status, but reconciliation still checks live Pod, drain,
+PVC and capability state before advancing. This makes restart continuation
+idempotent without treating status as an execution log.
 
 Drain has two readiness dimensions:
 
@@ -285,6 +296,12 @@ clock, and admission health only; it has no cluster-wide dependency.
 - After activation, the durable minimum-reader fence rejects an incompatible
   binary on startup. Rollback is allowed only while it remains compatible;
   otherwise recovery proceeds by forward upgrade.
+- A newly replaced Pod must become Ready before another outdated Pod can be
+  drained. Optional canary approval stops after exactly one current Ready Pod.
+- Paused and approval-wait stages are stable. Other stages stop after the
+  configured timeout and require an explicit retry nonce or rollback request.
+- The image, rendered Broker configuration, auth Secret and client TLS Secret
+  revisions all contribute to one desired Pod revision.
 
 Unknown record kinds continue to fail closed. Safety comes from preventing any
 such kind from being emitted until all old readers have left the fleet, rather
@@ -324,14 +341,16 @@ The implementation is complete only when all of the following pass:
 6. Broker restart reattaches its PVC and resumes its local backlog.
 7. StatefulSet scale-up follows eligible nodes; scale-down blocks until the
    highest ordinal drains to zero.
-8. Controller tests cover capability preflight, rollback fences, drain-aware
-   one-at-a-time rolling, and refusal to replace a lone broker. OrbStack runs
-   three actual broker Pods with independent RWO PVCs through a complete image
-   rollout while an official Go-client ledger publishes and consumes through
-   proxy and lookup. It requires `missing=0`, zero publish errors, and three
-   consumer connections. Before rolling, it requests an unsupported feature
-   level and proves preflight blocks without changing any broker Pod UID. The
-   single-node test topology is not evidence of failure-domain behavior.
+8. Controller tests cover capability preflight, rollback fences, durable
+   operation status, replacement readiness, canary approval, Lease expiry,
+   PVC quantity safety, targeted maintenance, drain-aware rolling, and refusal
+   to replace a lone broker. OrbStack runs three actual broker Pods with
+   independent RWO PVCs and two distinct A/B capability binaries. It validates
+   PDBs, online PVC growth, targeted maintenance, Operator failover, canary
+   continuation, feature activation and rollback fencing while an official
+   Go-client ledger publishes and consumes through proxy and lookup. It
+   requires `missing=0`, zero publish errors, and three consumer connections.
+   The single-node topology is not evidence of failure-domain behavior.
 9. Disk admission, DLQ outbox recovery, scrub, and protective eviction tests
    pass.
 10. OrbStack Kubernetes functional acceptance passes. A real 500-node cluster
@@ -343,6 +362,10 @@ The implementation is complete only when all of the following pass:
 12. Fuzz targets cover protocol and compression plus storage record, channel
     WAL/checkpoint, topic manifest, proxy HTTP metadata, and registry-response
     parsing.
+13. The release gate runs formatting, check, tests, clippy, Helm rendering,
+    fuzz smoke and official Go/Python compatibility. OrbStack acceptance is an
+    explicit local release gate because CI does not emulate multi-node PVC
+    detach/attach behavior.
 
 ## 10. Explicit non-goals
 

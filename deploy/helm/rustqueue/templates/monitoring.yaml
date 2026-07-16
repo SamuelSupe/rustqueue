@@ -1,0 +1,91 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rustqueue.fullname" . }}-runtime
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rustqueue.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace | quote }}]
+  selector:
+    matchExpressions:
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Values.queue.name | quote }}]
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [broker, discovery, proxy]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "rustqueue.fullname" . }}-operator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rustqueue.labels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace | quote }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: operator
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+{{- end }}
+{{- if .Values.monitoring.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "rustqueue.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rustqueue.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: rustqueue.production
+      rules:
+        - alert: RustQueueOperatorHasNoLeader
+          expr: (sum(rustqueue_operator_leader) or vector(0)) < 1
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: RustQueue Operator has no active leader
+        - alert: RustQueueBrokerDiskPressure
+          expr: rustqueue_disk_pressure == 1
+          for: 1m
+          labels: {severity: critical}
+          annotations:
+            summary: RustQueue Broker is rejecting publishes due to disk pressure
+        - alert: RustQueueStorageErrors
+          expr: increase(rustqueue_storage_errors_total[5m]) > 0
+          labels: {severity: critical}
+          annotations:
+            summary: RustQueue Broker reported a storage error
+        - alert: RustQueueProtectiveEviction
+          expr: increase(rustqueue_protective_evicted_messages_total[5m]) > 0
+          labels: {severity: critical}
+          annotations:
+            summary: RustQueue intentionally evicted messages to protect its disk
+        - alert: RustQueuePublishThrottling
+          expr: rate(rustqueue_publish_throttled_requests_total[5m]) > 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: RustQueue publish admission has been throttling continuously
+        - alert: RustQueueFsyncP99High
+          expr: histogram_quantile(0.99, sum by (le) (rate(rustqueue_storage_fsync_duration_seconds_bucket[5m]))) > 1
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: RustQueue local durable fsync p99 exceeds one second
+{{- end }}

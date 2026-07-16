@@ -1,6 +1,8 @@
 use axum::{response::IntoResponse, routing::get, Router};
 use kube::CustomResourceExt;
 use rustqueue_operator::RustQueue;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,25 +20,38 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Some(command) if command != "run" => anyhow::bail!("unknown command {command}"),
-        _ => tokio::try_join!(rustqueue_operator::controller::run(), health_server()).map(|_| ()),
+        _ => {
+            let leader = Arc::new(AtomicBool::new(false));
+            tokio::try_join!(
+                rustqueue_operator::controller::run(Arc::clone(&leader)),
+                health_server(leader)
+            )
+            .map(|_| ())
+        }
     }
 }
 
-async fn health_server() -> anyhow::Result<()> {
+async fn health_server(leader: Arc<AtomicBool>) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(|| async { "ok" }))
-        .route("/metrics", get(metrics));
+        .route("/metrics", get(move || metrics(Arc::clone(&leader))));
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn metrics() -> impl IntoResponse {
+async fn metrics(leader: Arc<AtomicBool>) -> impl IntoResponse {
     (
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
-        "# HELP rustqueue_operator_up Whether the operator process is running.\n\
+        format!(
+            "# HELP rustqueue_operator_up Whether the operator process is running.\n\
          # TYPE rustqueue_operator_up gauge\n\
-         rustqueue_operator_up 1\n",
+         rustqueue_operator_up 1\n\
+         # HELP rustqueue_operator_leader Whether this replica holds the leader lease.\n\
+         # TYPE rustqueue_operator_leader gauge\n\
+         rustqueue_operator_leader {}\n",
+            leader.load(Ordering::Acquire) as u8
+        ),
     )
 }

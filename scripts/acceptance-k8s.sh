@@ -207,10 +207,10 @@ deadline=$((SECONDS + 180))
 while (( SECONDS < deadline )); do
   phase=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
   message=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.message}' 2>/dev/null || true)
-  if [[ "$phase" == "Rolling" && "$message" == "rolling replacement needs at least two brokers" ]]; then break; fi
+  if [[ "$phase" == "RolloutBlocked" && "$message" == "rolling replacement needs at least two brokers" ]]; then break; fi
   sleep 2
 done
-[[ "$phase" == "Rolling" && "$message" == "rolling replacement needs at least two brokers" ]] || {
+[[ "$phase" == "RolloutBlocked" && "$message" == "rolling replacement needs at least two brokers" ]] || {
   echo "single-broker rolling safety gate was not enforced" >&2
   exit 1
 }

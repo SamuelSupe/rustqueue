@@ -10,11 +10,13 @@ OPERATOR_IMAGE="${OPERATOR_IMAGE:-rustqueue-operator:multi-e2e}"
 COMPAT_IMAGE="${COMPAT_IMAGE:-rustqueue-go-compat:multi-e2e}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 KEEP_CLUSTER="${KEEP_CLUSTER:-0}"
-LEDGER_SECONDS="${LEDGER_SECONDS:-60}"
+LEDGER_SECONDS="${LEDGER_SECONDS:-90}"
 CHART="deploy/helm/rustqueue"
 FAKE_NODES=(rustqueue-capacity-e2e-1 rustqueue-capacity-e2e-2)
 LABELED_NODE=0
 NODE_KEEPER=""
+STORAGE_CLASS=""
+STORAGE_CLASS_CREATED=0
 
 require() {
   command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 1; }
@@ -38,6 +40,9 @@ cleanup() {
     helm uninstall "$RELEASE" -n "$NAMESPACE" >/dev/null 2>&1 || true
     kubectl delete namespace "$NAMESPACE" --wait=false >/dev/null 2>&1 || true
     kubectl delete node "${FAKE_NODES[@]}" --ignore-not-found >/dev/null 2>&1 || true
+    if [[ "$STORAGE_CLASS_CREATED" == "1" ]]; then
+      kubectl delete storageclass "$STORAGE_CLASS" --ignore-not-found >/dev/null 2>&1 || true
+    fi
     if [[ "$LABELED_NODE" == "1" ]]; then
       kubectl label node "$NODE_NAME" rustqueue.io/eligible- >/dev/null 2>&1 || true
     fi
@@ -83,6 +88,37 @@ wait_queue_phase() {
     sleep 2
   done
   echo "queue did not enter phase $expected" >&2
+  return 1
+}
+
+wait_operator_failover() {
+  local previous=$1 deadline=$((SECONDS + ${2:-60})) holder
+  while (( SECONDS < deadline )); do
+    holder=$(kubectl -n "$NAMESPACE" get lease rustqueue-operator-leader \
+      -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
+    if [[ -n "$holder" && "$holder" != "$previous" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "operator leader did not fail over from $previous" >&2
+  return 1
+}
+
+wait_storage_ready() {
+  local size=$1 deadline=$((SECONDS + ${2:-180})) ready requests
+  while (( SECONDS < deadline )); do
+    ready=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" \
+      -o json | jq -r '.status.conditions[]? | select(.type == "StorageReady") | .status' | tail -1)
+    requests=$(kubectl -n "$NAMESPACE" get pvc \
+      -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
+      -o json | jq -r --arg size "$size" '[.items[].spec.resources.requests.storage == $size] | all')
+    if [[ "$ready" == "True" && "$requests" == "true" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "PVCs did not expand to $size" >&2
   return 1
 }
 
@@ -167,6 +203,74 @@ start_operational_ledger() {
   return 1
 }
 
+select_expandable_storage_class() {
+  local default_class provisioner reclaim_policy binding_mode
+  default_class=$(kubectl get storageclass -o json | jq -r \
+    '.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"] == "true") | .metadata.name' | head -1)
+  [[ -n "$default_class" ]] || {
+    echo "OrbStack has no default StorageClass" >&2
+    return 1
+  }
+  if [[ "$(kubectl get storageclass "$default_class" -o jsonpath='{.allowVolumeExpansion}')" == "true" ]]; then
+    STORAGE_CLASS="$default_class"
+    return 0
+  fi
+
+  provisioner=$(kubectl get storageclass "$default_class" -o jsonpath='{.provisioner}')
+  [[ "$provisioner" == "rancher.io/local-path" ]] || {
+    echo "default StorageClass $default_class cannot be cloned safely for expansion acceptance" >&2
+    return 1
+  }
+  reclaim_policy=$(kubectl get storageclass "$default_class" -o jsonpath='{.reclaimPolicy}')
+  binding_mode=$(kubectl get storageclass "$default_class" -o jsonpath='{.volumeBindingMode}')
+  STORAGE_CLASS="${NAMESPACE}-expandable"
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: $STORAGE_CLASS
+  labels:
+    rustqueue.io/acceptance-storage-class: "true"
+provisioner: $provisioner
+reclaimPolicy: ${reclaim_policy:-Delete}
+volumeBindingMode: ${binding_mode:-WaitForFirstConsumer}
+allowVolumeExpansion: true
+EOF
+  STORAGE_CLASS_CREATED=1
+}
+
+complete_orbstack_local_path_resize() {
+  local size=$1 deadline=$((SECONDS + 120)) requests reason claim volume
+  [[ "$STORAGE_CLASS_CREATED" == "1" ]] || return 0
+  while (( SECONDS < deadline )); do
+    requests=$(kubectl -n "$NAMESPACE" get pvc \
+      -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
+      -o json | jq -r --arg size "$size" \
+      '(.items | length) > 0 and ([.items[].spec.resources.requests.storage == $size] | all)')
+    reason=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o json | jq -r \
+      '.status.conditions[]? | select(.type == "StorageReady") | .reason' | tail -1)
+    [[ "$requests" == "true" && "$reason" == "StorageResizing" ]] && break
+    sleep 2
+  done
+  [[ "$requests" == "true" && "$reason" == "StorageResizing" ]] || {
+    echo "operator did not request all local-path PVC expansions before provider acknowledgement" >&2
+    return 1
+  }
+
+  # OrbStack local-path volumes are host directories without a quota, but the
+  # provisioner has no CSI resizer. Emulate only its capacity acknowledgement
+  # after the operator has issued and observed every PVC expansion request.
+  for claim in $(kubectl -n "$NAMESPACE" get pvc \
+    -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
+    -o json | jq -r '.items[].metadata.name'); do
+    volume=$(kubectl -n "$NAMESPACE" get pvc "$claim" -o jsonpath='{.spec.volumeName}')
+    kubectl patch pv "$volume" --type=merge \
+      -p "{\"spec\":{\"capacity\":{\"storage\":\"$size\"}}}" >/dev/null
+    kubectl -n "$NAMESPACE" patch pvc "$claim" --subresource=status --type=merge \
+      -p "{\"status\":{\"capacity\":{\"storage\":\"$size\"}}}" >/dev/null
+  done
+}
+
 probe_metric() {
   local name=$1 url=$2 metric=$3 output
   kubectl -n "$NAMESPACE" delete pod "$name" --ignore-not-found >/dev/null
@@ -191,9 +295,15 @@ require jq
 }
 
 if [[ "$BUILD_IMAGES" == "1" ]]; then
-  make image
+  BUILD_VERSION=0.7.0-e2e-a MAX_STORAGE_FEATURE_LEVEL=1 make image
   docker tag rustqueue:dev "$BROKER_IMAGE_A"
+  BUILD_VERSION=0.7.0-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image
   docker tag rustqueue:dev "$BROKER_IMAGE_B"
+  [[ "$(docker image inspect "$BROKER_IMAGE_A" -f '{{.Id}}')" != \
+     "$(docker image inspect "$BROKER_IMAGE_B" -f '{{.Id}}')" ]] || {
+    echo "acceptance images A and B are not distinct binaries" >&2
+    exit 1
+  }
   make operator-image
   docker tag rustqueue-operator:dev "$OPERATOR_IMAGE"
   docker build -t "$COMPAT_IMAGE" tests/compat/go
@@ -205,8 +315,7 @@ if [[ "$(kubectl get node "$NODE_NAME" -o jsonpath='{.metadata.labels.rustqueue\
   kubectl label node "$NODE_NAME" rustqueue.io/eligible=true >/dev/null
   LABELED_NODE=1
 fi
-STORAGE_CLASS=$(kubectl get storageclass -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{end}')
-[[ -n "$STORAGE_CLASS" ]] || { echo "OrbStack has no default StorageClass" >&2; exit 1; }
+select_expandable_storage_class
 
 kubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null
 wait_namespace_deleted
@@ -238,6 +347,32 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/"$QUEUE-0" pod/"$QUEUE-1"
   echo "three broker PVCs were not created" >&2
   exit 1
 }
+[[ "$(kubectl -n "$NAMESPACE" get pdb "$QUEUE-brokers" -o jsonpath='{.spec.minAvailable}')" == "2" ]] || {
+  echo "broker disruption budget does not preserve two available Pods" >&2
+  exit 1
+}
+[[ "$(kubectl -n "$NAMESPACE" get pdb -l app.kubernetes.io/component=operator -o json | jq '.items | length')" == "1" ]] || {
+  echo "operator disruption budget was not installed" >&2
+  exit 1
+}
+
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p '{"spec":{"storageSize":"2Gi"}}' >/dev/null
+complete_orbstack_local_path_resize 2Gi
+wait_storage_ready 2Gi 240
+
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p "{\"spec\":{\"maintenance\":{\"broker\":\"$QUEUE-2\",\"enabled\":true}}}" >/dev/null
+wait_queue_phase Maintenance 120
+[[ "$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.currentOperation.target}')" == "$QUEUE-2" ]] || {
+  echo "targeted Broker maintenance was not persisted in status" >&2
+  exit 1
+}
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p "{\"spec\":{\"maintenance\":{\"broker\":\"$QUEUE-2\",\"enabled\":false}}}" >/dev/null
+wait_queue_ready 3 120
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p '{"spec":{"maintenance":null}}' >/dev/null
 
 uids_before=$(kubectl -n "$NAMESPACE" get pods \
   -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
@@ -258,7 +393,21 @@ wait_queue_ready 3 120
 
 start_operational_ledger
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
-  -p "{\"spec\":{\"image\":\"$BROKER_IMAGE_B\"}}" >/dev/null
+  -p "{\"spec\":{\"image\":\"$BROKER_IMAGE_B\",\"rollout\":{\"requireCanaryApproval\":true,\"approvedRevision\":null}}}" >/dev/null
+
+wait_queue_phase RolloutAwaitingApproval 180
+[[ "$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker -o json | jq --arg image "$BROKER_IMAGE_B" '[.items[].spec.containers[] | select(.name == "broker" and .image == $image)] | length')" == "1" ]] || {
+  echo "rollout did not stop after exactly one canary Broker" >&2
+  exit 1
+}
+leader=$(kubectl -n "$NAMESPACE" get lease rustqueue-operator-leader -o jsonpath='{.spec.holderIdentity}')
+[[ -n "$leader" ]] || { echo "operator leader lease has no holder" >&2; exit 1; }
+kubectl -n "$NAMESPACE" delete pod "$leader" --wait=false >/dev/null
+wait_operator_failover "$leader" 90
+wait_queue_phase RolloutAwaitingApproval 30
+approved_revision=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.currentOperation.revision}')
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p "{\"spec\":{\"rollout\":{\"approvedRevision\":\"$approved_revision\"}}}" >/dev/null
 
 saw_rolling=0
 deadline=$((SECONDS + 420))
@@ -282,6 +431,36 @@ kubectl -n "$NAMESPACE" logs operational-ledger
 kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker -o json | \
   jq -e --arg image "$BROKER_IMAGE_B" \
     '.items | (length == 3) and all(.[]; all(.spec.containers[]; .image == $image))' >/dev/null
+
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p '{"spec":{"storageFeatureLevel":2,"rollout":{"requireCanaryApproval":false,"approvedRevision":null}}}' >/dev/null
+wait_queue_ready 3 420
+[[ "$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.activeStorageFeatureLevel}')" == "2" ]] || {
+  echo "feature level 2 was not activated after the compatible rollout" >&2
+  exit 1
+}
+
+uids_before=$(kubectl -n "$NAMESPACE" get pods \
+  -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
+  -o json | jq -r '.items | sort_by(.metadata.name) | map(.metadata.uid) | join(",")')
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p "{\"spec\":{\"rollout\":{\"rollbackToImage\":\"$BROKER_IMAGE_A\"}}}" >/dev/null
+wait_queue_phase PreflightBlocked 120
+uids_after=$(kubectl -n "$NAMESPACE" get pods \
+  -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
+  -o json | jq -r '.items | sort_by(.metadata.name) | map(.metadata.uid) | join(",")')
+[[ "$uids_before" == "$uids_after" ]] || {
+  echo "rollback fence replaced a Broker with an incompatible binary" >&2
+  exit 1
+}
+kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p '{"spec":{"rollout":{"rollbackToImage":null}}}' >/dev/null
+wait_queue_ready 3 120
+
+[[ "$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o json | jq '.status.operationHistory | length')" -ge 1 ]] || {
+  echo "completed operations were not retained in bounded status history" >&2
+  exit 1
+}
 
 probe_metric broker-metrics "http://$QUEUE-0.$QUEUE-brokers:4151/metrics" rustqueue_storage_fsync_duration_seconds
 probe_metric proxy-metrics "http://$QUEUE-proxy:4151/metrics" rustqueue_proxy_backend_duration_seconds

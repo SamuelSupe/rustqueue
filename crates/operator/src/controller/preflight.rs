@@ -42,9 +42,10 @@ pub(super) async fn target_image(
     context: &ContextData,
     cluster: &RustQueue,
     namespace: &str,
+    target_image: &str,
 ) -> anyhow::Result<Outcome> {
     let api = Api::<Pod>::namespaced(context.client.clone(), namespace);
-    let name = probe_name(&cluster.name_any(), &cluster.spec.image);
+    let name = probe_name(&cluster.name_any(), target_image);
     let pod = match api.get_opt(&name).await? {
         Some(pod) => pod,
         None => {
@@ -69,7 +70,7 @@ pub(super) async fn target_image(
                         "seccompProfile": {"type": "RuntimeDefault"}
                     },
                     "containers": [{
-                        "name": "probe", "image": cluster.spec.image,
+                        "name": "probe", "image": target_image,
                         "imagePullPolicy": cluster.spec.image_pull_policy,
                         "command": ["rustqueued"],
                         "args": ["--capabilities-output", "/dev/termination-log"],
@@ -196,9 +197,10 @@ pub(super) async fn cleanup_old_probes(
     context: &ContextData,
     cluster: &RustQueue,
     namespace: &str,
+    target_image: &str,
 ) -> anyhow::Result<()> {
     let api = Api::<Pod>::namespaced(context.client.clone(), namespace);
-    let current = probe_name(&cluster.name_any(), &cluster.spec.image);
+    let current = probe_name(&cluster.name_any(), target_image);
     let selector = format!(
         "app.kubernetes.io/instance={},app.kubernetes.io/component=capability-preflight",
         cluster.name_any()

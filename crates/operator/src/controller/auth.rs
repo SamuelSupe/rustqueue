@@ -77,3 +77,32 @@ pub(super) async fn ensure(
         revision: secret.resource_version().unwrap_or_default(),
     })
 }
+
+pub(super) async fn mounted_secret_revision(
+    client: &kube::Client,
+    cluster: &RustQueue,
+    namespace: &str,
+    auth: &AuthSecret,
+) -> anyhow::Result<String> {
+    let Some(name) = cluster.spec.client_tls_secret_name.as_deref() else {
+        return Ok(auth.revision.clone());
+    };
+    let secret = Api::<Secret>::namespaced(client.clone(), namespace)
+        .get(name)
+        .await
+        .with_context(|| format!("read client TLS Secret {name}"))?;
+    let data = secret
+        .data
+        .as_ref()
+        .context("client TLS Secret has no data")?;
+    for key in ["tls.crt", "tls.key"] {
+        if data.get(key).is_none_or(|value| value.0.is_empty()) {
+            bail!("client TLS Secret {name} is missing {key}");
+        }
+    }
+    Ok(format!(
+        "{}:{}",
+        auth.revision,
+        secret.resource_version().unwrap_or_default()
+    ))
+}

@@ -6,8 +6,11 @@ use std::path::Path;
 
 const COMPATIBILITY_FILE: &str = "COMPATIBILITY";
 pub const BASE_STORAGE_FEATURE_LEVEL: u32 = 1;
+#[cfg(rustqueue_storage_feature_level_2)]
+pub const MAX_READER_FEATURE_LEVEL: u32 = 2;
+#[cfg(not(rustqueue_storage_feature_level_2))]
 pub const MAX_READER_FEATURE_LEVEL: u32 = 1;
-pub const MAX_WRITER_FEATURE_LEVEL: u32 = 1;
+pub const MAX_WRITER_FEATURE_LEVEL: u32 = MAX_READER_FEATURE_LEVEL;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BinaryCapabilities {
@@ -28,7 +31,10 @@ pub struct CompatibilityState {
 
 pub fn binary_capabilities() -> BinaryCapabilities {
     BinaryCapabilities {
-        binary_version: env!("CARGO_PKG_VERSION").into(),
+        binary_version: option_env!("RUSTQUEUE_BUILD_VERSION")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .into(),
         data_format: DATA_FORMAT_VERSION,
         minimum_reader_feature_level: BASE_STORAGE_FEATURE_LEVEL,
         maximum_reader_feature_level: MAX_READER_FEATURE_LEVEL,

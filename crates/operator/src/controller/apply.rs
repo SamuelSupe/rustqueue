@@ -4,6 +4,7 @@ use crate::RustQueue;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::{ConfigMap, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use kube::api::{Api, Patch, PatchParams};
 use kube::ResourceExt;
@@ -49,6 +50,13 @@ pub(super) async fn resources(
             &Patch::Apply(&set.brokers),
         )
         .await?;
+    Api::<PodDisruptionBudget>::namespaced(client.clone(), namespace)
+        .patch(
+            &set.broker_pdb.name_any(),
+            &params,
+            &Patch::Apply(&set.broker_pdb),
+        )
+        .await?;
     Api::<Service>::namespaced(client.clone(), namespace)
         .patch(
             &set.discovery_service.name_any(),
@@ -61,6 +69,13 @@ pub(super) async fn resources(
             &set.discovery.name_any(),
             &params,
             &Patch::Apply(&set.discovery),
+        )
+        .await?;
+    Api::<PodDisruptionBudget>::namespaced(client.clone(), namespace)
+        .patch(
+            &set.discovery_pdb.name_any(),
+            &params,
+            &Patch::Apply(&set.discovery_pdb),
         )
         .await?;
     Api::<Service>::namespaced(client.clone(), namespace)

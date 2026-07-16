@@ -53,6 +53,107 @@ pub struct RustQueueSpec {
     pub proxy_node_selector: BTreeMap<String, String>,
     #[serde(default = "default_discovery_replicas")]
     pub discovery_replicas: i32,
+    #[serde(default)]
+    pub maintenance: Option<BrokerMaintenance>,
+    #[serde(default)]
+    pub rollout: RolloutPolicy,
+    #[serde(default)]
+    pub broker_scheduling: BrokerScheduling,
+    #[serde(default)]
+    pub broker_resources: WorkloadResources,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerMaintenance {
+    pub broker: String,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutPolicy {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub require_canary_approval: bool,
+    #[serde(default)]
+    pub approved_revision: Option<String>,
+    #[serde(default = "default_rollout_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub rollback_to_image: Option<String>,
+    #[serde(default)]
+    pub retry_nonce: String,
+}
+
+impl Default for RolloutPolicy {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            require_canary_approval: false,
+            approved_revision: None,
+            timeout_seconds: default_rollout_timeout(),
+            rollback_to_image: None,
+            retry_nonce: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerScheduling {
+    #[serde(default = "default_topology_key")]
+    pub topology_key: String,
+    #[serde(default)]
+    pub priority_class_name: Option<String>,
+    #[serde(default)]
+    pub tolerations: Vec<BrokerToleration>,
+}
+
+impl Default for BrokerScheduling {
+    fn default() -> Self {
+        Self {
+            topology_key: default_topology_key(),
+            priority_class_name: None,
+            tolerations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerToleration {
+    pub key: Option<String>,
+    pub operator: Option<String>,
+    pub value: Option<String>,
+    pub effect: Option<String>,
+    pub toleration_seconds: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadResources {
+    #[serde(default = "default_broker_cpu_request")]
+    pub cpu_request: String,
+    #[serde(default = "default_broker_memory_request")]
+    pub memory_request: String,
+    #[serde(default)]
+    pub cpu_limit: Option<String>,
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+}
+
+impl Default for WorkloadResources {
+    fn default() -> Self {
+        Self {
+            cpu_request: default_broker_cpu_request(),
+            memory_request: default_broker_memory_request(),
+            cpu_limit: None,
+            memory_limit: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -64,6 +165,44 @@ pub struct RustQueueStatus {
     pub phase: String,
     pub message: String,
     pub active_storage_feature_level: u32,
+    #[serde(default)]
+    pub conditions: Vec<RustQueueCondition>,
+    #[serde(default)]
+    pub current_operation: Option<OperationStatus>,
+    #[serde(default)]
+    pub operation_history: Vec<OperationStatus>,
+    #[serde(default)]
+    pub orphaned_pvcs: Vec<String>,
+    #[serde(default)]
+    pub desired_storage_size: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RustQueueCondition {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status: String,
+    pub reason: String,
+    pub message: String,
+    pub observed_generation: Option<i64>,
+    pub last_transition_time: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationStatus {
+    pub id: String,
+    pub kind: String,
+    pub phase: String,
+    pub target: String,
+    pub revision: String,
+    pub message: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub previous_image: Option<String>,
+    pub current_broker: Option<String>,
 }
 
 fn default_min_brokers() -> i32 {
@@ -113,6 +252,18 @@ fn default_max_backlog_messages() -> usize {
 }
 fn default_discovery_replicas() -> i32 {
     2
+}
+fn default_rollout_timeout() -> u64 {
+    600
+}
+fn default_topology_key() -> String {
+    "kubernetes.io/hostname".into()
+}
+fn default_broker_cpu_request() -> String {
+    "100m".into()
+}
+fn default_broker_memory_request() -> String {
+    "256Mi".into()
 }
 
 #[cfg(test)]

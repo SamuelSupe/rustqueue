@@ -26,6 +26,33 @@ spec:
   discoveryReplicas: {{ .Values.queue.discoveryReplicas }}
   proxyNodeSelector:
     {{- toYaml .Values.queue.proxyNodeSelector | nindent 4 }}
+  rollout:
+    paused: {{ .Values.queue.rollout.paused }}
+    requireCanaryApproval: {{ .Values.queue.rollout.requireCanaryApproval }}
+    timeoutSeconds: {{ .Values.queue.rollout.timeoutSeconds }}
+    retryNonce: {{ .Values.queue.rollout.retryNonce | quote }}
+    {{- if .Values.queue.rollout.approvedRevision }}
+    approvedRevision: {{ .Values.queue.rollout.approvedRevision | quote }}
+    {{- end }}
+    {{- if .Values.queue.rollout.rollbackToImage }}
+    rollbackToImage: {{ .Values.queue.rollout.rollbackToImage | quote }}
+    {{- end }}
+  brokerScheduling:
+    topologyKey: {{ .Values.queue.brokerScheduling.topologyKey | quote }}
+    {{- if .Values.queue.brokerScheduling.priorityClassName }}
+    priorityClassName: {{ .Values.queue.brokerScheduling.priorityClassName | quote }}
+    {{- end }}
+    tolerations:
+      {{- toYaml .Values.queue.brokerScheduling.tolerations | nindent 6 }}
+  brokerResources:
+    cpuRequest: {{ .Values.queue.brokerResources.cpuRequest | quote }}
+    memoryRequest: {{ .Values.queue.brokerResources.memoryRequest | quote }}
+    {{- if .Values.queue.brokerResources.cpuLimit }}
+    cpuLimit: {{ .Values.queue.brokerResources.cpuLimit | quote }}
+    {{- end }}
+    {{- if .Values.queue.brokerResources.memoryLimit }}
+    memoryLimit: {{ .Values.queue.brokerResources.memoryLimit | quote }}
+    {{- end }}
   {{- if .Values.queue.registrySecretName }}
   registrySecretName: {{ .Values.queue.registrySecretName | quote }}
   {{- end }}

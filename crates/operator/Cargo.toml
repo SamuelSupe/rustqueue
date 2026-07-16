@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 crc32c.workspace = true
 futures.workspace = true
 k8s-openapi.workspace = true

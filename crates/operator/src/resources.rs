@@ -3,6 +3,7 @@ use anyhow::{bail, Context};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::{ConfigMap, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use kube::{Resource, ResourceExt};
 use serde::de::DeserializeOwned;
@@ -19,8 +20,10 @@ pub struct ResourceSet {
     pub role_binding: RoleBinding,
     pub broker_service: Service,
     pub brokers: StatefulSet,
+    pub broker_pdb: PodDisruptionBudget,
     pub discovery_service: Service,
     pub discovery: Deployment,
+    pub discovery_pdb: PodDisruptionBudget,
     pub proxy_service: Service,
     pub proxy: DaemonSet,
     pub network_policy: NetworkPolicy,
@@ -29,8 +32,10 @@ pub struct ResourceSet {
 pub struct BuildInput<'a> {
     pub cluster: &'a RustQueue,
     pub replicas: i32,
+    pub image: &'a str,
+    pub claim_template_size: &'a str,
     pub secret_name: &'a str,
-    pub secret_revision: &'a str,
+    pub mounted_secret_revision: &'a str,
 }
 
 pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
@@ -61,12 +66,20 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
         crc32c::crc32c(
             format!(
                 "{}\0{}\0{}",
-                cluster.spec.image, config_text, input.secret_revision
+                input.image, config_text, input.mounted_secret_revision
             )
             .as_bytes(),
         )
     );
     let node_selector = pod_node_selector(&cluster.spec.eligible_node_selector)?;
+    let broker_resources = workload_resources(&cluster.spec.broker_resources);
+    let tolerations: Vec<_> = cluster
+        .spec
+        .broker_scheduling
+        .tolerations
+        .iter()
+        .map(|item| serde_json::to_value(item).expect("serializable toleration"))
+        .collect();
 
     let config = typed(json!({
         "apiVersion": "v1", "kind": "ConfigMap",
@@ -136,7 +149,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                 },
                 "spec": {
                     "serviceAccountName": service_account_name,
-                    "terminationGracePeriodSeconds": 30,
+                    "terminationGracePeriodSeconds": 45,
                     "securityContext": {
                         "runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532,
                         "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch",
@@ -145,10 +158,12 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                     "nodeSelector": node_selector,
                     "affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{
                         "labelSelector": {"matchLabels": labels_for(&labels, "broker")},
-                        "topologyKey": "kubernetes.io/hostname"
+                        "topologyKey": cluster.spec.broker_scheduling.topology_key
                     }]}},
+                    "priorityClassName": cluster.spec.broker_scheduling.priority_class_name,
+                    "tolerations": tolerations,
                     "containers": [{
-                        "name": "broker", "image": cluster.spec.image,
+                        "name": "broker", "image": input.image,
                         "imagePullPolicy": cluster.spec.image_pull_policy,
                         "command": ["rustqueued"], "args": ["--config", "/etc/rustqueue/rustqueue.toml"],
                         "ports": [{"name": "tcp", "containerPort": 4150}, {"name": "http", "containerPort": 4151}],
@@ -166,7 +181,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                         },
                         "readinessProbe": {"httpGet": {"path": "/v1/health", "port": "http"}, "periodSeconds": 2, "failureThreshold": 2},
                         "livenessProbe": {"httpGet": {"path": "/ping", "port": "http"}, "periodSeconds": 10, "failureThreshold": 3},
-                        "resources": {"requests": {"cpu": "100m", "memory": "256Mi"}}
+                        "resources": broker_resources
                     }],
                     "volumes": broker_volumes
                 }
@@ -175,9 +190,17 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                 "metadata": {"name": "data", "labels": labels_for(&labels, "broker")},
                 "spec": {
                     "accessModes": ["ReadWriteOnce"], "storageClassName": cluster.spec.storage_class_name,
-                    "resources": {"requests": {"storage": cluster.spec.storage_size}}
+                    "resources": {"requests": {"storage": input.claim_template_size}}
                 }
             }]
+        }
+    }))?;
+    let broker_pdb = typed(json!({
+        "apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+        "metadata": metadata(&format!("{name}-brokers"), "broker"),
+        "spec": {
+            "minAvailable": (input.replicas - 1).max(1),
+            "selector": {"matchLabels": labels_for(&labels, "broker")}
         }
     }))?;
 
@@ -201,7 +224,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                         "seccompProfile": {"type": "RuntimeDefault"}
                     },
                     "containers": [{
-                        "name": "discovery", "image": cluster.spec.image,
+                        "name": "discovery", "image": input.image,
                         "imagePullPolicy": cluster.spec.image_pull_policy,
                         "command": ["rustqueue-discovery"],
                         "ports": [{"name": "http", "containerPort": 4161}],
@@ -222,6 +245,14 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                     "volumes": [{"name": "auth", "secret": {"secretName": input.secret_name}}]
                 }
             }
+        }
+    }))?;
+    let discovery_pdb = typed(json!({
+        "apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+        "metadata": metadata(&format!("{discovery_name}-pdb"), "discovery"),
+        "spec": {
+            "minAvailable": 1,
+            "selector": {"matchLabels": labels_for(&labels, "discovery")}
         }
     }))?;
 
@@ -247,7 +278,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                         "seccompProfile": {"type": "RuntimeDefault"}
                     },
                     "containers": [{
-                        "name": "proxy", "image": cluster.spec.image,
+                        "name": "proxy", "image": input.image,
                         "imagePullPolicy": cluster.spec.image_pull_policy,
                         "command": ["rustqueue-proxy"],
                         "ports": [{"name": "tcp", "containerPort": 4150}, {"name": "http", "containerPort": 4151}],
@@ -282,8 +313,10 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
         role_binding,
         broker_service,
         brokers,
+        broker_pdb,
         discovery_service,
         discovery,
+        discovery_pdb,
         proxy_service,
         proxy,
         network_policy,
@@ -342,6 +375,26 @@ fn typed<T: DeserializeOwned>(value: Value) -> anyhow::Result<T> {
     serde_json::from_value(value).context("build Kubernetes resource")
 }
 
+fn workload_resources(resources: &crate::crd::WorkloadResources) -> Value {
+    let mut limits = serde_json::Map::new();
+    if let Some(cpu) = &resources.cpu_limit {
+        limits.insert("cpu".into(), json!(cpu));
+    }
+    if let Some(memory) = &resources.memory_limit {
+        limits.insert("memory".into(), json!(memory));
+    }
+    let mut value = json!({
+        "requests": {
+            "cpu": resources.cpu_request,
+            "memory": resources.memory_request,
+        }
+    });
+    if !limits.is_empty() {
+        value["limits"] = Value::Object(limits);
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +430,10 @@ mod tests {
                 client_tls_secret_name: None,
                 proxy_node_selector: BTreeMap::new(),
                 discovery_replicas: 2,
+                maintenance: None,
+                rollout: crate::crd::RolloutPolicy::default(),
+                broker_scheduling: crate::crd::BrokerScheduling::default(),
+                broker_resources: crate::crd::WorkloadResources::default(),
             },
             status: None,
         }
@@ -387,8 +444,10 @@ mod tests {
         let resources = build(BuildInput {
             cluster: &cluster(),
             replicas: 3,
+            image: "rustqueue:test",
+            claim_template_size: "100Gi",
             secret_name: "queue-auth",
-            secret_revision: "1",
+            mounted_secret_revision: "1",
         })
         .unwrap();
         let spec = resources.brokers.spec.unwrap();
@@ -396,6 +455,10 @@ mod tests {
         assert_eq!(spec.service_name.as_deref(), Some("queue-brokers"));
         assert_eq!(spec.update_strategy.unwrap().type_, Some("OnDelete".into()));
         assert_eq!(spec.volume_claim_templates.unwrap().len(), 1);
+        assert_eq!(
+            resources.broker_pdb.spec.unwrap().min_available,
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(2))
+        );
         assert_eq!(
             spec.template
                 .spec
