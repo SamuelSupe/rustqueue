@@ -19,7 +19,7 @@ else
   docker build -q -f "$root/fuzz/Dockerfile" -t rustqueue-fuzz:dev "$root" >/dev/null
 fi
 toolchain=$(docker run --rm rustqueue-fuzz:dev sh -c "rustup show active-toolchain | awk '{print \$1}'")
-for target in protocol storage_record snapshot_manifest compression topology_operation; do
+for target in protocol storage_record compression; do
   docker run --rm \
     -e CARGO_INCREMENTAL=0 \
     -e RUSTUP_TOOLCHAIN="$toolchain" \

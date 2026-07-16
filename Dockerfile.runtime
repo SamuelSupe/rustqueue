@@ -3,8 +3,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /data /var/lib/rustqueue && chown -R 65532:65532 /data /var/lib/rustqueue
 COPY .docker-bin/rustqueued /usr/local/bin/rustqueued
+COPY .docker-bin/rustqueue-discovery /usr/local/bin/rustqueue-discovery
+COPY .docker-bin/rustqueue-proxy /usr/local/bin/rustqueue-proxy
 COPY .docker-bin/rustqueue-bench /usr/local/bin/rustqueue-bench
 USER 65532:65532
 WORKDIR /var/lib/rustqueue
-EXPOSE 4150 4151 4250 4350
+EXPOSE 4150 4151 4161
 ENTRYPOINT ["/usr/local/bin/rustqueued"]

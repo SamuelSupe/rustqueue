@@ -1,147 +1,141 @@
-use crate::model::StoredMessage;
-use rustqueue_protocol::MAX_MPUB_MESSAGES;
-use rustqueue_storage::PayloadRef;
-use std::io;
-use std::ops::Range;
-use std::path::PathBuf;
+use crate::model::MessageMeta;
+use crate::BrokerError;
+use rustqueue_storage::{PayloadRef, Record, RecordLocation, HEADER_LEN};
 use std::sync::Arc;
 
-const ITEM_HEADER: usize = 8 + 8 + 8 + 4;
+const ITEM_HEADER: usize = 20;
 
-#[derive(Clone, Copy)]
-pub struct MessageHeader {
-    pub id: u64,
-    pub timestamp_ns: i64,
-    pub available_at_ms: i64,
+pub(crate) struct EncodedBatch {
+    pub payload: Vec<u8>,
+    pub entries: Vec<EncodedEntry>,
 }
 
-pub fn encode<B>(
-    headers: &[MessageHeader],
+pub(crate) struct EncodedEntry {
+    pub position: u64,
+    pub id: u64,
+    pub body_offset: usize,
+    pub len: u32,
+    pub crc32c: u32,
+}
+
+pub(crate) fn encode<B: AsRef<[u8]>>(
+    first_position: u64,
+    first_id: u64,
     bodies: &[B],
-) -> io::Result<(Vec<u8>, Vec<Range<usize>>)>
-where
-    B: AsRef<[u8]>,
-{
-    if headers.len() != bodies.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "message header and body counts differ",
-        ));
-    }
-    if bodies.len() > MAX_MPUB_MESSAGES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "batch message count exceeds limit",
-        ));
-    }
+) -> Result<EncodedBatch, BrokerError> {
     let capacity = 4usize.saturating_add(
         bodies
             .iter()
-            .map(|body| ITEM_HEADER.saturating_add(body.as_ref().len()))
-            .sum(),
+            .map(|body| ITEM_HEADER + body.as_ref().len())
+            .sum::<usize>(),
     );
-    let mut output = Vec::with_capacity(capacity);
-    let mut ranges = Vec::with_capacity(bodies.len());
-    output.extend_from_slice(&(bodies.len() as u32).to_be_bytes());
-    for (header, body) in headers.iter().zip(bodies) {
+    let mut payload = Vec::with_capacity(capacity);
+    payload.extend_from_slice(&(bodies.len() as u32).to_be_bytes());
+    let mut entries = Vec::with_capacity(bodies.len());
+    for (ordinal, body) in bodies.iter().enumerate() {
         let body = body.as_ref();
-        let length: u32 = body
-            .len()
-            .try_into()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "message too large"))?;
-        output.extend_from_slice(&header.id.to_be_bytes());
-        output.extend_from_slice(&header.timestamp_ns.to_be_bytes());
-        output.extend_from_slice(&header.available_at_ms.to_be_bytes());
-        output.extend_from_slice(&length.to_be_bytes());
-        let start = output.len();
-        output.extend_from_slice(body);
-        ranges.push(start..output.len());
+        let len = u32::try_from(body.len()).map_err(|_| BrokerError::MessageTooLarge)?;
+        let position = first_position.saturating_add(ordinal as u64);
+        let id = first_id.saturating_add(ordinal as u64);
+        payload.extend_from_slice(&position.to_be_bytes());
+        payload.extend_from_slice(&id.to_be_bytes());
+        payload.extend_from_slice(&len.to_be_bytes());
+        let body_offset = payload.len();
+        payload.extend_from_slice(body);
+        entries.push(EncodedEntry {
+            position,
+            id,
+            body_offset,
+            len,
+            crc32c: crc32c::crc32c(body),
+        });
     }
-    Ok((output, ranges))
+    Ok(EncodedBatch { payload, entries })
 }
 
-pub fn decode_refs(
-    mut input: &[u8],
-    log_index: u64,
-    path: &Arc<PathBuf>,
-    payload_offset: u64,
-) -> io::Result<Vec<StoredMessage>> {
-    let original_len = input.len();
-    let count = take_u32(&mut input)? as usize;
-    if count > MAX_MPUB_MESSAGES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "batch message count exceeds limit",
+pub(crate) fn metas(
+    record: &Record,
+    location: &RecordLocation,
+) -> Result<Vec<MessageMeta>, BrokerError> {
+    if record.payload.len() < 4 {
+        return Err(BrokerError::InvalidRecord(
+            "publish batch is truncated".into(),
         ));
     }
-    let mut messages = Vec::with_capacity(count);
-    let path = Arc::clone(path);
-    for batch_ordinal in 0..count {
-        if input.len() < ITEM_HEADER {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated batch item",
+    let count = u32::from_be_bytes(record.payload[0..4].try_into().unwrap()) as usize;
+    if count == 0 {
+        return Err(BrokerError::InvalidRecord("publish batch is empty".into()));
+    }
+    let mut cursor = 4usize;
+    let mut output = Vec::with_capacity(count);
+    for ordinal in 0..count {
+        if cursor.saturating_add(ITEM_HEADER) > record.payload.len() {
+            return Err(BrokerError::InvalidRecord(
+                "publish batch item is truncated".into(),
             ));
         }
-        let id = take_u64(&mut input)?;
-        let timestamp_ns = take_i64(&mut input)?;
-        let available_at_ms = take_i64(&mut input)?;
-        let length = take_u32(&mut input)? as usize;
-        if input.len() < length {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "truncated batch body",
+        let position = u64::from_be_bytes(record.payload[cursor..cursor + 8].try_into().unwrap());
+        let id = u64::from_be_bytes(record.payload[cursor + 8..cursor + 16].try_into().unwrap());
+        let len = u32::from_be_bytes(record.payload[cursor + 16..cursor + 20].try_into().unwrap());
+        cursor += ITEM_HEADER;
+        let end = cursor
+            .checked_add(len as usize)
+            .ok_or_else(|| BrokerError::InvalidRecord("publish batch length overflow".into()))?;
+        if end > record.payload.len() {
+            return Err(BrokerError::InvalidRecord(
+                "publish batch body is truncated".into(),
             ));
         }
-        let consumed = original_len - input.len();
-        let body = &input[..length];
-        messages.push(StoredMessage {
+        if ordinal == 0 && id != record.message_id {
+            return Err(BrokerError::InvalidRecord(
+                "publish batch first ID mismatch".into(),
+            ));
+        }
+        let body = &record.payload[cursor..end];
+        output.push(MessageMeta {
+            position,
             id,
-            timestamp_ns,
-            available_at_ms,
-            log_index,
-            batch_ordinal: batch_ordinal as u32,
+            timestamp_ns: record.timestamp_ns,
+            available_at_ms: record.available_at_ms,
+            log_index: location.index,
             payload: PayloadRef {
-                path: Arc::clone(&path),
-                offset: payload_offset.saturating_add(consumed as u64),
-                len: length as u32,
+                path: Arc::clone(&location.segment),
+                offset: location.offset + HEADER_LEN as u64 + cursor as u64,
+                len,
                 crc32c: crc32c::crc32c(body),
             },
         });
-        input = &input[length..];
+        cursor = end;
     }
-    if !input.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "batch contains trailing bytes",
+    if cursor != record.payload.len() {
+        return Err(BrokerError::InvalidRecord(
+            "publish batch has trailing bytes".into(),
         ));
     }
-    Ok(messages)
-}
-
-fn take_u32(input: &mut &[u8]) -> io::Result<u32> {
-    let bytes = take::<4>(input)?;
-    Ok(u32::from_be_bytes(bytes))
-}
-
-fn take_u64(input: &mut &[u8]) -> io::Result<u64> {
-    let bytes = take::<8>(input)?;
-    Ok(u64::from_be_bytes(bytes))
-}
-
-fn take_i64(input: &mut &[u8]) -> io::Result<i64> {
-    let bytes = take::<8>(input)?;
-    Ok(i64::from_be_bytes(bytes))
-}
-
-fn take<const N: usize>(input: &mut &[u8]) -> io::Result<[u8; N]> {
-    if input.len() < N {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "truncated batch header",
-        ));
-    }
-    let output = input[..N].try_into().unwrap();
-    *input = &input[N..];
     Ok(output)
+}
+
+pub(crate) fn metas_after_append(
+    timestamp_ns: i64,
+    available_at_ms: i64,
+    location: &RecordLocation,
+    batch: &EncodedBatch,
+) -> Vec<MessageMeta> {
+    batch
+        .entries
+        .iter()
+        .map(|entry| MessageMeta {
+            position: entry.position,
+            id: entry.id,
+            timestamp_ns,
+            available_at_ms,
+            log_index: location.index,
+            payload: PayloadRef {
+                path: Arc::clone(&location.segment),
+                offset: location.offset + HEADER_LEN as u64 + entry.body_offset as u64,
+                len: entry.len,
+                crc32c: entry.crc32c,
+            },
+        })
+        .collect()
 }

@@ -4,7 +4,15 @@ use std::{env, fs, path::Path};
 
 impl Config {
     pub(super) fn apply_environment(&mut self) -> anyhow::Result<()> {
-        set_from_env("RUSTQUEUE_NODE_ID", &mut self.node.id)?;
+        if env::var_os("RUSTQUEUE_NODE_ID").is_some() {
+            set_from_env("RUSTQUEUE_NODE_ID", &mut self.node.id)?;
+        } else if let Ok(pod_name) = env::var("POD_NAME") {
+            let ordinal = pod_name
+                .rsplit_once('-')
+                .and_then(|(_, value)| value.parse::<u64>().ok())
+                .with_context(|| "POD_NAME must end in a StatefulSet ordinal")?;
+            self.node.id = ordinal.saturating_add(1);
+        }
         set_string_env(
             "RUSTQUEUE_BROADCAST_ADDRESS",
             &mut self.node.broadcast_address,
@@ -15,16 +23,12 @@ impl Config {
             self.storage.data_path = value.into();
         }
         set_from_env(
-            "RUSTQUEUE_DEFAULT_PARTITIONS",
-            &mut self.queue.default_partitions,
-        )?;
-        set_from_env(
-            "RUSTQUEUE_MAX_PARTITIONS_PER_TOPIC",
-            &mut self.queue.max_partitions_per_topic,
-        )?;
-        set_from_env(
             "RUSTQUEUE_MAX_MESSAGE_BYTES",
             &mut self.queue.max_message_bytes,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_BOOTSTRAP_RETENTION_SECONDS",
+            &mut self.queue.bootstrap_retention_seconds,
         )?;
         set_from_env("RUSTQUEUE_MAX_BODY_BYTES", &mut self.limits.max_body_bytes)?;
         set_from_env(
@@ -55,15 +59,6 @@ impl Config {
             "RUSTQUEUE_DEAD_LETTER_SUFFIX",
             &mut self.queue.dead_letter_suffix,
         );
-        set_from_env(
-            "RUSTQUEUE_DISCOVERY_ENABLED",
-            &mut self.cluster.discovery.enabled,
-        )?;
-        set_from_env(
-            "RUSTQUEUE_FEDERATION_ENABLED",
-            &mut self.cluster.federation.enabled,
-        )?;
-        set_from_env("RUSTQUEUE_CELL_ID", &mut self.cluster.federation.cell_id)?;
         set_string_env("RUSTQUEUE_LOG_FORMAT", &mut self.log_format);
         Ok(())
     }

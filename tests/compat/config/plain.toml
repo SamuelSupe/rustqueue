@@ -13,9 +13,6 @@ advertised_http_port = 4151
 [storage]
 data_path = "/data"
 
-[queue]
-default_partitions = 2
-
 [limits]
 heartbeat_interval_ms = 1000
 output_buffer_size = 16384

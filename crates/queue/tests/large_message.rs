@@ -10,16 +10,16 @@ async fn persists_and_delivers_a_twenty_mebibyte_message() {
         ..BrokerConfig::default()
     })
     .unwrap();
-    broker.create_topic("large", None).unwrap();
-    broker.create_channel("large", "workers").unwrap();
+    broker.create_topic("large").await.unwrap();
+    broker.create_channel("large", "workers").await.unwrap();
 
     let body = vec![0x5a; 20 * 1024 * 1024];
     broker
-        .publish("large", vec![body.clone()], Duration::ZERO, None, None)
+        .publish("large", vec![body.clone()], Duration::ZERO)
+        .await
         .unwrap();
-    let mut cursor = 0;
     let delivery = broker
-        .next_message("large", "workers", &mut cursor, None)
+        .next_message("large", "workers", None)
         .await
         .unwrap()
         .unwrap();

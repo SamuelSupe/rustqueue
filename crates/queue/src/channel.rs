@@ -1,0 +1,351 @@
+use crate::channel_store::ChannelStore;
+use crate::model::ChannelStats;
+use crate::BrokerError;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) enum ChannelCommand {
+    Finish {
+        position: u64,
+        message_id: u64,
+    },
+    Requeue {
+        position: u64,
+        message_id: u64,
+        available_at_ms: i64,
+        attempts: u16,
+    },
+    Pause {
+        paused: bool,
+    },
+    Empty {
+        through_position: u64,
+    },
+    Evict {
+        through_position: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChannelCheckpoint {
+    pub format: u8,
+    pub name: String,
+    pub barrier_position: u64,
+    pub ack_floor_position: u64,
+    pub acknowledged: BTreeSet<u64>,
+    pub requeued_until: BTreeMap<u64, i64>,
+    #[serde(default)]
+    pub attempts: BTreeMap<u64, u16>,
+    pub paused: bool,
+    pub ephemeral: bool,
+}
+
+struct InFlight {
+    deadline_ms: i64,
+    token: u64,
+}
+
+pub(crate) struct ChannelRuntime {
+    pub state: ChannelState,
+    pub store: Option<ChannelStore>,
+}
+
+pub(crate) struct ChannelState {
+    pub name: String,
+    pub barrier_position: u64,
+    pub ack_floor_position: u64,
+    pub acknowledged: BTreeSet<u64>,
+    pub requeued_until: BTreeMap<u64, i64>,
+    pub paused: bool,
+    pub ephemeral: bool,
+    next_position: u64,
+    in_flight: HashMap<u64, InFlight>,
+    in_flight_ids: HashMap<u64, u64>,
+    redelivery: BTreeSet<u64>,
+    attempts: HashMap<u64, u16>,
+    next_token: u64,
+    max_ack_gap: usize,
+}
+
+impl ChannelState {
+    pub fn new(name: String, barrier_position: u64, ephemeral: bool, max_ack_gap: usize) -> Self {
+        Self {
+            name,
+            barrier_position,
+            ack_floor_position: barrier_position,
+            acknowledged: BTreeSet::new(),
+            requeued_until: BTreeMap::new(),
+            paused: false,
+            ephemeral,
+            next_position: barrier_position.saturating_add(1),
+            in_flight: HashMap::new(),
+            in_flight_ids: HashMap::new(),
+            redelivery: BTreeSet::new(),
+            attempts: HashMap::new(),
+            next_token: 1,
+            max_ack_gap: max_ack_gap.max(1),
+        }
+    }
+
+    pub fn from_checkpoint(
+        checkpoint: ChannelCheckpoint,
+        max_ack_gap: usize,
+    ) -> Result<Self, BrokerError> {
+        if checkpoint.format != 7 || checkpoint.ack_floor_position < checkpoint.barrier_position {
+            return Err(BrokerError::InvalidRecord(
+                "invalid channel checkpoint".into(),
+            ));
+        }
+        let next_position = checkpoint.ack_floor_position.saturating_add(1);
+        Ok(Self {
+            name: checkpoint.name,
+            barrier_position: checkpoint.barrier_position,
+            ack_floor_position: checkpoint.ack_floor_position,
+            acknowledged: checkpoint.acknowledged,
+            requeued_until: checkpoint.requeued_until,
+            paused: checkpoint.paused,
+            ephemeral: checkpoint.ephemeral,
+            next_position,
+            in_flight: HashMap::new(),
+            in_flight_ids: HashMap::new(),
+            redelivery: BTreeSet::new(),
+            attempts: checkpoint.attempts.into_iter().collect(),
+            next_token: 1,
+            max_ack_gap: max_ack_gap.max(1),
+        })
+    }
+
+    pub fn checkpoint(&self) -> ChannelCheckpoint {
+        ChannelCheckpoint {
+            format: 7,
+            name: self.name.clone(),
+            barrier_position: self.barrier_position,
+            ack_floor_position: self.ack_floor_position,
+            acknowledged: self.acknowledged.clone(),
+            requeued_until: self.requeued_until.clone(),
+            attempts: self
+                .attempts
+                .iter()
+                .map(|(position, attempts)| (*position, *attempts))
+                .collect(),
+            paused: self.paused,
+            ephemeral: self.ephemeral,
+        }
+    }
+
+    pub fn apply(&mut self, command: &ChannelCommand) {
+        match *command {
+            ChannelCommand::Finish { position, .. } => self.acknowledge(position),
+            ChannelCommand::Requeue {
+                position,
+                available_at_ms,
+                attempts,
+                ..
+            } => {
+                self.remove_in_flight(position);
+                self.redelivery.insert(position);
+                self.requeued_until.insert(position, available_at_ms);
+                self.attempts.insert(position, attempts);
+            }
+            ChannelCommand::Pause { paused } => self.paused = paused,
+            ChannelCommand::Empty { through_position }
+            | ChannelCommand::Evict { through_position } => {
+                self.ack_floor_position = self.ack_floor_position.max(through_position);
+                self.acknowledged
+                    .retain(|position| *position > through_position);
+                self.requeued_until
+                    .retain(|position, _| *position > through_position);
+                self.attempts
+                    .retain(|position, _| *position > through_position);
+                let removed: Vec<_> = self
+                    .in_flight
+                    .keys()
+                    .copied()
+                    .filter(|position| *position <= through_position)
+                    .collect();
+                for position in removed {
+                    self.remove_in_flight(position);
+                }
+                self.redelivery
+                    .retain(|position| *position > through_position);
+                self.next_position = self.next_position.max(through_position.saturating_add(1));
+            }
+        }
+    }
+
+    pub fn next_candidate(
+        &mut self,
+        now_ms: i64,
+        last_position: u64,
+        available_at: impl Fn(u64) -> Option<i64>,
+    ) -> Option<u64> {
+        if self.paused {
+            return None;
+        }
+        let expired: Vec<_> = self
+            .in_flight
+            .iter()
+            .filter_map(|(position, flight)| (flight.deadline_ms <= now_ms).then_some(*position))
+            .collect();
+        for position in expired {
+            self.remove_in_flight(position);
+            self.redelivery.insert(position);
+        }
+        let ready_redelivery = self.redelivery.iter().copied().find(|position| {
+            self.requeued_until
+                .get(position)
+                .copied()
+                .unwrap_or_default()
+                <= now_ms
+                && available_at(*position).is_some_and(|available| available <= now_ms)
+        });
+        if let Some(position) = ready_redelivery {
+            self.redelivery.remove(&position);
+            self.requeued_until.remove(&position);
+            return Some(position);
+        }
+        while self.next_position <= last_position {
+            if self.next_position
+                > self
+                    .ack_floor_position
+                    .saturating_add(self.max_ack_gap as u64)
+            {
+                return None;
+            }
+            let position = self.next_position;
+            self.next_position = self.next_position.saturating_add(1);
+            if position <= self.ack_floor_position
+                || self.acknowledged.contains(&position)
+                || self.in_flight.contains_key(&position)
+            {
+                continue;
+            }
+            let Some(available) = available_at(position) else {
+                continue;
+            };
+            if available > now_ms {
+                self.redelivery.insert(position);
+                self.requeued_until.insert(position, available);
+                continue;
+            }
+            return Some(position);
+        }
+        None
+    }
+
+    pub fn reserve(&mut self, position: u64, id: u64, timeout_ms: i64) -> (u64, u16) {
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1).max(1);
+        let attempts = self.attempts.entry(position).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        self.in_flight.insert(
+            position,
+            InFlight {
+                deadline_ms: now_ms().saturating_add(timeout_ms),
+                token,
+            },
+        );
+        self.in_flight_ids.insert(id, position);
+        (token, *attempts)
+    }
+
+    pub fn cancel(&mut self, position: u64, token: u64) {
+        if self
+            .in_flight
+            .get(&position)
+            .is_some_and(|flight| flight.token == token)
+        {
+            self.remove_in_flight(position);
+            self.redelivery.insert(position);
+        }
+    }
+
+    pub fn defer_candidate(&mut self, position: u64) {
+        self.redelivery.insert(position);
+    }
+
+    pub fn in_flight_position(&self, id: u64) -> Option<u64> {
+        self.in_flight_ids.get(&id).copied()
+    }
+
+    pub fn delivery_attempts(&self, position: u64) -> u16 {
+        self.attempts.get(&position).copied().unwrap_or_default()
+    }
+
+    pub fn touch(&mut self, position: u64, timeout_ms: i64) -> bool {
+        let Some(flight) = self.in_flight.get_mut(&position) else {
+            return false;
+        };
+        flight.deadline_ms = now_ms().saturating_add(timeout_ms);
+        true
+    }
+
+    pub fn release(&mut self, position: u64) {
+        if self.remove_in_flight(position) {
+            self.redelivery.insert(position);
+        }
+    }
+
+    pub fn release_all(&mut self) -> usize {
+        let positions: Vec<_> = self.in_flight.keys().copied().collect();
+        let count = positions.len();
+        for position in positions {
+            self.remove_in_flight(position);
+            self.redelivery.insert(position);
+        }
+        count
+    }
+
+    pub fn first_in_flight_position(&self) -> Option<u64> {
+        self.in_flight.keys().copied().min()
+    }
+
+    pub fn stats(&self, last_position: u64) -> ChannelStats {
+        let total = last_position.saturating_sub(self.ack_floor_position);
+        ChannelStats {
+            name: self.name.clone(),
+            depth: total.saturating_sub(self.acknowledged.len() as u64),
+            in_flight_count: self.in_flight.len() as u64,
+            deferred_count: self.requeued_until.len() as u64,
+            paused: self.paused,
+            ephemeral: self.ephemeral,
+            ack_cursor: self.ack_floor_position,
+            ack_gap: self.acknowledged.len() as u64,
+        }
+    }
+
+    fn acknowledge(&mut self, position: u64) {
+        self.remove_in_flight(position);
+        self.redelivery.remove(&position);
+        self.requeued_until.remove(&position);
+        self.attempts.remove(&position);
+        if position <= self.ack_floor_position {
+            return;
+        }
+        self.acknowledged.insert(position);
+        while self
+            .acknowledged
+            .remove(&self.ack_floor_position.saturating_add(1))
+        {
+            self.ack_floor_position = self.ack_floor_position.saturating_add(1);
+        }
+    }
+
+    fn remove_in_flight(&mut self, position: u64) -> bool {
+        let removed = self.in_flight.remove(&position).is_some();
+        if removed {
+            self.in_flight_ids
+                .retain(|_, candidate| *candidate != position);
+        }
+        removed
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}

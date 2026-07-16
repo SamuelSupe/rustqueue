@@ -4,80 +4,32 @@ fullnameOverride: ""
 operator:
   image:
     repository: rustqueue-operator
-    tag: "0.6.0"
+    tag: "0.7.0"
     pullPolicy: IfNotPresent
   log: rustqueue_operator=info
   resources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: "1"
-      memory: 512Mi
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: "1", memory: 512Mi}
 
-cluster:
+queue:
   create: true
   name: rustqueue
-  image: rustqueue:0.6.0
+  image: rustqueue:0.7.0
   imagePullPolicy: IfNotPresent
-
-  storage:
-    # Empty selects the single default StorageClass. Set this explicitly for SSD production PVCs.
-    className: ""
-    size: 100Gi
-    retainOnDelete: true
-    minFreeBytes: 10737418240
-    diskHighWatermarkPercent: 85
-    diskLowWatermarkPercent: 75
-    protectiveEvictionEnabled: true
-
-  nodes:
-    selector:
-      rustqueue.io/dedicated: "true"
-    dedicated: true
-    taintKey: rustqueue.io/dedicated
-    failureDomainLabel: topology.kubernetes.io/zone
-    autoScaleFromNodes: true
-    replicas: null
-
-  cells:
-    minNodes: 3
-    targetNodes: 9
-    maxNodes: 9
-    routersPerCell: 3
-    maxHomeCellsPerTopic: 128
-
-  replication:
-    metadata: 3
-    partitions: 3
-
-  queue:
-    defaultPartitions: 4
-    maxPartitionsPerTopic: 1024
-    maxMessageBytes: 33554432
-    maxBodyBytes: 67108864
-    maxBacklogMessagesPerPartition: 10000000
-    messageRetentionSeconds: 0
-    maxDeliveryAttempts: 16
-
-  security:
-    caValidityDays: 3650
-    certificateValidityDays: 365
-    renewBeforeDays: 30
-
-  upgrade:
-    automatic: true
-    maxUnavailablePerCell: 1
-    progressDeadlineSeconds: 600
-    retryGeneration: 0
-
-  resources:
-    cpuRequest: 500m
-    memoryRequest: 1Gi
-    cpuLimit: "4"
-    memoryLimit: 8Gi
-
-  development:
-    # Functional testing only. Production must use one eligible node per Broker.
-    allowSingleNode: false
-    virtualReplicas: 3
+  minBrokers: 1
+  maxBrokers: 500
+  eligibleNodeSelector: rustqueue.io/eligible=true
+  storageClassName: local-path
+  storageSize: 100Gi
+  minFreeBytes: 10737418240
+  diskHighWatermarkPercent: 85
+  diskLowWatermarkPercent: 75
+  protectiveEvictionEnabled: true
+  diskPressureGraceSeconds: 60
+  bootstrapRetentionSeconds: 30
+  maxMessageBytes: 20971520
+  maxBacklogMessages: 10000000
+  registrySecretName: ""
+  clientTlsSecretName: ""
+  discoveryReplicas: 2
+  proxyNodeSelector: {}

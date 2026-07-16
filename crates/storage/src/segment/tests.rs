@@ -1,15 +1,16 @@
 use super::*;
 use crate::RecordKind;
+use std::io::{Seek, SeekFrom};
 use tempfile::tempdir;
 
 fn record(index: u64, payload: &[u8]) -> Record {
     Record {
         kind: RecordKind::PublishBatch,
         flags: 0,
-        term: 1,
         index,
         timestamp_ns: 1,
         message_id: index,
+        available_at_ms: 0,
         payload: payload.to_vec(),
     }
 }
@@ -83,6 +84,30 @@ fn refuses_middle_corruption() {
 }
 
 #[test]
+fn refuses_a_checksum_corrupt_complete_tail() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 4096).unwrap();
+    log.append(record(0, b"confirmed"), true).unwrap();
+    let path = log.current_path.clone();
+    drop(log);
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    file.seek(SeekFrom::Start(HEADER_LEN as u64)).unwrap();
+    file.write_all(b"X").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    assert!(matches!(
+        SegmentLog::open(directory.path(), 4096),
+        Err(StorageError::Corrupt { offset: 0, .. })
+    ));
+}
+
+#[test]
 fn purges_only_complete_inactive_segments() {
     let directory = tempdir().unwrap();
     let mut log = SegmentLog::open(directory.path(), 100).unwrap();
@@ -95,4 +120,19 @@ fn purges_only_complete_inactive_segments() {
     assert_eq!(log.segment_paths().unwrap().len(), 2);
     assert!(log.read(2).unwrap().is_none());
     assert_eq!(log.read(3).unwrap().unwrap().payload, vec![3; 20]);
+}
+
+#[cfg(unix)]
+#[test]
+fn isolates_log_after_a_mutating_io_failure() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 1024).unwrap();
+    log.append(record(0, b"entry"), true).unwrap();
+    std::fs::remove_file(&log.current_path).unwrap();
+
+    assert!(matches!(log.truncate_suffix(1), Err(StorageError::Io(_))));
+    assert!(matches!(
+        log.append(record(0, b"must-not-write"), true),
+        Err(StorageError::Isolated)
+    ));
 }

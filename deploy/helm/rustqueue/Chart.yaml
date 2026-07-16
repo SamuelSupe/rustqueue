@@ -1,12 +1,12 @@
 apiVersion: v2
 name: rustqueue
-description: RustQueue Broker cluster and Kubernetes Operator
+description: Kubernetes-native share-nothing NSQ-compatible message queue
 type: application
-version: 0.6.0
-appVersion: "0.6.0"
+version: 0.7.0
+appVersion: "0.7.0"
 kubeVersion: ">=1.28.0-0"
 keywords:
   - messaging
   - nsq
-  - raft
+  - share-nothing
   - operator

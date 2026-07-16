@@ -22,36 +22,46 @@ pub struct Metrics {
     pub protocol_errors: AtomicU64,
     pub auth_failures: AtomicU64,
     pub storage_errors: AtomicU64,
+    pub disk_total_bytes: AtomicU64,
+    pub disk_available_bytes: AtomicU64,
+    pub disk_used_percent: AtomicU64,
+    pub disk_pressure: AtomicI64,
+    pub protective_evictions: AtomicU64,
+    pub protective_evicted_messages: AtomicU64,
 }
 
 pub fn render_broker(stats: &BrokerStats) -> String {
-    let mut output = String::from(
-        "# TYPE rustqueue_partition_messages gauge\n\
+    let mut output = format!(
+        "# TYPE rustqueue_publish_group_commits_total counter\n\
+         rustqueue_publish_group_commits_total {}\n\
+         # TYPE rustqueue_publish_group_requests_total counter\n\
+         rustqueue_publish_group_requests_total {}\n\
+         # TYPE rustqueue_publish_group_max_requests gauge\n\
+         rustqueue_publish_group_max_requests {}\n\
+         # TYPE rustqueue_topic_messages gauge\n\
          # TYPE rustqueue_channel_depth gauge\n\
          # TYPE rustqueue_channel_in_flight gauge\n\
          # TYPE rustqueue_channel_deferred gauge\n\
          # TYPE rustqueue_channel_ack_gap gauge\n",
+        stats.publish_group_commit.commits,
+        stats.publish_group_commit.requests,
+        stats.publish_group_commit.max_batch_requests,
     );
     for topic in &stats.topics {
-        for partition in &topic.partitions {
-            let partition_labels = format!(
-                "topic=\"{}\",partition=\"{}\",slot=\"{}\"",
-                topic.name, partition.partition, partition.slot
-            );
+        let topic_label = format!("topic=\"{}\"", topic.name);
+        output.push_str(&format!(
+            "rustqueue_topic_messages{{{topic_label}}} {}\n",
+            topic.message_count
+        ));
+        for channel in &topic.channels {
+            let labels = format!("{topic_label},channel=\"{}\"", channel.name);
             output.push_str(&format!(
-                "rustqueue_partition_messages{{{partition_labels}}} {}\n",
-                partition.message_count
-            ));
-            for channel in &partition.channels {
-                let labels = format!("{partition_labels},channel=\"{}\"", channel.name);
-                output.push_str(&format!(
-                    "rustqueue_channel_depth{{{labels}}} {}\n\
+                "rustqueue_channel_depth{{{labels}}} {}\n\
                      rustqueue_channel_in_flight{{{labels}}} {}\n\
                      rustqueue_channel_deferred{{{labels}}} {}\n\
                      rustqueue_channel_ack_gap{{{labels}}} {}\n",
-                    channel.depth, channel.in_flight_count, channel.deferred_count, channel.ack_gap,
-                ));
-            }
+                channel.depth, channel.in_flight_count, channel.deferred_count, channel.ack_gap,
+            ));
         }
     }
     output
@@ -98,7 +108,19 @@ impl Metrics {
                 "# TYPE rustqueue_auth_failures_total counter\n",
                 "rustqueue_auth_failures_total {}\n",
                 "# TYPE rustqueue_storage_errors_total counter\n",
-                "rustqueue_storage_errors_total {}\n"
+                "rustqueue_storage_errors_total {}\n",
+                "# TYPE rustqueue_disk_total_bytes gauge\n",
+                "rustqueue_disk_total_bytes {}\n",
+                "# TYPE rustqueue_disk_available_bytes gauge\n",
+                "rustqueue_disk_available_bytes {}\n",
+                "# TYPE rustqueue_disk_used_percent gauge\n",
+                "rustqueue_disk_used_percent {}\n",
+                "# TYPE rustqueue_disk_pressure gauge\n",
+                "rustqueue_disk_pressure {}\n",
+                "# TYPE rustqueue_protective_evictions_total counter\n",
+                "rustqueue_protective_evictions_total {}\n",
+                "# TYPE rustqueue_protective_evicted_messages_total counter\n",
+                "rustqueue_protective_evicted_messages_total {}\n"
             ),
             self.tcp_connections.load(Ordering::Relaxed),
             self.publish_messages.load(Ordering::Relaxed),
@@ -119,6 +141,12 @@ impl Metrics {
             self.protocol_errors.load(Ordering::Relaxed),
             self.auth_failures.load(Ordering::Relaxed),
             self.storage_errors.load(Ordering::Relaxed),
+            self.disk_total_bytes.load(Ordering::Relaxed),
+            self.disk_available_bytes.load(Ordering::Relaxed),
+            self.disk_used_percent.load(Ordering::Relaxed),
+            self.disk_pressure.load(Ordering::Relaxed),
+            self.protective_evictions.load(Ordering::Relaxed),
+            self.protective_evicted_messages.load(Ordering::Relaxed),
         )
     }
 }

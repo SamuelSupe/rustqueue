@@ -13,9 +13,6 @@ advertised_http_port = 4151
 [storage]
 data_path = "/data"
 
-[queue]
-default_partitions = 2
-
 [security]
 auth_http_addresses = ["http://auth:4181"]
 

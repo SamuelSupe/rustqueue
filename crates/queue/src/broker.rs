@@ -1,638 +1,479 @@
-use crate::batch;
-use crate::catalog::{Catalog, CatalogStore, PartitionDefinition, TopicDefinition};
-use crate::dedup::{DedupCache, DedupKey};
-use crate::model::{
-    BrokerStats, ChannelState, ChannelStats, Delivery, InFlight, LoadingDelivery, PartitionStats,
-    ReservedDelivery, StoredMessage, TopicStats,
-};
+#[path = "broker/group_commit.rs"]
+mod group_commit;
+#[path = "broker/io.rs"]
+mod io;
+#[path = "broker/maintenance.rs"]
+mod maintenance;
+
+use crate::metadata::{load_optional, store_atomic, topic_directory, BrokerMeta, TopicManifest};
+use crate::model::BrokerStats;
 use crate::payload_reader::PayloadReader;
-use crate::projection::{PartitionProjection, ProjectedChannel, ProjectedMessage};
+use crate::topic::TopicHandle;
 use parking_lot::{Mutex, RwLock};
 use rustqueue_protocol::validate_name;
-use rustqueue_storage::{
-    ensure_data_format, Record, RecordKind, SegmentLog, StorageError, MAX_RECORD_BYTES,
-};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use rustqueue_storage::{ensure_data_format, StorageError};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thiserror::Error;
-
-const MAX_PARTITION_SLOT: u32 = u16::MAX as u32;
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
     pub data_path: PathBuf,
-    pub default_partitions: u16,
+    pub node_id: u64,
     pub max_segment_bytes: u64,
     pub max_message_bytes: usize,
     pub message_timeout: Duration,
+    pub bootstrap_retention: Duration,
     pub max_ack_gap: usize,
-    pub max_backlog_messages_per_partition: usize,
-    pub projection_only: bool,
+    pub max_backlog_messages: usize,
     pub entry_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
-    pub dedup_max_entries: usize,
-    pub dedup_ttl: Duration,
-    pub cell_id: u64,
 }
 
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
-            data_path: PathBuf::from("data"),
-            default_partitions: 1,
+            data_path: "data".into(),
+            node_id: 1,
             max_segment_bytes: 100 * 1024 * 1024,
-            max_message_bytes: 1024 * 1024,
+            max_message_bytes: 20 * 1024 * 1024,
             message_timeout: Duration::from_secs(60),
+            bootstrap_retention: Duration::from_secs(30),
             max_ack_gap: 65_536,
-            max_backlog_messages_per_partition: 10_000_000,
-            projection_only: false,
+            max_backlog_messages: 10_000_000,
             entry_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
-            dedup_max_entries: 1_000_000,
-            dedup_ttl: Duration::from_secs(600),
-            cell_id: 1,
         }
     }
 }
 
 #[derive(Debug, Error)]
 pub enum BrokerError {
-    #[error("topic not found")]
+    #[error("topic is invalid")]
+    InvalidTopic,
+    #[error("channel is invalid")]
+    InvalidChannel,
+    #[error("topic does not exist")]
     TopicNotFound,
-    #[error("channel not found")]
+    #[error("topic deletion is still draining in-process readers")]
+    TopicRetiring,
+    #[error("channel does not exist")]
     ChannelNotFound,
-    #[error("partition not found")]
-    PartitionNotFound,
-    #[error("message not in flight")]
+    #[error("message does not exist")]
+    MessageNotFound,
+    #[error("message is not in flight")]
     MessageNotInFlight,
-    #[error("message exceeds configured maximum")]
+    #[error("message exceeds configured limit")]
     MessageTooLarge,
-    #[error("batch exceeds storage record maximum")]
+    #[error("publish batch is invalid or too large")]
     BatchTooLarge,
-    #[error("partition backlog quota exceeded")]
+    #[error("topic backlog limit reached")]
     BacklogLimit,
-    #[error("partition slot space exhausted")]
-    SlotExhausted,
-    #[error("storage error: {0}")]
-    Storage(#[from] StorageError),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("message ID sequence exhausted")]
+    SequenceExhausted,
+    #[error("local storage is isolated after an earlier failure; restart is required")]
+    StorageUnavailable,
     #[error("invalid durable record: {0}")]
     InvalidRecord(String),
-    #[error("invalid topic name")]
-    InvalidTopic,
-    #[error("invalid channel name")]
-    InvalidChannel,
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
+#[derive(Clone)]
 pub struct Broker {
+    inner: Arc<BrokerInner>,
+}
+
+struct BrokerInner {
     config: BrokerConfig,
-    catalog_store: CatalogStore,
-    catalog: Mutex<Catalog>,
-    topics: RwLock<HashMap<String, Arc<Topic>>>,
+    topics_root: PathBuf,
+    meta_path: PathBuf,
+    meta: Mutex<BrokerMeta>,
+    sequence: Mutex<SequenceState>,
+    topic_lifecycle: Mutex<()>,
+    topics: RwLock<HashMap<String, Arc<TopicHandle>>>,
+    retired_topics: Mutex<HashMap<String, Arc<TopicHandle>>>,
     payload_reader: Arc<PayloadReader>,
-    dedup: Mutex<DedupCache>,
+    registry_revision: AtomicU64,
+    storage_healthy: AtomicBool,
+    publish_groups: group_commit::PublishGroups,
 }
 
-struct Topic {
-    name: String,
-    partitions: RwLock<PartitionRoutes>,
-    key_routing_slots: Vec<u16>,
-    next_partition: AtomicUsize,
-    paused: AtomicBool,
+struct SequenceState {
+    next: u64,
+    reserved_exclusive: u64,
 }
 
-struct PartitionRoutes {
-    ordered: Vec<Arc<Mutex<Partition>>>,
-    by_number: HashMap<u16, Arc<Mutex<Partition>>>,
-    by_slot: HashMap<u16, Arc<Mutex<Partition>>>,
+impl Broker {
+    pub fn open(config: BrokerConfig) -> Result<Self, BrokerError> {
+        if config.node_id == 0 || config.node_id > u16::MAX as u64 {
+            return Err(BrokerError::InvalidRecord(
+                "node ID must fit 16 bits".into(),
+            ));
+        }
+        ensure_data_format(&config.data_path)
+            .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
+        let topics_root = config.data_path.join("topics");
+        std::fs::create_dir_all(&topics_root)?;
+        std::fs::create_dir_all(config.data_path.join("dlq-outbox"))?;
+        std::fs::create_dir_all(config.data_path.join("audit"))?;
+        let meta_path = config.data_path.join("broker.meta");
+        let meta = match load_optional::<BrokerMeta>(&meta_path)? {
+            Some(meta) if meta.format == 7 && meta.node_id == config.node_id => meta,
+            Some(_) => {
+                return Err(BrokerError::InvalidRecord(
+                    "broker.meta identity or format mismatch".into(),
+                ))
+            }
+            None => {
+                let meta = BrokerMeta {
+                    format: 7,
+                    node_id: config.node_id,
+                    next_sequence: 1,
+                    registry_revision: 1,
+                };
+                store_atomic(&meta_path, &meta)?;
+                meta
+            }
+        };
+        let payload_reader = PayloadReader::new(
+            config.entry_cache_bytes,
+            config.payload_read_workers,
+            config.payload_read_queue,
+        );
+        let mut topics = HashMap::new();
+        for entry in std::fs::read_dir(&topics_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() || !entry.path().join("manifest").exists() {
+                continue;
+            }
+            let manifest: TopicManifest = load_optional(&entry.path().join("manifest"))?
+                .ok_or_else(|| BrokerError::InvalidRecord("topic manifest disappeared".into()))?;
+            if manifest.deleted {
+                std::fs::remove_dir_all(entry.path())?;
+                continue;
+            }
+            let handle = TopicHandle::open(
+                &entry.path(),
+                config.max_segment_bytes,
+                config.max_backlog_messages,
+                config.max_ack_gap,
+            )?;
+            let name = handle.state.lock().name.clone();
+            topics.insert(name, handle);
+        }
+        let revision = meta.registry_revision;
+        let next_sequence = meta.next_sequence;
+        let broker = Self {
+            inner: Arc::new(BrokerInner {
+                config,
+                topics_root,
+                meta_path,
+                meta: Mutex::new(meta),
+                sequence: Mutex::new(SequenceState {
+                    next: next_sequence,
+                    reserved_exclusive: next_sequence,
+                }),
+                topic_lifecycle: Mutex::new(()),
+                topics: RwLock::new(topics),
+                retired_topics: Mutex::new(HashMap::new()),
+                payload_reader,
+                registry_revision: AtomicU64::new(revision),
+                storage_healthy: AtomicBool::new(true),
+                publish_groups: group_commit::PublishGroups::default(),
+            }),
+        };
+        broker.recover_outbox()?;
+        Ok(broker)
+    }
+
+    pub async fn create_topic(&self, name: &str) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        let name = name.to_owned();
+        self.storage_task(move || broker.get_or_create_topic(&name).map(|_| ()))
+            .await
+    }
+
+    pub async fn delete_topic(&self, name: &str) -> Result<(), BrokerError> {
+        validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
+        let broker = self.clone();
+        let name = name.to_owned();
+        self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            let handle = broker
+                .inner
+                .topics
+                .read()
+                .get(&name)
+                .cloned()
+                .ok_or(BrokerError::TopicNotFound)?;
+            handle.state.lock().mark_deleted()?;
+            broker.inner.topics.write().remove(&name);
+            let directory = topic_directory(&broker.inner.config.data_path, &name);
+            if Arc::strong_count(&handle) == 1
+                && !broker.inner.payload_reader.has_active_under(&directory)
+            {
+                std::fs::remove_dir_all(directory)?;
+                std::fs::File::open(&broker.inner.topics_root)?.sync_all()?;
+            } else {
+                broker
+                    .inner
+                    .retired_topics
+                    .lock()
+                    .insert(name.clone(), handle);
+            }
+            broker.bump_registry()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn create_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        validate_channel(channel)?;
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        let channel = channel.to_owned();
+        self.storage_task(move || {
+            let handle = broker.get_or_create_topic(&topic)?;
+            if handle
+                .state
+                .lock()
+                .create_channel(&channel, broker.inner.config.bootstrap_retention)?
+            {
+                broker.bump_registry()?;
+            }
+            handle.signal();
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn delete_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        let channel = channel.to_owned();
+        self.storage_task(move || {
+            broker
+                .topic(&topic)?
+                .state
+                .lock()
+                .delete_channel(&channel)?;
+            broker.bump_registry()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn set_topic_paused(&self, topic: &str, paused: bool) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        self.storage_task(move || broker.topic(&topic)?.state.lock().set_paused(paused))
+            .await
+    }
+
+    pub async fn set_channel_paused(
+        &self,
+        topic: &str,
+        channel: &str,
+        paused: bool,
+    ) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        let channel = channel.to_owned();
+        self.storage_task(move || {
+            broker
+                .topic(&topic)?
+                .state
+                .lock()
+                .set_channel_paused(&channel, paused)
+        })
+        .await
+    }
+
+    pub async fn empty_topic(&self, topic: &str) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        self.storage_task(move || broker.topic(&topic)?.state.lock().empty_topic())
+            .await
+    }
+
+    pub async fn empty_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        let channel = channel.to_owned();
+        self.storage_task(move || broker.topic(&topic)?.state.lock().empty_channel(&channel))
+            .await
+    }
+
+    pub fn topic_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.inner.topics.read().keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    pub fn channel_names(&self, topic: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(self.topic(topic)?.state.lock().channel_names())
+    }
+
+    pub fn stats(&self) -> BrokerStats {
+        let mut topics: Vec<_> = self
+            .inner
+            .topics
+            .read()
+            .values()
+            .map(|topic| topic.state.lock().stats())
+            .collect();
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        BrokerStats {
+            publish_group_commit: self.inner.publish_groups.stats(),
+            topics,
+        }
+    }
+
+    pub fn registry_revision(&self) -> u64 {
+        self.inner.registry_revision.load(Ordering::Acquire)
+    }
+
+    pub fn storage_healthy(&self) -> bool {
+        self.inner.storage_healthy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ensure_storage_healthy(&self) -> Result<(), BrokerError> {
+        if self.storage_healthy() {
+            Ok(())
+        } else {
+            Err(BrokerError::StorageUnavailable)
+        }
+    }
+
+    pub(crate) fn observe_storage_result<T>(
+        &self,
+        result: Result<T, BrokerError>,
+    ) -> Result<T, BrokerError> {
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_)
+            )
+        }) {
+            self.inner.storage_healthy.store(false, Ordering::Release);
+        }
+        result
+    }
+
+    async fn storage_task<T: Send + 'static>(
+        &self,
+        task: impl FnOnce() -> Result<T, BrokerError> + Send + 'static,
+    ) -> Result<T, BrokerError> {
+        self.ensure_storage_healthy()?;
+        let result = blocking(task).await;
+        self.observe_storage_result(result)
+    }
+
+    fn get_or_create_topic(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
+        validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
+        if let Some(topic) = self.inner.topics.read().get(name).cloned() {
+            return Ok(topic);
+        }
+        let _lifecycle = self.inner.topic_lifecycle.lock();
+        self.cleanup_retired_topic(name)?;
+        let mut topics = self.inner.topics.write();
+        if let Some(topic) = topics.get(name).cloned() {
+            return Ok(topic);
+        }
+        let directory = topic_directory(&self.inner.config.data_path, name);
+        let topic = TopicHandle::create(
+            &directory,
+            name,
+            self.inner.config.max_segment_bytes,
+            self.inner.config.max_backlog_messages,
+            self.inner.config.max_ack_gap,
+        )?;
+        topics.insert(name.into(), Arc::clone(&topic));
+        drop(topics);
+        self.bump_registry()?;
+        Ok(topic)
+    }
+
+    fn cleanup_retired_topic(&self, name: &str) -> Result<(), BrokerError> {
+        let mut retired = self.inner.retired_topics.lock();
+        let Some(handle) = retired.get(name) else {
+            return Ok(());
+        };
+        if Arc::strong_count(handle) > 1 {
+            return Err(BrokerError::TopicRetiring);
+        }
+        let directory = topic_directory(&self.inner.config.data_path, name);
+        if self.inner.payload_reader.has_active_under(&directory) {
+            return Err(BrokerError::TopicRetiring);
+        }
+        let handle = retired.remove(name).expect("retired topic still exists");
+        drop(handle);
+        if directory.exists() {
+            std::fs::remove_dir_all(directory)?;
+        }
+        std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
+        Ok(())
+    }
+
+    fn topic(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
+        validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
+        self.inner
+            .topics
+            .read()
+            .get(name)
+            .cloned()
+            .ok_or(BrokerError::TopicNotFound)
+    }
+
+    fn bump_registry(&self) -> Result<(), BrokerError> {
+        let revision = self
+            .inner
+            .registry_revision
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let mut meta = self.inner.meta.lock();
+        meta.registry_revision = revision;
+        store_atomic(&self.inner.meta_path, &*meta)?;
+        Ok(())
+    }
 }
 
-struct Partition {
-    number: u16,
-    slot: u16,
-    group_id: u64,
-    cell_id: u64,
-    wire_incarnation: u32,
-    base_sequence: u64,
-    next_sequence: u64,
-    log: SegmentLog,
-    messages: Vec<StoredMessage>,
-    channels: HashMap<String, ChannelState>,
-    durable_appends: bool,
-    dirty: bool,
-    max_ack_gap: usize,
-    max_backlog_messages: usize,
-    persist_wal: bool,
-    projection_index: u64,
-    next_delivery_token: u64,
-    delivery_wake: tokio::sync::watch::Sender<u64>,
+fn validate_channel(channel: &str) -> Result<(), BrokerError> {
+    validate_name(channel).map_err(|_| BrokerError::InvalidChannel)
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ChannelCommand {
-    channel: String,
-    #[serde(default)]
-    message_id: u64,
-    #[serde(default)]
-    available_at_ms: i64,
-    #[serde(default)]
-    paused: bool,
-}
-
-mod api;
-mod batch_delivery;
-mod channel_delivery;
-mod partition_apply;
-mod partition_channel;
-mod partition_snapshot;
-mod partition_storage;
-mod projection;
-mod protective_eviction;
-mod topic;
-
-pub use protective_eviction::ProtectiveEvictionCandidate;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PartitionLayout {
-    pub number: u16,
-    pub slot: u16,
-    pub cell_id: u64,
-    pub group_id: u64,
-    pub wire_incarnation: u32,
-}
-
-fn topic_path(data_path: &Path, name: &str) -> PathBuf {
-    data_path.join("topics").join(name)
+async fn blocking<T: Send + 'static>(
+    task: impl FnOnce() -> Result<T, BrokerError> + Send + 'static,
+) -> Result<T, BrokerError> {
+    tokio::task::spawn_blocking(task).await.map_err(|error| {
+        BrokerError::InvalidRecord(format!("blocking storage task failed: {error}"))
+    })?
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
 }
 
 fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
         .min(i64::MAX as u128) as i64
 }
 
-fn duration_ms(duration: Duration) -> i64 {
-    duration.as_millis().min(i64::MAX as u128) as i64
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    fn open_broker(path: &Path) -> Arc<Broker> {
-        Broker::open(BrokerConfig {
-            data_path: path.to_path_buf(),
-            default_partitions: 2,
-            max_segment_bytes: 1024,
-            max_message_bytes: 1024,
-            message_timeout: Duration::from_millis(20),
-            max_ack_gap: 65_536,
-            max_backlog_messages_per_partition: 10_000_000,
-            projection_only: false,
-            entry_cache_bytes: 1024 * 1024,
-            payload_read_workers: 1,
-            payload_read_queue: 16,
-            dedup_max_entries: 1024,
-            dedup_ttl: Duration::from_secs(60),
-            cell_id: 7,
-        })
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn internal_message_identity_survives_partial_batch_gc_and_restart() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker
-            .ensure_topic_layout_v4(
-                "events",
-                &[PartitionLayout {
-                    number: 0,
-                    slot: 19,
-                    cell_id: 7,
-                    group_id: 42,
-                    wire_incarnation: 3,
-                }],
-                &[19],
-            )
-            .unwrap();
-        broker.create_channel("events", "workers").unwrap();
-        let wire_ids = broker
-            .publish(
-                "events",
-                vec![b"first".to_vec(), b"second".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        let first = broker.internal_message_id("events", wire_ids[0]).unwrap();
-        let second = broker.internal_message_id("events", wire_ids[1]).unwrap();
-        assert_eq!(first.group.cell, rustqueue_protocol::CellId(7));
-        assert_eq!(first.group.local, 42);
-        assert_eq!(first.log_index, second.log_index);
-        assert_eq!((first.ordinal, second.ordinal), (0, 1));
-        assert_eq!(first.incarnation, 3);
-        let mut cursor = 0;
-        let delivery = broker
-            .next_message("events", "workers", &mut cursor, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivery.id, wire_ids[0]);
-        broker.finish("events", "workers", delivery.id).unwrap();
-        assert_eq!(broker.compact_partition_projection("events", 0).unwrap(), 1);
-        assert_eq!(
-            broker.internal_message_id("events", wire_ids[1]).unwrap(),
-            second
-        );
-        drop(broker);
-
-        let broker = open_broker(directory.path());
-        assert_eq!(
-            broker.internal_message_id("events", wire_ids[1]).unwrap(),
-            second
-        );
-    }
-
-    #[tokio::test]
-    async fn fanout_and_restart_preserve_acknowledgements() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker.create_channel("events", "one").unwrap();
-        broker.create_channel("events", "two").unwrap();
-        let ids = broker
-            .publish(
-                "events",
-                vec![b"hello".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        let mut cursor = 0;
-        let first = broker
-            .next_message("events", "one", &mut cursor, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.id, ids[0]);
-        broker.finish("events", "one", first.id).unwrap();
-        drop(broker);
-
-        let broker = open_broker(directory.path());
-        let mut cursor = 0;
-        assert!(broker
-            .next_message("events", "one", &mut cursor, None)
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            broker
-                .next_message("events", "two", &mut cursor, None)
-                .await
-                .unwrap()
-                .unwrap()
-                .body
-                .as_ref(),
-            b"hello"
-        );
-    }
-
-    #[test]
-    fn concurrent_first_publish_creates_one_runtime_topic() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        let barrier = Arc::new(std::sync::Barrier::new(16));
-        let mut workers = Vec::new();
-        for worker in 0..16 {
-            let broker = Arc::clone(&broker);
-            let barrier = Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
-                barrier.wait();
-                for message in 0..100 {
-                    broker
-                        .publish(
-                            "first-publish-race",
-                            vec![format!("{worker}-{message}").into_bytes()],
-                            Duration::ZERO,
-                            None,
-                            None,
-                        )
-                        .unwrap();
-                }
-            }));
-        }
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        let count: u64 = broker
-            .stats()
-            .topics
-            .iter()
-            .find(|topic| topic.name == "first-publish-race")
-            .unwrap()
-            .partitions
-            .iter()
-            .map(|partition| partition.message_count)
-            .sum();
-        assert_eq!(count, 1_600);
-    }
-
-    #[tokio::test]
-    async fn timeout_redelivers_at_least_once() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker.create_channel("jobs", "workers").unwrap();
-        broker
-            .publish("jobs", vec![b"job".to_vec()], Duration::ZERO, Some(0), None)
-            .unwrap();
-        let mut cursor = 0;
-        let first = broker
-            .next_message(
-                "jobs",
-                "workers",
-                &mut cursor,
-                Some(Duration::from_millis(1)),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(3));
-        let second = broker
-            .next_message("jobs", "workers", &mut cursor, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.id, second.id);
-        assert_eq!(second.attempts, 2);
-    }
-
-    #[tokio::test]
-    async fn channel_starts_after_creation_barrier() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker
-            .publish(
-                "events",
-                vec![b"old".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        broker.create_channel("events", "new").unwrap();
-        broker
-            .publish(
-                "events",
-                vec![b"new".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        let mut cursor = 0;
-        let delivery = broker
-            .next_message("events", "new", &mut cursor, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivery.body.as_ref(), b"new");
-    }
-
-    #[tokio::test]
-    async fn payload_reservation_does_not_hold_the_partition_lock() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker.create_channel("events", "workers").unwrap();
-        let ids = broker
-            .publish(
-                "events",
-                vec![b"one".to_vec(), b"two".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        let mut cursor = 0;
-        let first = broker
-            .next_message("events", "workers", &mut cursor, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.id, ids[0]);
-
-        let partition = broker.partition("events", 0).unwrap();
-        let reservation = partition
-            .lock()
-            .reserve_next_message("workers", Duration::from_secs(1))
-            .unwrap()
-            .unwrap();
-        assert_eq!(reservation.message_id, ids[1]);
-        assert!(partition.try_lock().is_some());
-        broker.finish("events", "workers", first.id).unwrap();
-        partition.lock().cancel_delivery("workers", &reservation);
-    }
-
-    #[tokio::test]
-    async fn replicated_publish_is_runtime_idempotent_but_cache_loss_can_duplicate() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker.create_channel("events", "workers").unwrap();
-        let timestamp = 123_456_789;
-        let ids = broker
-            .publish_replicated(
-                77,
-                "events",
-                vec![b"once".to_vec()],
-                timestamp,
-                0,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        let repeated = broker
-            .publish_replicated(
-                77,
-                "events",
-                vec![b"once".to_vec()],
-                timestamp,
-                0,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_eq!(ids, repeated);
-        drop(broker);
-
-        let broker = open_broker(directory.path());
-        let recovered = broker
-            .publish_replicated(
-                77,
-                "events",
-                vec![b"once".to_vec()],
-                timestamp,
-                0,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_ne!(ids, recovered);
-        let mut cursor = 0;
-        let delivery = broker
-            .next_message("events", "workers", &mut cursor, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(delivery.timestamp_ns, timestamp);
-        assert_eq!(broker.stats().topics[0].message_count, 2);
-    }
-
-    #[tokio::test]
-    async fn topic_pause_survives_restart_and_blocks_delivery() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker.create_channel("events", "workers").unwrap();
-        broker
-            .publish(
-                "events",
-                vec![b"queued".to_vec()],
-                Duration::ZERO,
-                None,
-                None,
-            )
-            .unwrap();
-        broker.set_topic_paused("events", true).unwrap();
-        drop(broker);
-
-        let broker = open_broker(directory.path());
-        let mut cursor = 0;
-        assert!(broker
-            .next_message("events", "workers", &mut cursor, None)
-            .await
-            .unwrap()
-            .is_none());
-        broker.set_topic_paused("events", false).unwrap();
-        assert_eq!(
-            broker
-                .next_message("events", "workers", &mut cursor, None)
-                .await
-                .unwrap()
-                .unwrap()
-                .body
-                .as_ref(),
-            b"queued"
-        );
-    }
-
-    #[tokio::test]
-    async fn snapshot_compaction_keeps_sequence_mapping_after_prefix_gc() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        broker.create_channel("events", "workers").unwrap();
-        let ids = broker
-            .publish(
-                "events",
-                vec![b"one".to_vec(), b"two".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        for id in &ids {
-            let mut cursor = 0;
-            broker
-                .next_message("events", "workers", &mut cursor, None)
-                .await
-                .unwrap()
-                .unwrap();
-            broker.finish("events", "workers", *id).unwrap();
-        }
-        assert_eq!(broker.compact_partition_projection("events", 0).unwrap(), 2);
-        let next = broker
-            .publish(
-                "events",
-                vec![b"three".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_eq!(next[0] & ((1u64 << 48) - 1), 3);
-        let mut cursor = 0;
-        assert_eq!(
-            broker
-                .next_message("events", "workers", &mut cursor, None)
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            next[0]
-        );
-    }
-
-    #[test]
-    fn rejects_names_that_can_escape_storage_paths() {
-        let directory = tempdir().unwrap();
-        let broker = open_broker(directory.path());
-        assert!(matches!(
-            broker.publish("../escape", vec![b"x".to_vec()], Duration::ZERO, None, None),
-            Err(BrokerError::InvalidTopic)
-        ));
-        assert!(matches!(
-            broker.create_channel("safe", "bad/channel"),
-            Err(BrokerError::InvalidChannel)
-        ));
-    }
-
-    #[test]
-    fn partition_backlog_quota_rejects_before_allocating_more_ids() {
-        let directory = tempdir().unwrap();
-        let broker = Broker::open(BrokerConfig {
-            data_path: directory.path().to_path_buf(),
-            max_backlog_messages_per_partition: 1,
-            max_segment_bytes: 1024 * 1024,
-            ..BrokerConfig::default()
-        })
-        .unwrap();
-        let first = broker
-            .publish(
-                "events",
-                vec![b"one".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None,
-            )
-            .unwrap();
-        assert_eq!(1, first.len());
-        assert!(matches!(
-            broker.publish(
-                "events",
-                vec![b"two".to_vec()],
-                Duration::ZERO,
-                Some(0),
-                None
-            ),
-            Err(BrokerError::BacklogLimit)
-        ));
-    }
-}
+#[path = "broker_tests.rs"]
+mod tests;

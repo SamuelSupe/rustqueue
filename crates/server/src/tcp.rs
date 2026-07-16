@@ -1,14 +1,11 @@
-mod ack_pipeline;
 mod authorization;
 mod codec;
 mod commands;
-mod cursor;
 mod dead_letter;
 mod session;
 mod time;
 mod writer;
 
-use ack_pipeline::*;
 use authorization::*;
 use codec::*;
 use commands::*;
@@ -26,22 +23,18 @@ use crate::tls;
 use anyhow::Context;
 use bytes::Bytes;
 use parking_lot::Mutex as SyncMutex;
-use rustqueue_consensus::{
-    dead_letter_topic, ClusterRuntime, FetchRequest, FetchResponse, QueueCommand, RemoteDelivery,
-    TouchRequest, DEFAULT_FETCH_WAIT_MS, MAX_FETCH_BYTES, MAX_FETCH_MESSAGES,
-};
 use rustqueue_protocol::{
     encode_frame, encode_message_header, parse_mpub_bytes, Command, CommandError, FrameType,
     IdentifyRequest, IdentifyResponse, CLOSE_WAIT, HEARTBEAT, MAGIC_V2, OK,
 };
 use rustqueue_queue::{Broker, BrokerError};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{
@@ -70,14 +63,36 @@ enum Compression {
 struct Subscription {
     topic: String,
     channel: String,
-    partition_cursor: usize,
-    ephemeral_lease: Option<u64>,
 }
 
 type EphemeralConsumers = Arc<SyncMutex<HashMap<(String, String), usize>>>;
 
-const EPHEMERAL_LEASE: Duration = Duration::from_secs(30);
-const EPHEMERAL_RENEW_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_FETCH_MESSAGES: u16 = 64;
+const MAX_FETCH_BYTES: u32 = 32 * 1024 * 1024;
+const DEFAULT_FETCH_WAIT_MS: u32 = 100;
+
+#[derive(Clone, Debug)]
+struct FetchRequest {
+    topic: String,
+    channel: String,
+    timeout_ms: u64,
+    max_messages: u16,
+    max_bytes: u32,
+    wait_ms: u32,
+}
+
+#[derive(Clone, Debug)]
+struct FetchResponse {
+    deliveries: Vec<RemoteDelivery>,
+}
+
+#[derive(Clone, Debug)]
+struct RemoteDelivery {
+    id: u64,
+    timestamp_ns: i64,
+    attempts: u16,
+    body: Bytes,
+}
 
 struct SessionState {
     identified: bool,
@@ -94,7 +109,6 @@ struct SessionState {
     subscription: Option<Subscription>,
     rdy: u64,
     in_flight: HashMap<u64, Instant>,
-    pending_acks: HashSet<u64>,
     closing: bool,
 }
 
@@ -113,7 +127,6 @@ pub async fn serve(
     config: Arc<Config>,
     broker: Arc<Broker>,
     metrics: Arc<Metrics>,
-    consensus: Option<Arc<ClusterRuntime>>,
     accepting: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
 ) -> anyhow::Result<()> {
@@ -123,7 +136,6 @@ pub async fn serve(
         .map_err(anyhow::Error::msg)?
         .map(Arc::new);
     let permits = Arc::new(Semaphore::new(config.limits.max_connections));
-    let operation_ids = Arc::new(AtomicU64::new(operation_seed(config.node.id)));
     let ephemeral_consumers: EphemeralConsumers = Arc::new(SyncMutex::new(HashMap::new()));
     info!(address = %config.network.tcp_address, "NSQ TCP listener ready");
 
@@ -136,17 +148,11 @@ pub async fn serve(
                 continue;
             }
         };
-        if !accepting.load(Ordering::Acquire) {
-            drop(stream);
-            continue;
-        }
         let config = Arc::clone(&config);
         let broker = Arc::clone(&broker);
         let metrics = Arc::clone(&metrics);
         let tls_acceptor = tls_acceptor.clone();
         let authenticator = authenticator.clone();
-        let consensus = consensus.clone();
-        let operation_ids = Arc::clone(&operation_ids);
         let ephemeral_consumers = Arc::clone(&ephemeral_consumers);
         let accepting = Arc::clone(&accepting);
         let publish_admission = Arc::clone(&publish_admission);
@@ -161,8 +167,6 @@ pub async fn serve(
                 &metrics,
                 tls_acceptor,
                 authenticator,
-                consensus,
-                operation_ids,
                 ephemeral_consumers,
                 accepting,
                 publish_admission,
@@ -185,8 +189,6 @@ async fn handle_connection(
     metrics: &Metrics,
     tls_acceptor: Option<TlsAcceptor>,
     authenticator: Option<Arc<Authenticator>>,
-    consensus: Option<Arc<ClusterRuntime>>,
-    operation_ids: Arc<AtomicU64>,
     ephemeral_consumers: EphemeralConsumers,
     accepting: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
@@ -235,7 +237,6 @@ async fn handle_connection(
         subscription: None,
         rdy: 0,
         in_flight: HashMap::new(),
-        pending_acks: HashSet::new(),
         closing: false,
     };
 
@@ -327,8 +328,6 @@ async fn handle_connection(
         broker,
         metrics,
         authenticator,
-        consensus,
-        operation_ids,
         ephemeral_consumers,
         accepting,
         publish_admission,

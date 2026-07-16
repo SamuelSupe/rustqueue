@@ -4,21 +4,15 @@ pub const HEADER_LEN: usize = 48;
 // Public publish payload is capped at 64 MiB. The durable envelope also needs
 // room for per-message IDs, timestamps, lengths and checksums.
 pub const MAX_RECORD_BYTES: usize = 72 * 1024 * 1024;
-const MAGIC: &[u8; 4] = b"RQW3";
-const VERSION: u8 = 3;
+const MAGIC: &[u8; 4] = b"RQV7";
+const VERSION: u8 = 7;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordKind {
     PublishBatch = 1,
-    CreateChannel = 2,
-    DeleteChannel = 3,
-    Ack = 4,
-    Requeue = 5,
-    PauseChannel = 6,
-    EmptyChannel = 7,
-    Membership = 8,
-    Noop = 9,
+    EvictionGap = 2,
+    Noop = 3,
 }
 
 impl TryFrom<u8> for RecordKind {
@@ -27,14 +21,8 @@ impl TryFrom<u8> for RecordKind {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::PublishBatch),
-            2 => Ok(Self::CreateChannel),
-            3 => Ok(Self::DeleteChannel),
-            4 => Ok(Self::Ack),
-            5 => Ok(Self::Requeue),
-            6 => Ok(Self::PauseChannel),
-            7 => Ok(Self::EmptyChannel),
-            8 => Ok(Self::Membership),
-            9 => Ok(Self::Noop),
+            2 => Ok(Self::EvictionGap),
+            3 => Ok(Self::Noop),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unknown record kind {value}"),
@@ -47,10 +35,10 @@ impl TryFrom<u8> for RecordKind {
 pub struct Record {
     pub kind: RecordKind,
     pub flags: u16,
-    pub term: u64,
     pub index: u64,
     pub timestamp_ns: i64,
     pub message_id: u64,
+    pub available_at_ms: i64,
     pub payload: Vec<u8>,
 }
 
@@ -71,10 +59,10 @@ impl Record {
         bytes[4] = VERSION;
         bytes[5] = self.kind as u8;
         bytes[6..8].copy_from_slice(&self.flags.to_be_bytes());
-        bytes[8..16].copy_from_slice(&self.term.to_be_bytes());
-        bytes[16..24].copy_from_slice(&self.index.to_be_bytes());
-        bytes[24..32].copy_from_slice(&self.timestamp_ns.to_be_bytes());
-        bytes[32..40].copy_from_slice(&self.message_id.to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.index.to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.timestamp_ns.to_be_bytes());
+        bytes[24..32].copy_from_slice(&self.message_id.to_be_bytes());
+        bytes[32..40].copy_from_slice(&self.available_at_ms.to_be_bytes());
         bytes[40..44].copy_from_slice(&(self.payload.len() as u32).to_be_bytes());
         bytes[HEADER_LEN..].copy_from_slice(&self.payload);
 
@@ -108,10 +96,10 @@ impl Record {
         Ok(Self {
             kind: RecordKind::try_from(header[5])?,
             flags: u16::from_be_bytes(header[6..8].try_into().unwrap()),
-            term: u64::from_be_bytes(header[8..16].try_into().unwrap()),
-            index: u64::from_be_bytes(header[16..24].try_into().unwrap()),
-            timestamp_ns: i64::from_be_bytes(header[24..32].try_into().unwrap()),
-            message_id: u64::from_be_bytes(header[32..40].try_into().unwrap()),
+            index: u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            timestamp_ns: i64::from_be_bytes(header[16..24].try_into().unwrap()),
+            message_id: u64::from_be_bytes(header[24..32].try_into().unwrap()),
+            available_at_ms: i64::from_be_bytes(header[32..40].try_into().unwrap()),
             payload,
         })
     }

@@ -1,441 +1,408 @@
-use crate::crd::RustQueueCluster;
-use crate::layout::{BrokerPlan, CellPlan};
-use anyhow::Context;
-use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::{ConfigMap, Secret, Service, ServiceAccount};
-use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use crate::RustQueue;
+use anyhow::{bail, Context};
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
+use k8s_openapi::api::core::v1::{ConfigMap, Service, ServiceAccount};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use kube::{Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub const MANAGER: &str = "rustqueue-operator";
-pub const LABEL_CLUSTER: &str = "rustqueue.io/cluster";
-pub const LABEL_CELL: &str = "rustqueue.io/cell";
-pub const LABEL_NODE_ID: &str = "rustqueue.io/node-id";
-pub const LABEL_COMPONENT: &str = "app.kubernetes.io/component";
-pub const ANNOTATION_TLS_REVISION: &str = "rustqueue.io/tls-revision";
-pub const ANNOTATION_CONFIG_REVISION: &str = "rustqueue.io/config-revision";
-pub const ANNOTATION_TARGET_NODE: &str = "rustqueue.io/target-node";
-pub const ANNOTATION_ROLLOUT_REVISION: &str = "rustqueue.io/rollout-revision";
-pub const ANNOTATION_CERT_NOT_AFTER: &str = "rustqueue.io/certificate-not-after";
 
-pub fn service_account(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-) -> anyhow::Result<ServiceAccount> {
-    from_value(json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": metadata(cluster, namespace, &format!("{}-broker", cluster.name_any()), labels(cluster, "broker"))?,
-        "automountServiceAccountToken": false
-    }))
+pub struct ResourceSet {
+    pub revision: String,
+    pub config: ConfigMap,
+    pub service_account: ServiceAccount,
+    pub role: Role,
+    pub role_binding: RoleBinding,
+    pub broker_service: Service,
+    pub brokers: StatefulSet,
+    pub discovery_service: Service,
+    pub discovery: Deployment,
+    pub proxy_service: Service,
+    pub proxy: DaemonSet,
+    pub network_policy: NetworkPolicy,
 }
 
-pub fn client_service(cluster: &RustQueueCluster, namespace: &str) -> anyhow::Result<Service> {
-    from_value(json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": metadata(cluster, namespace, &cluster.name_any(), labels(cluster, "gateway"))?,
+pub struct BuildInput<'a> {
+    pub cluster: &'a RustQueue,
+    pub replicas: i32,
+    pub secret_name: &'a str,
+    pub secret_revision: &'a str,
+}
+
+pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
+    let cluster = input.cluster;
+    let name = cluster.name_any();
+    let namespace = cluster
+        .namespace()
+        .context("RustQueue must be namespaced")?;
+    let owner = cluster
+        .controller_owner_ref(&())
+        .context("RustQueue owner reference")?;
+    let labels = base_labels(&name);
+    let metadata = |resource_name: &str, component: &str| {
+        json!({
+            "name": resource_name, "namespace": namespace,
+            "labels": labels_for(&labels, component),
+            "ownerReferences": [owner],
+        })
+    };
+    let broker_service_name = format!("{name}-brokers");
+    let discovery_name = format!("{name}-discovery");
+    let proxy_name = format!("{name}-proxy");
+    let service_account_name = format!("{name}-runtime");
+    let config_name = format!("{name}-config");
+    let config_text = broker_config(cluster, input.secret_name);
+    let revision = format!(
+        "{:08x}",
+        crc32c::crc32c(
+            format!(
+                "{}\0{}\0{}",
+                cluster.spec.image, config_text, input.secret_revision
+            )
+            .as_bytes(),
+        )
+    );
+    let node_selector = pod_node_selector(&cluster.spec.eligible_node_selector)?;
+
+    let config = typed(json!({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": metadata(&config_name, "broker"),
+        "data": {"rustqueue.toml": config_text},
+    }))?;
+    let service_account = typed(json!({
+        "apiVersion": "v1", "kind": "ServiceAccount",
+        "metadata": metadata(&service_account_name, "runtime"),
+    }))?;
+    let role = typed(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+        "metadata": metadata(&service_account_name, "runtime"),
+        "rules": [{
+            "apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"],
+            "verbs": ["get", "list", "watch"]
+        }],
+    }))?;
+    let role_binding = typed(json!({
+        "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+        "metadata": metadata(&service_account_name, "runtime"),
+        "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": service_account_name},
+        "subjects": [{"kind": "ServiceAccount", "name": service_account_name, "namespace": namespace}],
+    }))?;
+    let broker_service = typed(json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": metadata(&broker_service_name, "broker"),
         "spec": {
-            "type": "ClusterIP",
-            "selector": { LABEL_CLUSTER: cluster.name_any(), LABEL_COMPONENT: "broker" },
+            "clusterIP": "None", "publishNotReadyAddresses": true,
+            "selector": labels_for(&labels, "broker"),
             "ports": [
                 {"name": "tcp", "port": 4150, "targetPort": "tcp"},
                 {"name": "http", "port": 4151, "targetPort": "http"}
             ]
         }
-    }))
-}
+    }))?;
 
-pub fn headless_service(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    cell: &CellPlan,
-) -> anyhow::Result<Service> {
-    let mut resource_labels = labels(cluster, "broker");
-    resource_labels.insert(LABEL_CELL.into(), cell.id.to_string());
-    from_value(json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": metadata(cluster, namespace, &cell.brokers[0].headless_service, resource_labels)?,
+    let mut broker_volumes = vec![
+        json!({"name": "config", "configMap": {"name": config_name}}),
+        json!({"name": "auth", "secret": {"secretName": input.secret_name}}),
+    ];
+    let mut broker_mounts = vec![
+        json!({"name": "data", "mountPath": "/data"}),
+        json!({"name": "config", "mountPath": "/etc/rustqueue", "readOnly": true}),
+        json!({"name": "auth", "mountPath": "/run/secrets/rustqueue", "readOnly": true}),
+    ];
+    if let Some(tls_secret) = &cluster.spec.client_tls_secret_name {
+        broker_volumes.push(json!({"name": "client-tls", "secret": {"secretName": tls_secret}}));
+        broker_mounts.push(
+            json!({"name": "client-tls", "mountPath": "/run/tls/rustqueue", "readOnly": true}),
+        );
+    }
+    let brokers = typed(json!({
+        "apiVersion": "apps/v1", "kind": "StatefulSet",
+        "metadata": metadata(&name, "broker"),
         "spec": {
-            "clusterIP": "None",
-            "publishNotReadyAddresses": true,
-            "selector": { LABEL_CLUSTER: cluster.name_any(), LABEL_COMPONENT: "broker", LABEL_CELL: cell.id.to_string() },
-            "ports": [
-                {"name": "tcp", "port": 4150, "targetPort": "tcp"},
-                {"name": "http", "port": 4151, "targetPort": "http"},
-                {"name": "raft", "port": 4250, "targetPort": "raft"},
-                {"name": "p2p", "port": 4350, "targetPort": "p2p"}
-            ]
-        }
-    }))
-}
-
-pub fn disruption_budget(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    cell: &CellPlan,
-) -> anyhow::Result<PodDisruptionBudget> {
-    let name = format!("{}-cell-{}", cluster.name_any(), cell.id);
-    from_value(json!({
-        "apiVersion": "policy/v1",
-        "kind": "PodDisruptionBudget",
-        "metadata": metadata(cluster, namespace, &name, labels(cluster, "broker"))?,
-        "spec": {
-            "maxUnavailable": 1,
-            "selector": {"matchLabels": {LABEL_CLUSTER: cluster.name_any(), LABEL_COMPONENT: "broker", LABEL_CELL: cell.id.to_string()}},
-            "unhealthyPodEvictionPolicy": "IfHealthyBudget"
-        }
-    }))
-}
-
-pub fn pending_config_map(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    broker: &BrokerPlan,
-) -> anyhow::Result<ConfigMap> {
-    from_value(json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": metadata(cluster, namespace, &broker.config_map, broker_labels(cluster, broker))?,
-        "data": {"node-name": "", "rustqueue.toml": ""}
-    }))
-}
-
-pub fn configured_config_map(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    broker: &BrokerPlan,
-    node_name: &str,
-    contents: &str,
-) -> anyhow::Result<ConfigMap> {
-    from_value(json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": metadata(cluster, namespace, &broker.config_map, broker_labels(cluster, broker))?,
-        "data": {"node-name": node_name, "rustqueue.toml": contents}
-    }))
-}
-
-pub fn secret(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    name: &str,
-    component: &str,
-    string_data: BTreeMap<String, String>,
-    annotations: BTreeMap<String, String>,
-) -> anyhow::Result<Secret> {
-    let mut metadata = metadata(cluster, namespace, name, labels(cluster, component))?;
-    metadata["annotations"] = serde_json::to_value(annotations)?;
-    from_value(json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "metadata": metadata,
-        "type": "Opaque",
-        "stringData": string_data
-    }))
-}
-
-pub fn stateful_set(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    broker: &BrokerPlan,
-    tls_revision: u64,
-    config_revision: u64,
-    target_node: &str,
-) -> anyhow::Result<StatefulSet> {
-    let name = &broker.stateful_set;
-    let pod_labels = broker_labels(cluster, broker);
-    let anti_affinity = if cluster.spec.development.allow_single_node {
-        Value::Null
-    } else {
-        json!({
-            "requiredDuringSchedulingIgnoredDuringExecution": [{
-                "labelSelector": {"matchLabels": {LABEL_CLUSTER: cluster.name_any(), LABEL_COMPONENT: "broker"}},
-                "topologyKey": "kubernetes.io/hostname"
-            }]
-        })
-    };
-    let tolerations = if cluster.spec.nodes.dedicated {
-        json!([{
-            "key": cluster.spec.nodes.taint_key,
-            "operator": "Equal",
-            "value": "true",
-            "effect": "NoSchedule"
-        }])
-    } else {
-        json!([])
-    };
-    let retention = if cluster.spec.storage.retain_on_delete {
-        "Retain"
-    } else {
-        "Delete"
-    };
-    let pre_stop = format!(
-        "token=$(cat /etc/rustqueue/shared/admin.token); curl -fsS -X POST -H \"authorization: Bearer $token\" -H 'content-type: application/json' -d '{{\"enabled\":true,\"ttl_seconds\":1800,\"reason\":\"kubernetes termination\"}}' http://127.0.0.1:4151/v1/cluster/nodes/{}/maintenance >/dev/null || true; sleep 5",
-        broker.node_id
-    );
-    let post_start = format!(
-        "token=$(cat /etc/rustqueue/shared/admin.token); for attempt in $(seq 1 120); do curl -fsS -X POST -H \"authorization: Bearer $token\" -H 'content-type: application/json' -d '{{\"enabled\":false,\"reason\":\"kubernetes pod ready\"}}' http://127.0.0.1:4151/v1/cluster/nodes/{}/maintenance >/dev/null && exit 0; sleep 1; done; exit 0",
-        broker.node_id
-    );
-    let wait_config = "until [ -s /config-src/rustqueue.toml ] && [ \"$(cat /config-src/node-name 2>/dev/null)\" = \"$NODE_NAME\" ]; do sleep 1; done; cp /config-src/rustqueue.toml /config-runtime/rustqueue.toml";
-    let mut template_annotations = BTreeMap::new();
-    template_annotations.insert(ANNOTATION_TLS_REVISION, tls_revision.to_string());
-    template_annotations.insert(ANNOTATION_CONFIG_REVISION, config_revision.to_string());
-    template_annotations.insert(ANNOTATION_TARGET_NODE, target_node.to_owned());
-    template_annotations.insert(
-        ANNOTATION_ROLLOUT_REVISION,
-        cluster.spec.upgrade.retry_generation.to_string(),
-    );
-    template_annotations.insert("prometheus.io/scrape", "true".into());
-    template_annotations.insert("prometheus.io/port", "4151".into());
-    template_annotations.insert("prometheus.io/path", "/metrics".into());
-    from_value(json!({
-        "apiVersion": "apps/v1",
-        "kind": "StatefulSet",
-        "metadata": metadata(cluster, namespace, name, pod_labels.clone())?,
-        "spec": {
-            "replicas": 1,
-            "serviceName": broker.headless_service,
+            "serviceName": broker_service_name,
+            "replicas": input.replicas,
             "podManagementPolicy": "Parallel",
             "updateStrategy": {"type": "OnDelete"},
-            "persistentVolumeClaimRetentionPolicy": {"whenDeleted": retention, "whenScaled": "Retain"},
-            "selector": {"matchLabels": {LABEL_CLUSTER: cluster.name_any(), LABEL_NODE_ID: broker.node_id.to_string()}},
+            "persistentVolumeClaimRetentionPolicy": {"whenDeleted": "Retain", "whenScaled": "Retain"},
+            "selector": {"matchLabels": labels_for(&labels, "broker")},
             "template": {
-                "metadata": {"labels": pod_labels, "annotations": template_annotations},
+                "metadata": {
+                    "labels": labels_for(&labels, "broker"),
+                    "annotations": {"rustqueue.io/revision": revision}
+                },
                 "spec": {
-                    "serviceAccountName": format!("{}-broker", cluster.name_any()),
-                    "automountServiceAccountToken": false,
-                    "terminationGracePeriodSeconds": 90,
-                    "securityContext": {"runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532, "fsGroup": 65532, "seccompProfile": {"type": "RuntimeDefault"}},
-                    "affinity": {
-                        "nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{
-                            "matchExpressions": selector_expressions(&cluster.spec.nodes.selector),
-                            "matchFields": [{"key": "metadata.name", "operator": "In", "values": [target_node]}]
-                        }]}},
-                        "podAntiAffinity": anti_affinity
+                    "serviceAccountName": service_account_name,
+                    "terminationGracePeriodSeconds": 30,
+                    "securityContext": {
+                        "runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532,
+                        "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch",
+                        "seccompProfile": {"type": "RuntimeDefault"}
                     },
-                    "topologySpreadConstraints": [{
-                        "maxSkew": 1,
-                        "topologyKey": cluster.spec.nodes.failure_domain_label,
-                        "whenUnsatisfiable": if cluster.spec.development.allow_single_node { "ScheduleAnyway" } else { "DoNotSchedule" },
-                        "labelSelector": {"matchLabels": {LABEL_CLUSTER: cluster.name_any(), LABEL_COMPONENT: "broker"}}
-                    }],
-                    "tolerations": tolerations,
-                    "initContainers": [{
-                        "name": "wait-for-config",
-                        "image": cluster.spec.image,
-                        "imagePullPolicy": cluster.spec.image_pull_policy,
-                        "command": ["/bin/sh", "-ec", wait_config],
-                        "env": [{"name": "NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}}],
-                        "securityContext": container_security(),
-                        "volumeMounts": [
-                            {"name": "config-source", "mountPath": "/config-src", "readOnly": true},
-                            {"name": "config-runtime", "mountPath": "/config-runtime"}
-                        ]
-                    }],
+                    "nodeSelector": node_selector,
+                    "affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{
+                        "labelSelector": {"matchLabels": labels_for(&labels, "broker")},
+                        "topologyKey": "kubernetes.io/hostname"
+                    }]}},
                     "containers": [{
-                        "name": "rustqueue",
-                        "image": cluster.spec.image,
+                        "name": "broker", "image": cluster.spec.image,
                         "imagePullPolicy": cluster.spec.image_pull_policy,
-                        "args": ["--config", "/etc/rustqueue/runtime/rustqueue.toml"],
-                        "ports": [
-                            {"name": "tcp", "containerPort": 4150},
-                            {"name": "http", "containerPort": 4151},
-                            {"name": "raft", "containerPort": 4250},
-                            {"name": "p2p", "containerPort": 4350}
+                        "command": ["rustqueued"], "args": ["--config", "/etc/rustqueue/rustqueue.toml"],
+                        "ports": [{"name": "tcp", "containerPort": 4150}, {"name": "http", "containerPort": 4151}],
+                        "env": [
+                            {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+                            {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+                            {"name": "RUSTQUEUE_BROADCAST_ADDRESS", "value": format!("$(POD_NAME).{broker_service_name}.$(POD_NAMESPACE).svc")},
+                            {"name": "RUSTQUEUE_DATA_PATH", "value": "/data"}
                         ],
-                        "resources": {
-                            "requests": {"cpu": cluster.spec.resources.cpu_request, "memory": cluster.spec.resources.memory_request},
-                            "limits": {"cpu": cluster.spec.resources.cpu_limit, "memory": cluster.spec.resources.memory_limit}
+                        "volumeMounts": broker_mounts,
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "readOnlyRootFilesystem": true,
+                            "capabilities": {"drop": ["ALL"]}
                         },
-                        "startupProbe": {"httpGet": {"path": "/ping", "port": "http"}, "periodSeconds": 2, "failureThreshold": 90},
-                        "readinessProbe": {"httpGet": {"path": "/v1/health", "port": "http"}, "periodSeconds": 2, "failureThreshold": 3},
-                        "livenessProbe": {"httpGet": {"path": "/ping", "port": "http"}, "periodSeconds": 10, "failureThreshold": 6},
-                        "lifecycle": {
-                            "postStart": {"exec": {"command": ["/bin/sh", "-ec", post_start]}},
-                            "preStop": {"exec": {"command": ["/bin/sh", "-ec", pre_stop]}}
-                        },
-                        "securityContext": container_security(),
-                        "volumeMounts": [
-                            {"name": "data", "mountPath": "/data"},
-                            {"name": "config-runtime", "mountPath": "/etc/rustqueue/runtime", "readOnly": true},
-                            {"name": "tls", "mountPath": "/etc/rustqueue/tls", "readOnly": true},
-                            {"name": "shared", "mountPath": "/etc/rustqueue/shared", "readOnly": true},
-                            {"name": "tmp", "mountPath": "/tmp"}
-                        ]
+                        "readinessProbe": {"httpGet": {"path": "/v1/health", "port": "http"}, "periodSeconds": 2, "failureThreshold": 2},
+                        "livenessProbe": {"httpGet": {"path": "/ping", "port": "http"}, "periodSeconds": 10, "failureThreshold": 3},
+                        "resources": {"requests": {"cpu": "100m", "memory": "256Mi"}}
                     }],
-                    "volumes": [
-                        {"name": "config-source", "configMap": {"name": broker.config_map}},
-                        {"name": "config-runtime", "emptyDir": {}},
-                        {"name": "tls", "secret": {"secretName": broker.tls_secret}},
-                        {"name": "shared", "secret": {"secretName": format!("{}-shared", cluster.name_any())}},
-                        {"name": "tmp", "emptyDir": {}}
-                    ]
+                    "volumes": broker_volumes
                 }
             },
             "volumeClaimTemplates": [{
-                "metadata": {"name": "data", "labels": {LABEL_CLUSTER: cluster.name_any(), LABEL_NODE_ID: broker.node_id.to_string()}},
+                "metadata": {"name": "data", "labels": labels_for(&labels, "broker")},
                 "spec": {
-                    "accessModes": ["ReadWriteOnce"],
-                    "storageClassName": cluster.spec.storage.class_name,
-                    "resources": {"requests": {"storage": cluster.spec.storage.size}}
+                    "accessModes": ["ReadWriteOnce"], "storageClassName": cluster.spec.storage_class_name,
+                    "resources": {"requests": {"storage": cluster.spec.storage_size}}
                 }
             }]
         }
-    }))
-}
+    }))?;
 
-fn labels(cluster: &RustQueueCluster, component: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("app.kubernetes.io/name".into(), "rustqueue".into()),
-        ("app.kubernetes.io/instance".into(), cluster.name_any()),
-        ("app.kubernetes.io/managed-by".into(), MANAGER.into()),
-        (LABEL_CLUSTER.into(), cluster.name_any()),
-        (LABEL_COMPONENT.into(), component.into()),
-    ])
-}
+    let discovery_service = typed(service_json(
+        metadata(&discovery_name, "discovery"),
+        labels_for(&labels, "discovery"),
+        vec![json!({"name": "http", "port": 4161, "targetPort": "http"})],
+    ))?;
+    let discovery = typed(json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": metadata(&discovery_name, "discovery"),
+        "spec": {
+            "replicas": cluster.spec.discovery_replicas.max(2),
+            "selector": {"matchLabels": labels_for(&labels, "discovery")},
+            "template": {
+                "metadata": {"labels": labels_for(&labels, "discovery"), "annotations": {"rustqueue.io/revision": revision}},
+                "spec": {
+                    "serviceAccountName": service_account_name,
+                    "securityContext": {
+                        "runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532,
+                        "seccompProfile": {"type": "RuntimeDefault"}
+                    },
+                    "containers": [{
+                        "name": "discovery", "image": cluster.spec.image,
+                        "imagePullPolicy": cluster.spec.image_pull_policy,
+                        "command": ["rustqueue-discovery"],
+                        "ports": [{"name": "http", "containerPort": 4161}],
+                        "env": [
+                            {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+                            {"name": "RUSTQUEUE_BROKER_SERVICE", "value": broker_service_name},
+                            {"name": "RUSTQUEUE_REGISTRY_TOKEN_FILE", "value": "/run/secrets/rustqueue/registry-token"}
+                        ],
+                        "volumeMounts": [{"name": "auth", "mountPath": "/run/secrets/rustqueue", "readOnly": true}],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "readOnlyRootFilesystem": true,
+                            "capabilities": {"drop": ["ALL"]}
+                        },
+                        "readinessProbe": {"httpGet": {"path": "/v1/health", "port": "http"}, "periodSeconds": 2},
+                        "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}}
+                    }],
+                    "volumes": [{"name": "auth", "secret": {"secretName": input.secret_name}}]
+                }
+            }
+        }
+    }))?;
 
-fn broker_labels(cluster: &RustQueueCluster, broker: &BrokerPlan) -> BTreeMap<String, String> {
-    let mut result = labels(cluster, "broker");
-    result.insert(LABEL_CELL.into(), broker.cell_id.to_string());
-    result.insert(LABEL_NODE_ID.into(), broker.node_id.to_string());
-    result
-}
+    let proxy_service = typed(service_json(
+        metadata(&proxy_name, "proxy"),
+        labels_for(&labels, "proxy"),
+        vec![
+            json!({"name": "tcp", "port": 4150, "targetPort": "tcp"}),
+            json!({"name": "http", "port": 4151, "targetPort": "http"}),
+        ],
+    ))?;
+    let proxy = typed(json!({
+        "apiVersion": "apps/v1", "kind": "DaemonSet",
+        "metadata": metadata(&proxy_name, "proxy"),
+        "spec": {
+            "selector": {"matchLabels": labels_for(&labels, "proxy")},
+            "template": {
+                "metadata": {"labels": labels_for(&labels, "proxy"), "annotations": {"rustqueue.io/revision": revision}},
+                "spec": {
+                    "nodeSelector": cluster.spec.proxy_node_selector,
+                    "securityContext": {
+                        "runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532,
+                        "seccompProfile": {"type": "RuntimeDefault"}
+                    },
+                    "containers": [{
+                        "name": "proxy", "image": cluster.spec.image,
+                        "imagePullPolicy": cluster.spec.image_pull_policy,
+                        "command": ["rustqueue-proxy"],
+                        "ports": [{"name": "tcp", "containerPort": 4150}, {"name": "http", "containerPort": 4151}],
+                        "env": [{"name": "RUSTQUEUE_DISCOVERY_URLS", "value": format!("http://{discovery_name}:4161")}],
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "readOnlyRootFilesystem": true,
+                            "capabilities": {"drop": ["ALL"]}
+                        },
+                        "readinessProbe": {"httpGet": {"path": "/v1/health", "port": "http"}, "periodSeconds": 2},
+                        "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}}
+                    }]
+                }
+            }
+        }
+    }))?;
+    let network_policy = typed(json!({
+        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+        "metadata": metadata(&format!("{name}-internal"), "runtime"),
+        "spec": {
+            "podSelector": {"matchLabels": {"app.kubernetes.io/instance": name}},
+            "policyTypes": ["Ingress"],
+            "ingress": [{"from": [{"namespaceSelector": {}}]}]
+        }
+    }))?;
 
-fn metadata(
-    cluster: &RustQueueCluster,
-    namespace: &str,
-    name: &str,
-    labels: BTreeMap<String, String>,
-) -> anyhow::Result<Value> {
-    let owner = cluster
-        .controller_owner_ref(&())
-        .context("RustQueueCluster has no UID for owner reference")?;
-    Ok(json!({
-        "name": name,
-        "namespace": namespace,
-        "labels": labels,
-        "ownerReferences": [owner]
-    }))
-}
-
-fn selector_expressions(selector: &BTreeMap<String, String>) -> Vec<Value> {
-    selector
-        .iter()
-        .map(|(key, value)| json!({"key": key, "operator": "In", "values": [value]}))
-        .collect()
-}
-
-fn container_security() -> Value {
-    json!({
-        "allowPrivilegeEscalation": false,
-        "readOnlyRootFilesystem": true,
-        "runAsNonRoot": true,
-        "runAsUser": 65532,
-        "runAsGroup": 65532,
-        "capabilities": {"drop": ["ALL"]}
+    Ok(ResourceSet {
+        revision,
+        config,
+        service_account,
+        role,
+        role_binding,
+        broker_service,
+        brokers,
+        discovery_service,
+        discovery,
+        proxy_service,
+        proxy,
+        network_policy,
     })
 }
 
-fn from_value<T: DeserializeOwned>(value: Value) -> anyhow::Result<T> {
-    serde_json::from_value(value).context("deserialize generated Kubernetes resource")
+fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
+    let mut output = format!(
+        "[storage]\ndata_path = \"/data\"\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_backlog_messages = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\n# secret: {secret_name}\n",
+        cluster.spec.min_free_bytes,
+        cluster.spec.disk_high_watermark_percent,
+        cluster.spec.disk_low_watermark_percent,
+        cluster.spec.protective_eviction_enabled,
+        cluster.spec.disk_pressure_grace_seconds,
+        cluster.spec.bootstrap_retention_seconds,
+        cluster.spec.max_message_bytes,
+        cluster.spec.max_backlog_messages,
+    );
+    if cluster.spec.client_tls_secret_name.is_some() {
+        output.push_str("\n[security.tls]\ncertificate_file = \"/run/tls/rustqueue/tls.crt\"\nprivate_key_file = \"/run/tls/rustqueue/tls.key\"\nclient_ca_file = \"/run/tls/rustqueue/ca.crt\"\nrequire_client_certificate = false\nrequired = false\n");
+    }
+    output
+}
+
+fn base_labels(name: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("app.kubernetes.io/name".into(), "rustqueue".into()),
+        ("app.kubernetes.io/instance".into(), name.into()),
+        ("app.kubernetes.io/managed-by".into(), MANAGER.into()),
+    ])
+}
+
+fn labels_for(base: &BTreeMap<String, String>, component: &str) -> BTreeMap<String, String> {
+    let mut labels = base.clone();
+    labels.insert("app.kubernetes.io/component".into(), component.into());
+    labels
+}
+
+fn pod_node_selector(selector: &str) -> anyhow::Result<BTreeMap<String, String>> {
+    let Some((key, value)) = selector.split_once('=') else {
+        bail!("eligibleNodeSelector must be one key=value selector");
+    };
+    if key.trim().is_empty() || value.trim().is_empty() || key.contains(',') || value.contains(',')
+    {
+        bail!("eligibleNodeSelector must be one key=value selector");
+    }
+    Ok(BTreeMap::from([(key.trim().into(), value.trim().into())]))
+}
+
+fn service_json(metadata: Value, selector: BTreeMap<String, String>, ports: Vec<Value>) -> Value {
+    json!({"apiVersion": "v1", "kind": "Service", "metadata": metadata, "spec": {"selector": selector, "ports": ports}})
+}
+
+fn typed<T: DeserializeOwned>(value: Value) -> anyhow::Result<T> {
+    serde_json::from_value(value).context("build Kubernetes resource")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::RustQueueClusterSpec;
-    use crate::layout;
+    use crate::crd::RustQueueSpec;
     use kube::api::ObjectMeta;
 
-    fn cluster() -> RustQueueCluster {
-        let mut spec = RustQueueClusterSpec::default();
-        spec.storage.class_name = "fast-ssd".into();
-        RustQueueCluster {
+    fn cluster() -> RustQueue {
+        RustQueue {
             metadata: ObjectMeta {
                 name: Some("queue".into()),
-                namespace: Some("messaging".into()),
-                uid: Some("test-uid".into()),
-                ..ObjectMeta::default()
+                namespace: Some("test".into()),
+                uid: Some("uid".into()),
+                ..Default::default()
             },
-            spec,
+            spec: RustQueueSpec {
+                image: "rustqueue:test".into(),
+                image_pull_policy: "Never".into(),
+                min_brokers: 1,
+                max_brokers: 500,
+                eligible_node_selector: "rustqueue.io/eligible=true".into(),
+                storage_class_name: "ssd".into(),
+                storage_size: "100Gi".into(),
+                min_free_bytes: 1024,
+                disk_high_watermark_percent: 85,
+                disk_low_watermark_percent: 75,
+                protective_eviction_enabled: true,
+                disk_pressure_grace_seconds: 60,
+                bootstrap_retention_seconds: 30,
+                max_message_bytes: 20 * 1024 * 1024,
+                max_backlog_messages: 10_000_000,
+                registry_secret_name: None,
+                client_tls_secret_name: None,
+                proxy_node_selector: BTreeMap::new(),
+                discovery_replicas: 2,
+            },
             status: None,
         }
     }
 
     #[test]
-    fn stateful_set_retains_pvc_and_uses_on_delete_rollout() {
-        let cluster = cluster();
-        let layout = layout::plan("queue", 3, &cluster.spec.cells);
-        let sts = stateful_set(
-            &cluster,
-            "messaging",
-            layout.broker(1).unwrap(),
-            7,
-            9,
-            "worker-a",
-        )
+    fn renders_one_share_nothing_statefulset_and_retained_pvcs() {
+        let resources = build(BuildInput {
+            cluster: &cluster(),
+            replicas: 3,
+            secret_name: "queue-auth",
+            secret_revision: "1",
+        })
         .unwrap();
+        let spec = resources.brokers.spec.unwrap();
+        assert_eq!(spec.replicas, Some(3));
+        assert_eq!(spec.service_name.as_deref(), Some("queue-brokers"));
+        assert_eq!(spec.update_strategy.unwrap().type_, Some("OnDelete".into()));
+        assert_eq!(spec.volume_claim_templates.unwrap().len(), 1);
         assert_eq!(
-            sts.spec
-                .as_ref()
-                .unwrap()
-                .update_strategy
-                .as_ref()
-                .unwrap()
-                .type_
-                .as_deref(),
-            Some("OnDelete")
-        );
-        assert_eq!(
-            sts.spec
-                .as_ref()
-                .unwrap()
-                .persistent_volume_claim_retention_policy
-                .as_ref()
-                .unwrap()
-                .when_deleted
-                .as_deref(),
-            Some("Retain")
-        );
-        assert_eq!(
-            sts.spec
-                .as_ref()
-                .unwrap()
-                .template
+            spec.template
                 .spec
-                .as_ref()
                 .unwrap()
-                .automount_service_account_token,
-            Some(false)
-        );
-        assert_eq!(
-            sts.spec
-                .as_ref()
+                .security_context
                 .unwrap()
-                .template
-                .metadata
-                .as_ref()
-                .unwrap()
-                .annotations
-                .as_ref()
-                .unwrap()[ANNOTATION_TARGET_NODE],
-            "worker-a"
+                .fs_group,
+            Some(65532)
         );
-    }
-
-    #[test]
-    fn peer_service_publishes_dns_before_readiness() {
-        let cluster = cluster();
-        let layout = layout::plan("queue", 3, &cluster.spec.cells);
-        let service = headless_service(&cluster, "messaging", &layout.cells[0]).unwrap();
-        assert_eq!(
-            service.spec.unwrap().publish_not_ready_addresses,
-            Some(true)
-        );
+        assert_eq!(resources.discovery.spec.unwrap().replicas, Some(2));
     }
 }

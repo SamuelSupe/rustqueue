@@ -1,10 +1,13 @@
 RustQueue Operator is installed in {{ .Release.Namespace }}.
-{{- if .Values.cluster.create }}
+{{- if .Values.queue.create }}
 
-Watch the cluster become Ready:
-  kubectl -n {{ .Release.Namespace }} get rustqueuecluster {{ .Values.cluster.name }} -w
+Watch the share-nothing broker set become ready:
+  kubectl -n {{ .Release.Namespace }} get rustqueue {{ .Values.queue.name }} -w
 
-In-cluster NSQ endpoints:
-  TCP:  {{ .Values.cluster.name }}.{{ .Release.Namespace }}.svc:4150
-  HTTP: http://{{ .Values.cluster.name }}.{{ .Release.Namespace }}.svc:4151
+Producer endpoints (node-local proxy Service):
+  TCP:  {{ .Values.queue.name }}-proxy.{{ .Release.Namespace }}.svc:4150
+  HTTP: http://{{ .Values.queue.name }}-proxy.{{ .Release.Namespace }}.svc:4151
+
+Consumer lookup endpoint:
+  http://{{ .Values.queue.name }}-discovery.{{ .Release.Namespace }}.svc:4161
 {{- end }}

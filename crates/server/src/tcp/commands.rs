@@ -1,5 +1,4 @@
 use super::*;
-use rustqueue_consensus::QueueResponse;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn process_command(
@@ -9,9 +8,6 @@ pub(super) async fn process_command(
     broker: &Broker,
     metrics: &Metrics,
     authenticator: Option<&Authenticator>,
-    consensus: Option<&ClusterRuntime>,
-    ack_pipeline: Option<&AckPipeline>,
-    operation_ids: &AtomicU64,
     ephemeral_consumers: &EphemeralConsumers,
     state: &mut SessionState,
     writer: &mut ClientWriter,
@@ -90,65 +86,16 @@ pub(super) async fn process_command(
             {
                 return Ok(false);
             }
-            let mut ephemeral_lease = None;
-            let create_result = if let Some(consensus) = consensus {
-                let result = if channel.ends_with("#ephemeral") {
-                    let lease_id = operation_ids.fetch_add(1, Ordering::Relaxed);
-                    let result = consensus
-                        .create_ephemeral_channel(
-                            &topic,
-                            &channel,
-                            lease_id,
-                            now_ms().saturating_add(
-                                EPHEMERAL_LEASE.as_millis().min(i64::MAX as u128) as i64,
-                            ),
-                        )
-                        .await;
-                    if result.is_ok() {
-                        ephemeral_lease = Some(lease_id);
-                    }
-                    result
-                } else if consensus.channel_is_active(&topic, &channel) {
-                    Ok(QueueResponse::default())
-                } else {
-                    consensus
-                        .write(QueueCommand::CreateChannel {
-                            topic: topic.clone(),
-                            channel: channel.clone(),
-                        })
-                        .await
-                };
-                result
-                    .map_err(|error| BrokerError::InvalidRecord(error.to_string()))
-                    .and_then(|response| {
-                        response
-                            .error
-                            .map_or(Ok(()), |error| Err(BrokerError::InvalidRecord(error)))
-                    })
-            } else {
-                let result = broker.create_channel(&topic, &channel);
-                if result.is_ok() && channel.ends_with("#ephemeral") {
-                    *ephemeral_consumers
-                        .lock()
-                        .entry((topic.clone(), channel.clone()))
-                        .or_default() += 1;
-                }
-                result
-            };
+            let create_result = broker.create_channel(&topic, &channel).await;
+            if create_result.is_ok() && channel.ends_with("#ephemeral") {
+                *ephemeral_consumers
+                    .lock()
+                    .entry((topic.clone(), channel.clone()))
+                    .or_default() += 1;
+            }
             match create_result {
                 Ok(()) => {
-                    let sequence = operation_ids.fetch_add(1, Ordering::Relaxed);
-                    let partition_count =
-                        consensus.map_or(1, |cluster| cluster.active_partition_count(&topic));
-                    state.subscription = Some(Subscription {
-                        topic,
-                        channel,
-                        partition_cursor: super::cursor::partition_cursor_seed(
-                            sequence,
-                            partition_count,
-                        ),
-                        ephemeral_lease,
-                    });
+                    state.subscription = Some(Subscription { topic, channel });
                     write_frame(writer, FrameType::Response, OK).await?;
                 }
                 Err(error) => {
@@ -169,8 +116,6 @@ pub(super) async fn process_command(
                 topic,
                 vec![parsed.body.unwrap_or_default()],
                 Duration::ZERO,
-                consensus,
-                operation_ids,
             )
             .await?
             {
@@ -199,8 +144,6 @@ pub(super) async fn process_command(
                 topic,
                 messages,
                 Duration::ZERO,
-                consensus,
-                operation_ids,
             )
             .await?
             {
@@ -223,8 +166,6 @@ pub(super) async fn process_command(
                 topic,
                 vec![parsed.body.unwrap_or_default()],
                 Duration::from_millis(delay_ms),
-                consensus,
-                operation_ids,
             )
             .await?
             {
@@ -251,39 +192,9 @@ pub(super) async fn process_command(
                 write_error(writer, "E_FIN_FAILED", "message is not in flight").await?;
                 return Ok(true);
             }
-            if state.pending_acks.contains(&id) {
-                // A leadership change can redeliver the same message on this
-                // connection before its first durable FIN completes. FIN is
-                // idempotent while that acknowledgement is pending.
-                return Ok(true);
-            }
-            let queued = ack_pipeline.is_some();
-            let finish_result = if let Some(pipeline) = ack_pipeline {
-                pipeline
-                    .enqueue(AckRequest {
-                        id,
-                        kind: AckKind::Finish,
-                        command: QueueCommand::Finish {
-                            topic: subscription.topic.clone(),
-                            channel: subscription.channel.clone(),
-                            message_id: id,
-                        },
-                    })
-                    .await
-            } else {
-                finish_message(
-                    broker,
-                    consensus,
-                    &subscription.topic,
-                    &subscription.channel,
-                    id,
-                )
-                .await
-            };
+            let finish_result =
+                finish_message(broker, &subscription.topic, &subscription.channel, id).await;
             match finish_result {
-                Ok(()) if queued => {
-                    state.pending_acks.insert(id);
-                }
                 Ok(()) => {
                     state.in_flight.remove(&id);
                     metrics.finished_messages.fetch_add(1, Ordering::Relaxed);
@@ -301,49 +212,15 @@ pub(super) async fn process_command(
                 write_error(writer, "E_REQ_FAILED", "message is not in flight").await?;
                 return Ok(true);
             }
-            if state.pending_acks.contains(&id) {
-                // Keep duplicate REQ idempotent while the durable operation is
-                // already queued. The completion path still reports failures.
-                return Ok(true);
-            }
-            let queued = ack_pipeline.is_some();
-            let available_at_ms = now_ms().saturating_add(delay_ms.min(i64::MAX as u64) as i64);
-            let requeue_result = if let Some(pipeline) = ack_pipeline {
-                pipeline
-                    .enqueue(AckRequest {
-                        id,
-                        kind: AckKind::Requeue,
-                        command: QueueCommand::Requeue {
-                            topic: subscription.topic.clone(),
-                            channel: subscription.channel.clone(),
-                            message_id: id,
-                            available_at_ms,
-                        },
-                    })
-                    .await
-            } else if let Some(consensus) = consensus {
-                consensus
-                    .write(QueueCommand::Requeue {
-                        topic: subscription.topic.clone(),
-                        channel: subscription.channel.clone(),
-                        message_id: id,
-                        available_at_ms,
-                    })
-                    .await
-                    .map_err(|error| BrokerError::InvalidRecord(error.to_string()))
-                    .and_then(response_result)
-            } else {
-                broker.requeue(
+            let requeue_result = broker
+                .requeue(
                     &subscription.topic,
                     &subscription.channel,
                     id,
                     Duration::from_millis(delay_ms),
                 )
-            };
+                .await;
             match requeue_result {
-                Ok(()) if queued => {
-                    state.pending_acks.insert(id);
-                }
                 Ok(()) => {
                     state.in_flight.remove(&id);
                     metrics.requeued_messages.fetch_add(1, Ordering::Relaxed);
@@ -360,24 +237,12 @@ pub(super) async fn process_command(
                 write_error(writer, "E_TOUCH_FAILED", "message is not in flight").await?;
                 return Ok(true);
             }
-            let touch_result = if let Some(consensus) = consensus {
-                consensus
-                    .touch(TouchRequest {
-                        topic: subscription.topic.clone(),
-                        channel: subscription.channel.clone(),
-                        message_id: id,
-                        timeout_ms: state.message_timeout.as_millis().min(u64::MAX as u128) as u64,
-                    })
-                    .await
-                    .map_err(|error| BrokerError::InvalidRecord(error.to_string()))
-            } else {
-                broker.touch(
-                    &subscription.topic,
-                    &subscription.channel,
-                    id,
-                    Some(state.message_timeout),
-                )
-            };
+            let touch_result = broker.touch(
+                &subscription.topic,
+                &subscription.channel,
+                id,
+                Some(state.message_timeout),
+            );
             match touch_result {
                 Ok(()) => {
                     state
@@ -410,13 +275,10 @@ async fn publish_tcp(
     topic: String,
     messages: Vec<Bytes>,
     delay: Duration,
-    consensus: Option<&ClusterRuntime>,
-    operation_ids: &AtomicU64,
 ) -> anyhow::Result<bool> {
     let message_count = messages.len() as u64;
     let byte_count = messages.iter().map(Bytes::len).sum::<usize>() as u64;
-    let publish_result =
-        publish_messages(broker, consensus, operation_ids, &topic, messages, delay).await;
+    let publish_result = publish_messages(broker, &topic, messages, delay).await;
     match publish_result {
         Ok(_) => {
             metrics
@@ -438,61 +300,18 @@ async fn publish_tcp(
 
 pub(super) async fn publish_messages(
     broker: &Broker,
-    consensus: Option<&ClusterRuntime>,
-    operation_ids: &AtomicU64,
     topic: &str,
     messages: Vec<Bytes>,
     delay: Duration,
 ) -> Result<Vec<u64>, BrokerError> {
-    if let Some(consensus) = consensus {
-        let operation_id = operation_ids.fetch_add(1, Ordering::Relaxed);
-        consensus
-            .write(QueueCommand::Publish {
-                operation_id,
-                topic: topic.to_owned(),
-                bodies: messages,
-                timestamp_ns: now_ns(),
-                available_at_ms: now_ms()
-                    .saturating_add(delay.as_millis().min(i64::MAX as u128) as i64),
-                partition: None,
-                routing_key: None,
-            })
-            .await
-            .map_err(|error| BrokerError::InvalidRecord(error.to_string()))
-            .and_then(|response| {
-                response.error.map_or(Ok(response.message_ids), |error| {
-                    Err(BrokerError::InvalidRecord(error))
-                })
-            })
-    } else {
-        broker.publish(topic, messages, delay, None, None)
-    }
-}
-
-fn response_result(response: rustqueue_consensus::QueueResponse) -> Result<(), BrokerError> {
-    response
-        .error
-        .map_or(Ok(()), |error| Err(BrokerError::InvalidRecord(error)))
+    broker.publish(topic, messages, delay).await
 }
 
 pub(super) async fn finish_message(
     broker: &Broker,
-    consensus: Option<&ClusterRuntime>,
     topic: &str,
     channel: &str,
     id: u64,
 ) -> Result<(), BrokerError> {
-    if let Some(consensus) = consensus {
-        consensus
-            .write(QueueCommand::Finish {
-                topic: topic.to_owned(),
-                channel: channel.to_owned(),
-                message_id: id,
-            })
-            .await
-            .map_err(|error| BrokerError::InvalidRecord(error.to_string()))
-            .and_then(response_result)
-    } else {
-        broker.finish(topic, channel, id)
-    }
+    broker.finish(topic, channel, id).await
 }

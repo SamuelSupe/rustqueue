@@ -167,8 +167,15 @@ func testEphemeral(address, httpAddress string, factory configFactory) error {
 }
 
 func testLookup(address, httpAddress string, factory configFactory) error {
+	return testLookupEndpoint(address, httpAddress, httpAddress, factory)
+}
+
+func testLookupEndpoint(address, managementAddress, lookupAddress string, factory configFactory) error {
 	topic := uniqueTopic("lookup")
-	if err := createTopic(httpAddress, topic); err != nil {
+	if err := createTopic(managementAddress, topic); err != nil {
+		return err
+	}
+	if err := waitForLookupProducer(lookupAddress, topic); err != nil {
 		return err
 	}
 	delivery := make(chan []byte, 1)
@@ -180,10 +187,10 @@ func testLookup(address, httpAddress string, factory configFactory) error {
 		delivery <- append([]byte(nil), message.Body...)
 		return nil
 	}))
-	if err := consumer.ConnectToNSQLookupd(httpAddress); err != nil {
+	if err := consumer.ConnectToNSQLookupd(lookupAddress); err != nil {
 		return err
 	}
-	if err := waitForChannel(httpAddress, topic, "workers", true); err != nil {
+	if err := waitForChannel(lookupAddress, topic, "workers", true); err != nil {
 		return err
 	}
 	defer stopConsumer(consumer)

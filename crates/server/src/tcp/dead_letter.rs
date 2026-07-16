@@ -10,8 +10,6 @@ enum DeadLetterReason {
 pub(super) async fn dead_letter_if_needed(
     config: &Config,
     broker: &Broker,
-    consensus: Option<&ClusterRuntime>,
-    operation_ids: &AtomicU64,
     metrics: &Metrics,
     topic: &str,
     channel: &str,
@@ -22,21 +20,11 @@ pub(super) async fn dead_letter_if_needed(
     };
     let target = dead_letter_topic(topic, channel, &config.queue.dead_letter_suffix)
         .map_err(BrokerError::InvalidRecord)?;
-    let result = match publish_messages(
-        broker,
-        consensus,
-        operation_ids,
-        &target,
-        vec![delivery.body.clone()],
-        Duration::ZERO,
-    )
-    .await
-    {
-        Ok(_) => finish_message(broker, consensus, topic, channel, delivery.id).await,
-        Err(error) => Err(error),
-    };
+    let result = broker
+        .move_to_dead_letter(topic, channel, delivery.id, &target, delivery.body.clone())
+        .await;
     if let Err(error) = result {
-        release_failed_move(broker, consensus, topic, channel, delivery.id).await;
+        broker.release(topic, channel, &[delivery.id]);
         return Err(error);
     }
     metrics.dead_letter_messages.fetch_add(1, Ordering::Relaxed);
@@ -71,24 +59,26 @@ fn reason(config: &Config, topic: &str, delivery: &RemoteDelivery) -> Option<Dea
     (age_ns >= retention.saturating_mul(1_000_000_000)).then_some(DeadLetterReason::Retention)
 }
 
-async fn release_failed_move(
-    broker: &Broker,
-    consensus: Option<&ClusterRuntime>,
-    topic: &str,
-    channel: &str,
-    id: u64,
-) {
-    if let Some(consensus) = consensus {
-        let _ = consensus
-            .release(rustqueue_consensus::ReleaseRequest {
-                topic: topic.to_owned(),
-                channel: channel.to_owned(),
-                message_ids: vec![id],
-            })
-            .await;
-    } else {
-        broker.release(topic, channel, &[id]);
+fn dead_letter_topic(topic: &str, channel: &str, suffix: &str) -> Result<String, String> {
+    if suffix.is_empty()
+        || suffix.len() > 16
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("dead-letter suffix is invalid".into());
     }
+    let candidate = format!("{topic}.{channel}{suffix}");
+    if rustqueue_protocol::validate_name(&candidate).is_ok() {
+        return Ok(candidate);
+    }
+    let hash = crc32c::crc32c(format!("{topic}\0{channel}").as_bytes());
+    let tail = format!(".{hash:08x}{suffix}");
+    let keep = 64usize.saturating_sub(tail.len()).min(topic.len());
+    let candidate = format!("{}{}", &topic[..keep], tail);
+    rustqueue_protocol::validate_name(&candidate)
+        .map_err(|_| "cannot derive a valid dead-letter topic name".to_owned())?;
+    Ok(candidate)
 }
 
 #[cfg(test)]
@@ -144,27 +134,22 @@ mod tests {
             ..rustqueue_queue::BrokerConfig::default()
         })
         .unwrap();
-        broker.create_channel("events", "workers").unwrap();
+        broker.create_channel("events", "workers").await.unwrap();
         broker
-            .publish(
-                "events",
-                vec![b"poison".to_vec()],
-                Duration::ZERO,
-                None,
-                None,
-            )
+            .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+            .await
             .unwrap();
-        let mut cursor = 0;
         let first = broker
-            .next_message("events", "workers", &mut cursor, None)
+            .next_message("events", "workers", None)
             .await
             .unwrap()
             .unwrap();
         broker
             .requeue("events", "workers", first.id, Duration::ZERO)
+            .await
             .unwrap();
         let second = broker
-            .next_message("events", "workers", &mut cursor, None)
+            .next_message("events", "workers", None)
             .await
             .unwrap()
             .unwrap();
@@ -174,8 +159,6 @@ mod tests {
         assert!(dead_letter_if_needed(
             &config,
             &broker,
-            None,
-            &AtomicU64::new(1),
             &metrics,
             "events",
             "workers",
@@ -195,7 +178,7 @@ mod tests {
             .iter()
             .find(|topic| topic.name == "events")
             .unwrap();
-        assert_eq!(source.partitions[0].channels[0].depth, 0);
+        assert_eq!(source.channels[0].depth, 0);
         let dlq = stats
             .topics
             .iter()

@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/nsqio/go-nsq"
 )
 
 func main() {
@@ -27,6 +29,28 @@ func main() {
 		); err != nil {
 			log.Fatal(err)
 		}
+		return
+	}
+	if mode == "lookup" {
+		if len(os.Args) != 5 {
+			log.Fatal("lookup mode requires producer TCP, management HTTP, and lookup HTTP addresses")
+		}
+		if err := testLookupEndpoint(os.Args[2], os.Args[3], os.Args[4], func() *nsq.Config {
+			return baseConfig()
+		}); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("go discovery lookup compatibility: ok")
+		return
+	}
+	if mode == "consume-one" {
+		if len(os.Args) != 6 {
+			log.Fatal("consume-one mode requires NSQD address, topic, channel, and expected body")
+		}
+		if err := consumeOne(os.Args[2], os.Args[3], os.Args[4], os.Args[5]); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("go durable backlog recovery: ok")
 		return
 	}
 	address := argument(2, "rustqueue-plain:4150")

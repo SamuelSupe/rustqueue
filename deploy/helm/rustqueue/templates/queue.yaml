@@ -1,0 +1,34 @@
+{{- if .Values.queue.create }}
+apiVersion: rustqueue.io/v1alpha1
+kind: RustQueue
+metadata:
+  name: {{ .Values.queue.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "rustqueue.labels" . | nindent 4 }}
+spec:
+  image: {{ .Values.queue.image | quote }}
+  imagePullPolicy: {{ .Values.queue.imagePullPolicy | quote }}
+  minBrokers: {{ .Values.queue.minBrokers }}
+  maxBrokers: {{ .Values.queue.maxBrokers }}
+  eligibleNodeSelector: {{ .Values.queue.eligibleNodeSelector | quote }}
+  storageClassName: {{ .Values.queue.storageClassName | quote }}
+  storageSize: {{ .Values.queue.storageSize | quote }}
+  minFreeBytes: {{ .Values.queue.minFreeBytes | int64 }}
+  diskHighWatermarkPercent: {{ .Values.queue.diskHighWatermarkPercent }}
+  diskLowWatermarkPercent: {{ .Values.queue.diskLowWatermarkPercent }}
+  protectiveEvictionEnabled: {{ .Values.queue.protectiveEvictionEnabled }}
+  diskPressureGraceSeconds: {{ .Values.queue.diskPressureGraceSeconds }}
+  bootstrapRetentionSeconds: {{ .Values.queue.bootstrapRetentionSeconds }}
+  maxMessageBytes: {{ .Values.queue.maxMessageBytes | int64 }}
+  maxBacklogMessages: {{ .Values.queue.maxBacklogMessages | int64 }}
+  discoveryReplicas: {{ .Values.queue.discoveryReplicas }}
+  proxyNodeSelector:
+    {{- toYaml .Values.queue.proxyNodeSelector | nindent 4 }}
+  {{- if .Values.queue.registrySecretName }}
+  registrySecretName: {{ .Values.queue.registrySecretName | quote }}
+  {{- end }}
+  {{- if .Values.queue.clientTlsSecretName }}
+  clientTlsSecretName: {{ .Values.queue.clientTlsSecretName | quote }}
+  {{- end }}
+{{- end }}

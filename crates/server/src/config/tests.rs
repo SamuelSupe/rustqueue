@@ -8,23 +8,6 @@ fn example_configuration_is_valid() {
 }
 
 #[test]
-fn cluster_examples_have_three_https_nodes() {
-    for source in [
-        include_str!("../../../../deploy/node-1.toml"),
-        include_str!("../../../../deploy/node-2.toml"),
-        include_str!("../../../../deploy/node-3.toml"),
-    ] {
-        let config: Config = toml::from_str(source).unwrap();
-        assert_eq!(config.cluster.nodes.len(), 3);
-        assert!(config
-            .cluster
-            .nodes
-            .values()
-            .all(|node| node.raft_address.starts_with("https://")));
-    }
-}
-
-#[test]
 fn accepts_the_documented_large_message_limits() {
     let mut config = Config::default();
     config.queue.max_message_bytes = MAX_SUPPORTED_MESSAGE_BYTES;

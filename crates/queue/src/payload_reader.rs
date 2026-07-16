@@ -15,7 +15,13 @@ type ReadResult = Result<Vec<Vec<u8>>, ReadFailure>;
 
 struct ReadJob {
     payloads: Vec<PayloadRef>,
+    _lease: PayloadLease,
     response: oneshot::Sender<ReadResult>,
+}
+
+pub(crate) struct PayloadLease {
+    active_paths: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    payloads: Vec<PayloadRef>,
 }
 
 const MAX_COALESCED_READ: u64 = 2 * 1024 * 1024;
@@ -60,11 +66,10 @@ impl PayloadReader {
         .max(1);
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
-            let active_paths = Arc::clone(&active_paths);
             let files = Arc::clone(&files);
             std::thread::Builder::new()
                 .name(format!("rustqueue-payload-{index}"))
-                .spawn(move || worker(receiver, active_paths, files))
+                .spawn(move || worker(receiver, files))
                 .expect("payload reader worker must start");
         }
         Arc::new(Self {
@@ -79,14 +84,27 @@ impl PayloadReader {
         })
     }
 
-    pub async fn read(&self, payload: &PayloadRef) -> io::Result<Arc<[u8]>> {
-        Ok(self
-            .read_many(std::slice::from_ref(payload))
-            .await?
-            .remove(0))
+    #[cfg(test)]
+    pub async fn read_many(&self, payloads: &[PayloadRef]) -> io::Result<Vec<Arc<[u8]>>> {
+        let lease = self.retain(payloads.to_vec());
+        self.read_retained(lease).await
     }
 
-    pub async fn read_many(&self, payloads: &[PayloadRef]) -> io::Result<Vec<Arc<[u8]>>> {
+    pub fn retain(&self, payloads: Vec<PayloadRef>) -> PayloadLease {
+        {
+            let mut active = self.active_paths.lock();
+            for payload in &payloads {
+                *active.entry(payload.path.as_ref().clone()).or_default() += 1;
+            }
+        }
+        PayloadLease {
+            active_paths: Arc::clone(&self.active_paths),
+            payloads,
+        }
+    }
+
+    pub async fn read_retained(&self, lease: PayloadLease) -> io::Result<Vec<Arc<[u8]>>> {
+        let payloads = lease.payloads.clone();
         let mut output = vec![None; payloads.len()];
         let mut missing = Vec::new();
         {
@@ -103,32 +121,23 @@ impl PayloadReader {
             return Ok(output.into_iter().flatten().collect());
         }
         let (sender, receiver) = oneshot::channel();
-        {
-            let mut active = self.active_paths.lock();
-            for index in &missing {
-                *active
-                    .entry(payloads[*index].path.as_ref().clone())
-                    .or_default() += 1;
-            }
-        }
         let job = ReadJob {
             payloads: missing
                 .iter()
                 .map(|index| payloads[*index].clone())
                 .collect(),
+            _lease: lease,
             response: sender,
         };
         match self.sender.try_send(job) {
             Ok(()) => {}
-            Err(TrySendError::Full(job)) => {
-                release_paths(&self.active_paths, &job.payloads);
+            Err(TrySendError::Full(_job)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "payload read queue is full",
                 ));
             }
-            Err(TrySendError::Disconnected(job)) => {
-                release_paths(&self.active_paths, &job.payloads);
+            Err(TrySendError::Disconnected(_job)) => {
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "payload readers stopped",
@@ -158,6 +167,19 @@ impl PayloadReader {
     pub fn retained_paths(&self) -> BTreeSet<std::path::PathBuf> {
         self.active_paths.lock().keys().cloned().collect()
     }
+
+    pub fn has_active_under(&self, directory: &Path) -> bool {
+        self.active_paths
+            .lock()
+            .keys()
+            .any(|path| path.starts_with(directory))
+    }
+}
+
+impl Drop for PayloadLease {
+    fn drop(&mut self) {
+        release_paths(&self.active_paths, &self.payloads);
+    }
 }
 
 impl PayloadCache {
@@ -179,17 +201,12 @@ impl PayloadCache {
     }
 }
 
-fn worker(
-    receiver: Arc<Mutex<Receiver<ReadJob>>>,
-    active_paths: Arc<Mutex<HashMap<std::path::PathBuf, usize>>>,
-    files: Arc<Mutex<FileCache>>,
-) {
+fn worker(receiver: Arc<Mutex<Receiver<ReadJob>>>, files: Arc<Mutex<FileCache>>) {
     loop {
         let job = receiver.lock().recv();
         let Ok(job) = job else { return };
         let result =
             read_payloads(&files, &job.payloads).map_err(|error| (error.kind(), error.to_string()));
-        release_paths(&active_paths, &job.payloads);
         let _ = job.response.send(result);
     }
 }
@@ -327,6 +344,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn payload_lease_keeps_segment_visible_to_gc_until_drop() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("payload");
+        let payload = PayloadRef {
+            path: Arc::new(path.clone()),
+            offset: 0,
+            len: 1,
+            crc32c: 0,
+        };
+        let reader = PayloadReader::new(1, 1, 1);
+        let lease = reader.retain(vec![payload]);
+        assert!(reader.retained_paths().contains(&path));
+        assert!(reader.has_active_under(root.path()));
+        drop(lease);
+        assert!(!reader.retained_paths().contains(&path));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn segment_fd_cache_avoids_opening_each_payload() {
@@ -340,8 +375,20 @@ mod tests {
             crc32c: crc32c::crc32c(b"payload"),
         };
         let reader = PayloadReader::new(1, 1, 4);
-        assert_eq!(&*reader.read(&payload).await.unwrap(), b"payload");
+        assert_eq!(
+            &*reader
+                .read_many(std::slice::from_ref(&payload))
+                .await
+                .unwrap()[0],
+            b"payload"
+        );
         std::fs::remove_file(path).unwrap();
-        assert_eq!(&*reader.read(&payload).await.unwrap(), b"payload");
+        assert_eq!(
+            &*reader
+                .read_many(std::slice::from_ref(&payload))
+                .await
+                .unwrap()[0],
+            b"payload"
+        );
     }
 }

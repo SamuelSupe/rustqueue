@@ -1,9 +1,6 @@
-mod admin;
 mod compat;
-mod federation;
 mod helpers;
 mod native;
-mod operations;
 
 use compat::*;
 use helpers::*;
@@ -19,15 +16,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rustqueue_consensus::{
-    ChannelLifecycle, ClusterRuntime, QueueCommand, QueueResponse, TopicState,
-};
 use rustqueue_queue::{Broker, BrokerError, BrokerStats};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -38,11 +31,9 @@ struct AppState {
     metrics: Arc<Metrics>,
     admin_token: Option<Arc<str>>,
     publish_token: Option<Arc<str>>,
-    consensus: Option<Arc<ClusterRuntime>>,
-    operation_ids: Arc<AtomicU64>,
+    registry_token: Option<Arc<str>>,
     accepting: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
-    federation_peers: Arc<crate::discovery::Directory>,
 }
 
 #[derive(Debug)]
@@ -57,8 +48,6 @@ struct PublishQuery {
     topic: String,
     #[serde(default)]
     defer: u64,
-    partition: Option<u16>,
-    key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -68,15 +57,11 @@ struct MultiPublishQuery {
     binary: bool,
     #[serde(default)]
     defer: u64,
-    partition: Option<u16>,
-    key: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TopicQuery {
     topic: String,
-    partitions: Option<u16>,
-    replication_factor: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -90,17 +75,6 @@ struct StatsQuery {
     format: Option<String>,
     topic: Option<String>,
     channel: Option<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct HealthQuery {
-    #[serde(default)]
-    deep: bool,
-}
-
-#[derive(Deserialize)]
-struct PartitionQuery {
-    topic: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -117,30 +91,24 @@ struct Producer {
     tcp_port: u16,
     http_port: u16,
     version: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cell_id: Option<u64>,
 }
 
 pub async fn serve(
     config: Arc<Config>,
     broker: Arc<Broker>,
     metrics: Arc<Metrics>,
-    consensus: Option<Arc<ClusterRuntime>>,
     accepting: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
-    federation_peers: Arc<crate::discovery::Directory>,
 ) -> anyhow::Result<()> {
     let state = AppState {
         admin_token: config.read_admin_token()?.map(Arc::from),
         publish_token: config.read_publish_token()?.map(Arc::from),
+        registry_token: config.read_registry_token()?.map(Arc::from),
         config: Arc::clone(&config),
         broker,
         metrics,
-        consensus,
-        operation_ids: Arc::new(AtomicU64::new(operation_seed(config.node.id))),
         accepting,
         publish_admission,
-        federation_peers,
     };
     let router = Router::new()
         .route("/ping", get(ping))
@@ -164,14 +132,10 @@ pub async fn serve(
         .route("/channel/pause", post(pause_channel))
         .route("/channel/unpause", post(unpause_channel))
         .route("/v1/health", get(health))
-        .route("/v1/cluster", get(cluster))
-        .route("/v1/partitions", get(partitions))
-        .route("/v1/replicas", get(replicas))
+        .route("/v1/registry", get(registry))
+        .route("/v1/drain", get(drain_status).post(set_drain))
         .route("/v1/stats", get(native_stats))
-        .merge(federation::routes())
         .route("/v1/storage/scrub", post(scrub))
-        .merge(admin::routes())
-        .merge(operations::routes())
         .layer(middleware::from_fn(nsq_content_negotiation))
         .with_state(state);
     let listener = TcpListener::bind(config.network.http_address).await?;
@@ -180,14 +144,12 @@ pub async fn serve(
     Ok(())
 }
 
-async fn nsq_content_negotiation(request: Request<axum::body::Body>, next: Next) -> Response {
+async fn nsq_content_negotiation(request: Request<Body>, next: Next) -> Response {
     let v1 = request
         .headers()
         .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.contains("application/vnd.nsq") && value.contains("version=1.0")
-        });
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("application/vnd.nsq") && v.contains("version=1.0"));
     let mut response = next.run(request).await;
     if v1 {
         response.headers_mut().insert(
@@ -206,44 +168,18 @@ impl ApiError {
             detail: detail.into(),
         }
     }
-
-    fn not_found(code: &'static str, detail: impl Into<String>) -> Self {
+    fn unavailable(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::NOT_FOUND,
+            status: StatusCode::SERVICE_UNAVAILABLE,
             code,
             detail: detail.into(),
         }
     }
-
-    fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            code,
-            detail: detail.into(),
-        }
-    }
-
-    fn internal(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code,
-            detail: detail.into(),
-        }
-    }
-
-    fn throttled() -> Self {
+    fn throttled(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: "E_THROTTLED",
-            detail: "publish byte budget is exhausted; retry later".into(),
-        }
-    }
-
-    fn disk_throttled() -> Self {
-        Self {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: "E_THROTTLED",
-            detail: "cluster storage is above the configured watermark; retry later".into(),
+            detail: detail.into(),
         }
     }
 }
@@ -252,11 +188,16 @@ impl From<BrokerError> for ApiError {
     fn from(error: BrokerError) -> Self {
         let (status, code) = match error {
             BrokerError::TopicNotFound => (StatusCode::NOT_FOUND, "E_BAD_TOPIC"),
+            BrokerError::TopicRetiring => (StatusCode::CONFLICT, "E_TOPIC_RETIRING"),
             BrokerError::InvalidTopic => (StatusCode::BAD_REQUEST, "E_BAD_TOPIC"),
             BrokerError::ChannelNotFound => (StatusCode::NOT_FOUND, "E_BAD_CHANNEL"),
             BrokerError::InvalidChannel => (StatusCode::BAD_REQUEST, "E_BAD_CHANNEL"),
             BrokerError::MessageTooLarge | BrokerError::BatchTooLarge => {
                 (StatusCode::BAD_REQUEST, "E_BAD_MESSAGE")
+            }
+            BrokerError::BacklogLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
+            BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "E_STORAGE")
             }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "E_INTERNAL"),
         };
@@ -270,13 +211,13 @@ impl From<BrokerError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let throttled = self.status == StatusCode::TOO_MANY_REQUESTS;
+        let retry = self.status == StatusCode::TOO_MANY_REQUESTS;
         let mut response = (
             self.status,
-            Json(json!({ "message": self.code, "detail": self.detail })),
+            Json(json!({"message": self.code, "detail": self.detail})),
         )
             .into_response();
-        if throttled {
+        if retry {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -288,6 +229,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustqueue_queue::{ChannelStats, TopicStats};
 
     #[test]
     fn parses_binary_mpub_strictly() {
@@ -297,10 +239,35 @@ mod tests {
         body.extend_from_slice(&3u32.to_be_bytes());
         body.extend_from_slice(b"two");
         assert_eq!(
-            parse_binary_mpub(Bytes::from(body.clone()), 10).unwrap(),
-            [Bytes::from_static(b"one"), Bytes::from_static(b"two")]
+            parse_binary_mpub(Bytes::from(body.clone()), 10)
+                .unwrap()
+                .len(),
+            2
         );
         body.push(0);
         assert!(parse_binary_mpub(Bytes::from(body), 10).is_err());
+    }
+
+    #[test]
+    fn registry_exposes_channel_names_instead_of_internal_stats() {
+        let topics = registry_topics(&BrokerStats {
+            publish_group_commit: Default::default(),
+            topics: vec![TopicStats {
+                name: "events".into(),
+                paused: false,
+                message_count: 3,
+                channels: vec![ChannelStats {
+                    name: "workers".into(),
+                    depth: 2,
+                    in_flight_count: 1,
+                    deferred_count: 0,
+                    paused: false,
+                    ephemeral: false,
+                    ack_cursor: 1,
+                    ack_gap: 0,
+                }],
+            }],
+        });
+        assert_eq!(topics[0]["channels"], json!(["workers"]));
     }
 }

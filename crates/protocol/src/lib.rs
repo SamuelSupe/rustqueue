@@ -1,14 +1,12 @@
 mod command;
 mod frame;
 mod identify;
-mod identity;
 mod mpub;
 mod name;
 
 pub use command::{Command, CommandError};
 pub use frame::{encode_frame, encode_message, encode_message_header, FrameType};
 pub use identify::{IdentifyRequest, IdentifyResponse};
-pub use identity::{CellId, GlobalGroupId, GroupKey, InternalMessageId};
 pub use mpub::{parse_mpub_body, parse_mpub_bytes, MpubError, MAX_MPUB_MESSAGES};
 pub use name::{validate_name, NameError};
 

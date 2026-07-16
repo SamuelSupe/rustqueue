@@ -1,5 +1,5 @@
 use crate::metrics::Metrics;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -8,6 +8,7 @@ const PERMIT_BYTES: usize = 4096;
 pub struct PublishAdmission {
     permits: Arc<Semaphore>,
     metrics: Arc<Metrics>,
+    storage_ready: AtomicBool,
 }
 
 pub struct ConnectionBudget {
@@ -35,7 +36,16 @@ impl PublishAdmission {
         Self {
             permits: Arc::new(Semaphore::new(units(capacity_bytes))),
             metrics,
+            storage_ready: AtomicBool::new(true),
         }
+    }
+
+    pub fn set_storage_ready(&self, ready: bool) {
+        self.storage_ready.store(ready, Ordering::Release);
+    }
+
+    pub fn storage_ready(&self) -> bool {
+        self.storage_ready.load(Ordering::Acquire)
     }
 
     pub fn try_reserve(&self, bytes: usize) -> Option<PublishReservation> {
@@ -62,6 +72,10 @@ impl PublishAdmission {
         bytes: usize,
         connection: Option<OwnedSemaphorePermit>,
     ) -> Option<PublishReservation> {
+        if !self.storage_ready() {
+            self.record_rejected(bytes);
+            return None;
+        }
         let count = u32::try_from(units(bytes)).ok()?;
         let node = match Arc::clone(&self.permits).try_acquire_many_owned(count) {
             Ok(permit) => permit,

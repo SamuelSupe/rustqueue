@@ -1,13 +1,14 @@
-//! Durable topic/channel state machine.
-
 mod batch;
 mod broker;
-mod catalog;
-mod dedup;
+mod channel;
+mod channel_store;
+mod eviction;
+mod metadata;
 mod model;
+mod outbox;
 mod payload_reader;
-mod projection;
+mod topic;
 
-pub use broker::{Broker, BrokerConfig, BrokerError, PartitionLayout, ProtectiveEvictionCandidate};
-pub use model::{BrokerStats, ChannelStats, Delivery, PartitionStats, TopicStats};
-pub use projection::{PartitionProjection, ProjectedChannel, ProjectedMessage};
+pub use broker::{Broker, BrokerConfig, BrokerError};
+pub use eviction::ProtectiveEviction;
+pub use model::{BrokerStats, ChannelStats, Delivery, PublishGroupCommitStats, TopicStats};

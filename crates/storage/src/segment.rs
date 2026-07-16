@@ -1,13 +1,18 @@
+#[path = "segment/files.rs"]
+mod files;
+
 use crate::{Record, HEADER_LEN};
+use files::{
+    read_record, scan_segment, scan_segment_readonly, segment_base_index, segment_path,
+    segment_paths,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-
-const SEGMENT_PREFIX: &str = "segment-";
-const SEGMENT_SUFFIX: &str = ".rqlog";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -21,6 +26,8 @@ pub enum StorageError {
     },
     #[error("log index is not contiguous: expected {expected}, got {actual}")]
     NonContiguous { expected: u64, actual: u64 },
+    #[error("segment log is isolated after an earlier storage failure")]
+    Isolated,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +56,7 @@ pub struct SegmentLog {
     recovery: RecoveryReport,
     start_index: u64,
     checksums: BTreeMap<PathBuf, (u64, u32)>,
+    isolated: AtomicBool,
 }
 
 impl SegmentLog {
@@ -97,6 +105,12 @@ impl SegmentLog {
         }
         recovery.records = records.len();
 
+        if records.is_empty() {
+            if let Some(base_index) = segment_base_index(&last_path) {
+                expected = Some(base_index);
+            }
+        }
+
         let current_path = last_path;
         let current_segment = Arc::new(current_path.clone());
         let current = OpenOptions::new()
@@ -113,8 +127,9 @@ impl SegmentLog {
             current,
             current_len,
             recovery,
-            start_index,
+            start_index: expected.unwrap_or(start_index),
             checksums,
+            isolated: AtomicBool::new(false),
         })
     }
 
@@ -151,6 +166,7 @@ impl SegmentLog {
         record: Record,
         durable: bool,
     ) -> Result<RecordLocation, StorageError> {
+        self.ensure_available()?;
         if self.records.is_empty() && self.current_len == 0 && record.index >= self.start_index {
             self.start_index = record.index;
         }
@@ -162,12 +178,25 @@ impl SegmentLog {
             });
         }
         let encoded = record.encode()?;
+        let result = self.append_encoded(&record, &encoded, durable);
+        if result.is_err() {
+            self.isolate();
+        }
+        result
+    }
+
+    fn append_encoded(
+        &mut self,
+        record: &Record,
+        encoded: &[u8],
+        durable: bool,
+    ) -> Result<RecordLocation, StorageError> {
         if self.current_len > 0 && self.current_len + encoded.len() as u64 > self.max_segment_bytes
         {
             self.rotate(record.index)?;
         }
         let offset = self.current_len;
-        self.current.write_all(&encoded)?;
+        self.current.write_all(encoded)?;
         if durable {
             self.current.sync_data()?;
         }
@@ -177,7 +206,7 @@ impl SegmentLog {
             .entry(self.current_path.clone())
             .or_insert((offset, 0));
         checksum.0 = self.current_len;
-        checksum.1 = crc32c::crc32c_append(checksum.1, &encoded);
+        checksum.1 = crc32c::crc32c_append(checksum.1, encoded);
         let location = RecordLocation {
             index: record.index,
             segment: Arc::clone(&self.current_segment),
@@ -189,8 +218,12 @@ impl SegmentLog {
     }
 
     pub fn sync(&self) -> Result<(), StorageError> {
-        self.current.sync_data()?;
-        Ok(())
+        self.ensure_available()?;
+        let result = self.current.sync_data().map_err(StorageError::from);
+        if result.is_err() {
+            self.isolate();
+        }
+        result
     }
 
     pub fn read(&self, index: u64) -> Result<Option<Record>, StorageError> {
@@ -201,7 +234,7 @@ impl SegmentLog {
     }
 
     pub fn read_location(&self, location: &RecordLocation) -> Result<Record, StorageError> {
-        read_record(location)
+        self.observe_read(read_record(location))
     }
 
     pub fn read_all(&self) -> Result<Vec<Record>, StorageError> {
@@ -227,6 +260,15 @@ impl SegmentLog {
     }
 
     pub fn truncate_suffix(&mut self, from_index: u64) -> Result<(), StorageError> {
+        self.ensure_available()?;
+        let result = self.truncate_suffix_inner(from_index);
+        if result.is_err() {
+            self.isolate();
+        }
+        result
+    }
+
+    fn truncate_suffix_inner(&mut self, from_index: u64) -> Result<(), StorageError> {
         let Some(first_removed) = self
             .records
             .iter()
@@ -278,6 +320,19 @@ impl SegmentLog {
         through_index: u64,
         retained: &BTreeSet<PathBuf>,
     ) -> Result<usize, StorageError> {
+        self.ensure_available()?;
+        let result = self.purge_prefix_retaining_inner(through_index, retained);
+        if result.is_err() {
+            self.isolate();
+        }
+        result
+    }
+
+    fn purge_prefix_retaining_inner(
+        &mut self,
+        through_index: u64,
+        retained: &BTreeSet<PathBuf>,
+    ) -> Result<usize, StorageError> {
         let mut removable = Vec::new();
         for path in segment_paths(&self.directory)? {
             if path == self.current_path || retained.contains(&path) {
@@ -313,9 +368,16 @@ impl SegmentLog {
     }
 
     pub fn scrub(&self) -> Result<usize, StorageError> {
+        self.ensure_available()?;
         let mut count = 0;
         for path in segment_paths(&self.directory)? {
-            let locations = scan_segment_readonly(&path)?;
+            let locations = match scan_segment_readonly(&path) {
+                Ok(locations) => locations,
+                Err(error) => {
+                    self.isolate();
+                    return Err(error);
+                }
+            };
             count += locations.len();
         }
         Ok(count)
@@ -327,6 +389,46 @@ impl SegmentLog {
 
     /// Seals the current segment so every existing payload path is immutable.
     pub fn seal(&mut self) -> Result<(), StorageError> {
+        self.ensure_available()?;
+        let result = self.seal_inner();
+        if result.is_err() {
+            self.isolate();
+        }
+        result
+    }
+
+    pub fn immutable_file(&self, path: &Path) -> Option<(u64, u32)> {
+        (path != self.current_path)
+            .then(|| self.checksums.get(path).copied())
+            .flatten()
+    }
+
+    pub fn oldest_inactive_boundary(&self) -> Result<Option<(PathBuf, u64)>, StorageError> {
+        self.oldest_inactive_boundary_retaining(&BTreeSet::new())
+    }
+
+    pub fn oldest_inactive_boundary_retaining(
+        &self,
+        retained: &BTreeSet<PathBuf>,
+    ) -> Result<Option<(PathBuf, u64)>, StorageError> {
+        for path in segment_paths(&self.directory)? {
+            if path == self.current_path || retained.contains(&path) {
+                continue;
+            }
+            if let Some(last_index) = self
+                .records
+                .iter()
+                .rev()
+                .find(|record| record.segment.as_ref() == &path)
+                .map(|record| record.index)
+            {
+                return Ok(Some((path, last_index)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn seal_inner(&mut self) -> Result<(), StorageError> {
         self.current.sync_all()?;
         if self.current_len > 0 {
             self.rotate(self.next_index())?;
@@ -334,10 +436,23 @@ impl SegmentLog {
         Ok(())
     }
 
-    pub fn immutable_file(&self, path: &Path) -> Option<(u64, u32)> {
-        (path != self.current_path)
-            .then(|| self.checksums.get(path).copied())
-            .flatten()
+    fn ensure_available(&self) -> Result<(), StorageError> {
+        if self.isolated.load(Ordering::Acquire) {
+            Err(StorageError::Isolated)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn isolate(&self) {
+        self.isolated.store(true, Ordering::Release);
+    }
+
+    fn observe_read<T>(&self, result: Result<T, StorageError>) -> Result<T, StorageError> {
+        if result.is_err() {
+            self.isolate();
+        }
+        result
     }
 
     fn rotate(&mut self, next_index: u64) -> Result<(), StorageError> {
@@ -356,114 +471,6 @@ impl SegmentLog {
         self.checksums.insert(self.current_path.clone(), (0, 0));
         Ok(())
     }
-}
-
-fn read_record(location: &RecordLocation) -> Result<Record, StorageError> {
-    let mut file = File::open(location.segment.as_ref())?;
-    file.seek(SeekFrom::Start(location.offset))?;
-    let mut header = [0u8; HEADER_LEN];
-    file.read_exact(&mut header)?;
-    let payload_len = Record::payload_len(&header)?;
-    let mut payload = vec![0; payload_len];
-    file.read_exact(&mut payload)?;
-    Record::decode(&header, payload).map_err(StorageError::Io)
-}
-
-fn scan_segment(
-    path: &Path,
-    allow_tail_repair: bool,
-) -> Result<(Vec<RecordLocation>, u64, u64, u32), StorageError> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(allow_tail_repair)
-        .open(path)?;
-    let original_len = file.metadata()?.len();
-    let mut offset = 0u64;
-    let mut locations = Vec::new();
-    let mut checksum = 0u32;
-    let segment = Arc::new(path.to_path_buf());
-
-    while offset < original_len {
-        let remaining = original_len - offset;
-        if remaining < HEADER_LEN as u64 {
-            if allow_tail_repair {
-                file.set_len(offset)?;
-                file.sync_all()?;
-                return Ok((locations, original_len - offset, offset, checksum));
-            }
-            return Err(corrupt(path, offset, "partial record header"));
-        }
-
-        file.seek(SeekFrom::Start(offset))?;
-        let mut header = [0u8; HEADER_LEN];
-        file.read_exact(&mut header)?;
-        let payload_len = Record::payload_len(&header)
-            .map_err(|error| corrupt(path, offset, error.to_string()))?;
-        let record_len = HEADER_LEN as u64 + payload_len as u64;
-        if remaining < record_len {
-            if allow_tail_repair {
-                file.set_len(offset)?;
-                file.sync_all()?;
-                return Ok((locations, original_len - offset, offset, checksum));
-            }
-            return Err(corrupt(path, offset, "partial record payload"));
-        }
-        let mut payload = vec![0; payload_len];
-        file.read_exact(&mut payload)?;
-        let record_checksum =
-            crc32c::crc32c_append(crc32c::crc32c_append(checksum, &header), &payload);
-        match Record::decode(&header, payload) {
-            Ok(record) => {
-                checksum = record_checksum;
-                locations.push(RecordLocation {
-                    index: record.index,
-                    segment: Arc::clone(&segment),
-                    offset,
-                    encoded_len: record_len,
-                });
-            }
-            Err(_error) if allow_tail_repair && offset + record_len == original_len => {
-                file.set_len(offset)?;
-                file.sync_all()?;
-                return Ok((locations, original_len - offset, offset, checksum));
-            }
-            Err(error) => return Err(corrupt(path, offset, error.to_string())),
-        }
-        offset += record_len;
-    }
-    Ok((locations, 0, offset, checksum))
-}
-
-fn scan_segment_readonly(path: &Path) -> Result<Vec<RecordLocation>, StorageError> {
-    scan_segment(path, false).map(|(locations, _, _, _)| locations)
-}
-
-fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> StorageError {
-    StorageError::Corrupt {
-        path: path.to_path_buf(),
-        offset,
-        reason: reason.into(),
-    }
-}
-
-fn segment_paths(directory: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(SEGMENT_PREFIX) && name.ends_with(SEGMENT_SUFFIX)
-                })
-        })
-        .collect();
-    paths.sort();
-    Ok(paths)
-}
-
-fn segment_path(directory: &Path, base_index: u64) -> PathBuf {
-    directory.join(format!("{SEGMENT_PREFIX}{base_index:020}{SEGMENT_SUFFIX}"))
 }
 
 #[cfg(test)]

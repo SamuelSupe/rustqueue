@@ -94,6 +94,31 @@ func waitForChannel(address, topic, channel string, present bool) error {
 	return fmt.Errorf("channel %s presence did not become %t", channel, present)
 }
 
+func waitForLookupProducer(address, topic string) error {
+	endpoint := fmt.Sprintf("http://%s/lookup?topic=%s", address, url.QueryEscape(topic))
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		request.Header.Set("Accept", "application/vnd.nsq; version=1.0")
+		response, err := http.DefaultClient.Do(request)
+		if err == nil {
+			var body struct {
+				Producers []json.RawMessage `json:"producers"`
+			}
+			err = json.NewDecoder(response.Body).Decode(&body)
+			response.Body.Close()
+			if err == nil && len(body.Producers) > 0 {
+				return nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("topic %s did not become discoverable within 10s", topic)
+}
+
 func receive(channel <-chan []byte, timeout time.Duration) ([]byte, error) {
 	select {
 	case body := <-channel:
