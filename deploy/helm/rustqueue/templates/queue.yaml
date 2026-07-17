@@ -23,6 +23,12 @@ spec:
   bootstrapRetentionSeconds: {{ .Values.queue.bootstrapRetentionSeconds }}
   maxMessageBytes: {{ .Values.queue.maxMessageBytes | int64 }}
   maxBacklogMessages: {{ .Values.queue.maxBacklogMessages | int64 }}
+  maxTopics: {{ .Values.queue.maxTopics | int64 }}
+  maxPublishWorkers: {{ .Values.queue.maxPublishWorkers | int64 }}
+  publishWorkerIdleSeconds: {{ .Values.queue.publishWorkerIdleSeconds | int64 }}
+  detailedQueueMetrics: {{ .Values.queue.detailedQueueMetrics }}
+  maxDetailedMetricSeries: {{ .Values.queue.maxDetailedMetricSeries | int64 }}
+  consoleManagementEnabled: {{ and .Values.console.enabled .Values.console.management.enabled }}
   discoveryReplicas: {{ .Values.queue.discoveryReplicas }}
   proxyNodeSelector:
     {{- toYaml .Values.queue.proxyNodeSelector | nindent 4 }}

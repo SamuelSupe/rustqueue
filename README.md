@@ -23,9 +23,15 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 - Concurrent publishes to one topic use a bounded group commit (up to 64
   requests or 8 MiB, with at most 1 ms coalescing delay) and all wait for the
   same durable boundary before receiving `OK`.
+- Per-topic publish and channel-commit workers retire after 60 idle seconds.
+  The defaults cap durable topics at 10,000 and each worker class at 1,024;
+  exhausted capacity returns retryable HTTP `429` instead of growing tasks and
+  memory without bound.
 - IDs are durably reserved in blocks, so restarts may create harmless gaps but
   never reuse a broker-scoped message ID.
-- A successful `FIN` or `REQ` has passed the local channel WAL `fsync`.
+- Concurrent `FIN` and `REQ` for one topic share a bounded group commit (up to
+  64 requests with at most 1 ms coalescing delay). A successful response has
+  passed every affected local channel WAL `fsync`.
 - Delivery is at least once. A restart redelivers messages without durable FIN.
 - The broker PVC is the only copy; permanent PVC loss loses its messages.
 - Topics and channels are broker-local. Lookup consumers union all owners.
@@ -33,15 +39,25 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   `SUB` can catch a newly selected owner without a normal-path miss.
 - The stable v7 wire limit is 32 MiB; the default single-message limit is
   20 MiB and the default MPUB body limit is 64 MiB.
+- Publish bodies are written to the segment with vectored header/metadata/body
+  I/O. The durable path does not build a second batch body or a full record
+  buffer, and admission charges the input plus bounded encoding metadata.
+- GC locates retention boundaries by monotonic indexes instead of rescanning a
+  full backlog every five seconds. Scrub snapshots immutable files under the
+  Topic lock, then verifies them lock-free with a default 64 MiB/s I/O limit.
 
 ## Components
 
 - `rustqueued`: local durable NSQ broker and HTTP management API.
-- `rustqueue-discovery`: stateless EndpointSlice-derived lookup service.
-- `rustqueue-proxy`: bounded producer TCP/HTTP proxy; TCP is connection-pinned.
+- `rustqueue-discovery`: stateless EndpointSlice-derived lookup service with
+  incremental topic/channel indexes and revision-head registry polling.
+- `rustqueue-proxy`: bounded producer TCP/HTTP proxy; TCP is connection-pinned
+  and new connections choose a least-active ready Broker.
 - `rustqueue-operator`: creates the StatefulSet, retained PVCs, discovery,
   proxy, RBAC, disruption budgets, PVC expansion and drain-aware one-at-a-time
   rolling updates.
+- `rustqueue-console`: Kubernetes and broker observability backend serving the
+  bilingual Carbon UI, with default-off native Topic/Channel management.
 - `rustqueuectl`: Kubernetes-aware cluster status, targeted maintenance,
   rollout, storage expansion, fan-out stats and scrub commands.
 
@@ -101,8 +117,25 @@ helm upgrade --install rustqueue deploy/helm/rustqueue \
 The producer endpoints are exposed by the proxy Service. Consumers should use
 both discovery replicas as lookupd endpoints. The generated runtime Secret is
 internal; set `queue.registrySecretName` to use a pre-created Secret containing
-`admin-token` and `registry-token`. Client TLS is optional and always supplied
+`admin-token`, `registry-token` and `console-token`. The console token can read
+broker observations and, only when Console management is explicitly enabled,
+call the narrow native Topic/Channel management API. It cannot authorize drain,
+scrub, upgrade or the NSQ-compatible admin API. Client TLS is optional and always supplied
 through an existing Kubernetes Secret; the operator does not run a CA.
+
+The chart enables RustQueue Console by default as a ClusterIP-only Service. It
+does not create an Ingress and has no built-in login. Put the Service behind
+your existing VPN, SSO or authenticated Ingress when broader access is needed:
+
+```sh
+kubectl -n rustqueue port-forward svc/rustqueue-console 4180:4180
+```
+
+Open `http://127.0.0.1:4180`. Console never reads message bodies, Secrets or
+container logs. It keeps a bounded 15-minute live trend in memory and resets
+that trend when its Pod restarts. Topic/Channel management is disabled by
+default; enable it with `--set console.management.enabled=true`. See the [Console security and deployment
+guide](docs/operations/console.md).
 
 Runtime Pods run as UID/GID 65532 with a read-only root filesystem. Broker Pods
 set `fsGroup=65532` and `fsGroupChangePolicy=OnRootMismatch` so dynamically
@@ -200,18 +233,34 @@ Native broker endpoints:
 
 - `GET /v1/health`
 - `GET /v1/registry`
+- `GET /v1/registry/head`
 - `GET /v1/capabilities`
 - `GET|POST /v1/drain`
 - `GET /v1/stats`
+- `GET /v1/observe` (console token, no message bodies)
+- `POST /v1/manage/topics/{action}` (console token, only when enabled)
+- `POST /v1/manage/channels/{action}` (console token, only when enabled)
+- `POST /v1/manage/fences/sync` (console token, only when enabled)
 - `POST /v1/storage/scrub`
 - `GET /metrics`
 
 Discovery serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, `/info`,
-`/v1/publishers`, `/v1/health`, and `/metrics`. The producer proxy also exposes
-`/metrics` on its HTTP listener.
+`/v1/publishers`, `/v1/publishers/head`, `/v1/health`, and `/metrics`. The
+producer proxy also exposes `/metrics` on its HTTP listener.
 
-Latency histograms cover durable fsync, group-commit queueing, publish ACK,
-payload reads, scrub/GC, proxy backend calls, and discovery registry polling.
+Horizontal scaling is deliberately bounded by client concurrency rather than a
+central coordinator. Least-active placement prevents random TCP connection
+collisions, but 16 persistent producer connections can use at most 16 Brokers
+at once. Lookup queries no longer scan every registry and steady-state polling
+transfers only small revision/readiness heads; nevertheless a consumer still
+needs one connection per actual Topic owner. This is a share-nothing cost, not
+an unbounded or zero-cost scaling claim.
+
+Latency histograms cover publish and channel-WAL fsync, publish and FIN/REQ
+group-commit queueing, publish and channel ACK, payload reads, scrub/GC, proxy
+backend calls, and discovery registry polling. Queue aggregates have fixed
+cardinality by default; `[metrics].detailed_queue_metrics` enables bounded
+per-topic/channel series up to `max_detailed_series`.
 
 ## Storage and upgrades
 
@@ -245,14 +294,19 @@ The on-disk layout is:
 /data/broker.meta
 /data/topics/<hex-topic>/manifest
 /data/topics/<hex-topic>/segments/*.rqlog
+/data/topics/<hex-topic>/segments/*.rqidx  # sealed-segment recovery metadata
 /data/topics/<hex-topic>/channels/<hex-channel>.checkpoint
 /data/topics/<hex-topic>/channels/<hex-channel>.wal
 /data/dlq-outbox/                # compact CRC-protected binary transfer intents
 /data/audit/
 ```
 
-Tail short writes are truncated during startup. A complete CRC-corrupt record,
-middle corruption, invalid channel WAL or identity mismatch fails closed.
+Tail short writes are truncated during startup. Sealed segments reopen from an
+atomic CRC-protected recovery index, so startup reads only index metadata plus
+the active tail. Missing or invalid indexes fall back to a full segment scan.
+Cold payload corruption is isolated by payload-read CRC or the immediate
+background scrub; active-tail corruption, invalid channel WAL and identity
+mismatch fail startup closed.
 
 Crash-boundary integration tests stop worker processes with actual `SIGKILL`
 after append, fsync-before-ACK, checkpoint file fsync-before-rename, and GC
@@ -267,8 +321,10 @@ registry responses.
 
 `./scripts/release-gate.sh` is the repeatable production gate. It runs format,
 build, unit, clippy, Helm, fuzz and official-client compatibility checks;
-`K8S_ACCEPTANCE=1` additionally requires the OrbStack context and runs both
-Kubernetes acceptances. The same non-Kubernetes gate runs in GitHub Actions.
+`K8S_ACCEPTANCE=1` additionally requires the OrbStack context and runs base,
+Console-management and multi-broker Kubernetes acceptances, including forced
+Console restart after one owner of a multi-owner operation completes. The same
+non-Kubernetes gate runs in GitHub Actions.
 
 ## Non-goals
 

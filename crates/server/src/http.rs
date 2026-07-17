@@ -1,9 +1,11 @@
 mod compat;
 mod helpers;
+mod manage;
 mod native;
 
 use compat::*;
 use helpers::*;
+use manage::*;
 use native::*;
 
 use crate::admission::PublishAdmission;
@@ -32,6 +34,7 @@ struct AppState {
     admin_token: Option<Arc<str>>,
     publish_token: Option<Arc<str>>,
     registry_token: Option<Arc<str>>,
+    console_token: Option<Arc<str>>,
     accepting: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
 }
@@ -104,13 +107,14 @@ pub async fn serve(
         admin_token: config.read_admin_token()?.map(Arc::from),
         publish_token: config.read_publish_token()?.map(Arc::from),
         registry_token: config.read_registry_token()?.map(Arc::from),
+        console_token: config.read_console_token()?.map(Arc::from),
         config: Arc::clone(&config),
         broker,
         metrics,
         accepting,
         publish_admission,
     };
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/ping", get(ping))
         .route("/info", get(info_handler))
         .route("/pub", post(publish))
@@ -133,12 +137,20 @@ pub async fn serve(
         .route("/channel/unpause", post(unpause_channel))
         .route("/v1/health", get(health))
         .route("/v1/capabilities", get(capabilities))
+        .route("/v1/registry/head", get(registry_head))
         .route("/v1/registry", get(registry))
         .route("/v1/drain", get(drain_status).post(set_drain))
         .route("/v1/stats", get(native_stats))
+        .route("/v1/observe", get(observe))
         .route("/v1/storage/scrub", post(scrub))
-        .layer(middleware::from_fn(nsq_content_negotiation))
-        .with_state(state);
+        .layer(middleware::from_fn(nsq_content_negotiation));
+    if config.security.console_management_enabled {
+        router = router
+            .route("/v1/manage/topics/{action}", post(manage_topic))
+            .route("/v1/manage/channels/{action}", post(manage_channel))
+            .route("/v1/manage/fences/sync", post(sync_fences));
+    }
+    let router = router.with_state(state);
     let listener = TcpListener::bind(config.network.http_address).await?;
     info!(address = %config.network.http_address, "HTTP API listening");
     axum::serve(listener, router).await?;
@@ -190,13 +202,23 @@ impl From<BrokerError> for ApiError {
         let (status, code) = match error {
             BrokerError::TopicNotFound => (StatusCode::NOT_FOUND, "E_BAD_TOPIC"),
             BrokerError::TopicRetiring => (StatusCode::CONFLICT, "E_TOPIC_RETIRING"),
+            BrokerError::TopicTombstoned => (StatusCode::CONFLICT, "E_TOPIC_TOMBSTONED"),
             BrokerError::InvalidTopic => (StatusCode::BAD_REQUEST, "E_BAD_TOPIC"),
             BrokerError::ChannelNotFound => (StatusCode::NOT_FOUND, "E_BAD_CHANNEL"),
+            BrokerError::ChannelTombstoned => (StatusCode::CONFLICT, "E_CHANNEL_TOMBSTONED"),
+            BrokerError::ManagementUnavailable => {
+                (StatusCode::SERVICE_UNAVAILABLE, "E_MANAGEMENT_UNAVAILABLE")
+            }
+            BrokerError::RevisionConflict { .. } => (StatusCode::CONFLICT, "E_REVISION_CONFLICT"),
+            BrokerError::OperationConflict => (StatusCode::CONFLICT, "E_OPERATION_CONFLICT"),
             BrokerError::InvalidChannel => (StatusCode::BAD_REQUEST, "E_BAD_CHANNEL"),
             BrokerError::MessageTooLarge | BrokerError::BatchTooLarge => {
                 (StatusCode::BAD_REQUEST, "E_BAD_MESSAGE")
             }
-            BrokerError::BacklogLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
+            BrokerError::BacklogLimit
+            | BrokerError::TopicLimit
+            | BrokerError::PublishWorkerLimit
+            | BrokerError::ChannelWorkerLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
             BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "E_STORAGE")
             }
@@ -253,11 +275,14 @@ mod tests {
     fn registry_exposes_channel_names_instead_of_internal_stats() {
         let topics = registry_topics(&BrokerStats {
             publish_group_commit: Default::default(),
+            channel_group_commit: Default::default(),
             latency: Default::default(),
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,
                 message_count: 3,
+                segment_count: 1,
+                segment_bytes: 256,
                 channels: vec![ChannelStats {
                     name: "workers".into(),
                     depth: 2,
@@ -271,5 +296,22 @@ mod tests {
             }],
         });
         assert_eq!(topics[0]["channels"], json!(["workers"]));
+    }
+
+    #[test]
+    fn console_token_is_read_only_and_distinct_from_admin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer console-secret"),
+        );
+        assert!(authorize(&headers, Some("console-secret"), "console").is_ok());
+        assert!(authorize(&headers, Some("admin-secret"), "admin").is_err());
+        assert!(authorize_any(
+            &headers,
+            &[Some("registry-secret"), Some("console-secret")],
+            "read-only"
+        )
+        .is_ok());
     }
 }

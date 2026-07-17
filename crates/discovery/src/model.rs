@@ -14,9 +14,18 @@ impl BrokerEndpoint {
             IpAddr::V6(address) => format!("http://[{address}]:{}/v1/registry", self.http_port),
         }
     }
+
+    pub fn registry_head_url(&self) -> String {
+        match self.address {
+            IpAddr::V4(address) => format!("http://{address}:{}/v1/registry/head", self.http_port),
+            IpAddr::V6(address) => {
+                format!("http://[{address}]:{}/v1/registry/head", self.http_port)
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BrokerRegistry {
     pub format: u8,
     pub revision: u64,
@@ -40,13 +49,23 @@ pub struct BrokerRegistry {
     pub compatibility: Option<CompatibilityReport>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BrokerRegistryHead {
+    pub format: u8,
+    pub revision: u64,
+    pub node_id: u64,
+    pub ready: bool,
+    pub publish_ready: bool,
+    pub consume_ready: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CompatibilityReport {
     pub binary: BinaryCapabilities,
     pub storage: CompatibilityState,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BinaryCapabilities {
     pub binary_version: String,
     pub data_format: u32,
@@ -55,7 +74,7 @@ pub struct BinaryCapabilities {
     pub maximum_writer_feature_level: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CompatibilityState {
     pub data_format: u32,
     pub active_writer_feature_level: u32,
@@ -63,7 +82,7 @@ pub struct CompatibilityState {
     pub generation: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RegistryTopic {
     pub name: String,
     #[serde(default)]

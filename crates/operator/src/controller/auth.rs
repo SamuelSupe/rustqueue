@@ -1,9 +1,10 @@
 use crate::RustQueue;
 use anyhow::{bail, Context};
 use k8s_openapi::api::core::v1::Secret;
-use kube::api::{Api, PostParams};
+use kube::api::{Api, Patch, PatchParams, PostParams};
 use kube::{Resource, ResourceExt};
 use rand::distributions::{Alphanumeric, DistString};
+use serde_json::json;
 use std::collections::BTreeMap;
 
 pub(super) struct AuthSecret {
@@ -25,7 +26,7 @@ pub(super) async fn ensure(
         .registry_secret_name
         .clone()
         .unwrap_or_else(|| format!("{}-auth", cluster.name_any()));
-    let secret = match api.get_opt(&name).await? {
+    let mut secret = match api.get_opt(&name).await? {
         Some(secret) => secret,
         None if generated => {
             let owner = cluster
@@ -38,6 +39,10 @@ pub(super) async fn ensure(
             );
             string_data.insert(
                 "registry-token".into(),
+                Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
+            );
+            string_data.insert(
+                "console-token".into(),
                 Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
             );
             api.create(
@@ -58,6 +63,29 @@ pub(super) async fn ensure(
         }
         None => bail!("configured registry Secret {name} does not exist"),
     };
+    let missing_console = secret
+        .data
+        .as_ref()
+        .is_none_or(|data| !data.contains_key("console-token"));
+    let has_observer = secret
+        .data
+        .as_ref()
+        .is_some_and(|data| data.contains_key("observer-token"));
+    if generated && (missing_console || has_observer) {
+        let patch = if missing_console {
+            json!({
+                "stringData": {
+                    "console-token": Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
+                },
+                "data": {"observer-token": null},
+            })
+        } else {
+            json!({"data": {"observer-token": null}})
+        };
+        secret = api
+            .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+            .await?;
+    }
     let data = secret.data.as_ref().context("auth Secret has no data")?;
     let read = |key: &str| -> anyhow::Result<String> {
         let bytes = data
@@ -70,6 +98,7 @@ pub(super) async fn ensure(
         }
         Ok(value.trim().into())
     };
+    let _ = read("console-token")?;
     Ok(AuthSecret {
         name,
         admin_token: read("admin-token")?,

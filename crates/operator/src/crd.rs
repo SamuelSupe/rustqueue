@@ -45,8 +45,20 @@ pub struct RustQueueSpec {
     pub max_message_bytes: usize,
     #[serde(default = "default_max_backlog_messages")]
     pub max_backlog_messages: usize,
+    #[serde(default = "default_max_topics")]
+    pub max_topics: usize,
+    #[serde(default = "default_max_publish_workers")]
+    pub max_publish_workers: usize,
+    #[serde(default = "default_publish_worker_idle_seconds")]
+    pub publish_worker_idle_seconds: u64,
+    #[serde(default)]
+    pub detailed_queue_metrics: bool,
+    #[serde(default = "default_max_detailed_metric_series")]
+    pub max_detailed_metric_series: usize,
     #[serde(default)]
     pub registry_secret_name: Option<String>,
+    #[serde(default)]
+    pub console_management_enabled: bool,
     #[serde(default)]
     pub client_tls_secret_name: Option<String>,
     #[serde(default)]
@@ -249,6 +261,18 @@ fn default_max_message_bytes() -> usize {
 }
 fn default_max_backlog_messages() -> usize {
     10_000_000
+}
+fn default_max_topics() -> usize {
+    10_000
+}
+fn default_max_publish_workers() -> usize {
+    1_024
+}
+fn default_publish_worker_idle_seconds() -> u64 {
+    60
+}
+fn default_max_detailed_metric_series() -> usize {
+    1_000
 }
 fn default_discovery_replicas() -> i32 {
     2

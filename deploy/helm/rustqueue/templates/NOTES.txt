@@ -11,3 +11,19 @@ Producer endpoints (node-local proxy Service):
 Consumer lookup endpoint:
   http://{{ .Values.queue.name }}-discovery.{{ .Release.Namespace }}.svc:4161
 {{- end }}
+{{- if and .Values.queue.create .Values.console.enabled }}
+RustQueue Console is available inside the cluster at:
+  http://{{ .Values.queue.name }}-console.{{ .Release.Namespace }}.svc:4180
+
+For local access:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Values.queue.name }}-console 4180:4180
+{{- if .Values.console.management.enabled }}
+
+Topic and Channel management is enabled. It starts locked and requires the exact
+confirmation value {{ .Release.Namespace }}/{{ .Values.queue.name }}.
+{{- else }}
+
+Topic and Channel management is disabled. Enable it explicitly with:
+  --set console.management.enabled=true
+{{- end }}
+{{- end }}

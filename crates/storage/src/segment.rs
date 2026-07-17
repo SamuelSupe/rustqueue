@@ -1,18 +1,26 @@
+#[path = "segment/append.rs"]
+mod append;
 #[path = "segment/files.rs"]
 mod files;
+#[path = "segment/maintenance.rs"]
+mod maintenance;
+#[path = "segment/recovery_index.rs"]
+mod recovery_index;
+#[path = "segment/scrub.rs"]
+mod scrub;
 
-use crate::{crash_failpoint, Record, BASE_STORAGE_FEATURE_LEVEL, HEADER_LEN};
-use files::{
-    read_record, scan_segment, scan_segment_readonly, segment_base_index, segment_path,
-    segment_paths,
-};
+use crate::{crash_failpoint, Record, RecordHeader, BASE_STORAGE_FEATURE_LEVEL, HEADER_LEN};
+use append::write_parts;
+use files::{read_record, scan_segment, segment_base_index, segment_path, segment_paths};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+
+pub use scrub::ScrubTarget;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -43,6 +51,8 @@ pub struct RecoveryReport {
     pub records: usize,
     pub truncated_bytes: u64,
     pub last_index: u64,
+    pub indexed_records: usize,
+    pub scanned_records: usize,
 }
 
 pub struct SegmentLog {
@@ -56,6 +66,7 @@ pub struct SegmentLog {
     recovery: RecoveryReport,
     start_index: u64,
     checksums: BTreeMap<PathBuf, (u64, u32)>,
+    recovery_metadata: BTreeMap<PathBuf, Vec<u8>>,
     isolated: AtomicBool,
     active_writer_feature_level: u32,
 }
@@ -95,13 +106,31 @@ impl SegmentLog {
 
         let mut records = Vec::new();
         let mut checksums = BTreeMap::new();
+        let mut recovery_metadata = BTreeMap::new();
         let mut recovery = RecoveryReport::default();
         let last_path = paths.last().cloned().expect("at least one segment");
         let mut expected = None;
 
         for path in &paths {
             let is_last = path == &last_path;
-            let (locations, truncated, bytes, crc32c) = scan_segment(path, is_last)?;
+            let indexed = if is_last {
+                None
+            } else {
+                recovery_index::load(path).ok().flatten().filter(|index| {
+                    fs::metadata(path)
+                        .map(|metadata| metadata.len() == index.segment_len)
+                        .unwrap_or(false)
+                })
+            };
+            let (locations, truncated, bytes, crc32c) = if let Some(index) = indexed {
+                recovery.indexed_records += index.locations.len();
+                recovery_metadata.insert(path.clone(), index.metadata);
+                (index.locations, 0, index.segment_len, index.segment_crc32c)
+            } else {
+                let scanned = scan_segment(path, is_last)?;
+                recovery.scanned_records += scanned.0.len();
+                scanned
+            };
             checksums.insert(path.clone(), (bytes, crc32c));
             recovery.truncated_bytes += truncated;
             for location in locations {
@@ -144,6 +173,7 @@ impl SegmentLog {
             recovery,
             start_index: expected.unwrap_or(start_index),
             checksums,
+            recovery_metadata,
             isolated: AtomicBool::new(false),
             active_writer_feature_level,
         })
@@ -166,6 +196,18 @@ impl SegmentLog {
             .map_or(self.start_index, |index| index + 1)
     }
 
+    /// Returns the current on-disk footprint using the checksums maintained by
+    /// append, recovery, rotation and purge. This does not touch the filesystem.
+    pub fn storage_usage(&self) -> (u64, u64) {
+        (
+            self.checksums.len() as u64,
+            self.checksums
+                .values()
+                .map(|(bytes, _)| *bytes)
+                .fold(0u64, u64::saturating_add),
+        )
+    }
+
     pub fn append(&mut self, mut record: Record, durable: bool) -> Result<u64, StorageError> {
         record.index = self.next_index();
         self.append_at_with_location(record, durable)
@@ -180,6 +222,16 @@ impl SegmentLog {
     pub fn append_at_with_location(
         &mut self,
         record: Record,
+        durable: bool,
+    ) -> Result<RecordLocation, StorageError> {
+        let header = record.header();
+        self.append_parts_at_with_location(header, &[record.payload.as_slice()], durable)
+    }
+
+    pub fn append_parts_at_with_location(
+        &mut self,
+        record: RecordHeader,
+        payload: &[&[u8]],
         durable: bool,
     ) -> Result<RecordLocation, StorageError> {
         self.ensure_available()?;
@@ -203,41 +255,54 @@ impl SegmentLog {
                 actual: record.index,
             });
         }
-        let encoded = record.encode()?;
-        let result = self.append_encoded(&record, &encoded, durable);
+        let header = record.encode(payload)?;
+        let encoded_len = payload.iter().try_fold(HEADER_LEN as u64, |total, part| {
+            total.checked_add(part.len() as u64)
+        });
+        let Some(encoded_len) = encoded_len else {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "record length overflow",
+            )));
+        };
+        let result = self.append_parts(&record, &header, payload, encoded_len, durable);
         if result.is_err() {
             self.isolate();
         }
         result
     }
 
-    fn append_encoded(
+    fn append_parts(
         &mut self,
-        record: &Record,
-        encoded: &[u8],
+        record: &RecordHeader,
+        header: &[u8; HEADER_LEN],
+        payload: &[&[u8]],
+        encoded_len: u64,
         durable: bool,
     ) -> Result<RecordLocation, StorageError> {
-        if self.current_len > 0 && self.current_len + encoded.len() as u64 > self.max_segment_bytes
-        {
+        if self.current_len > 0 && self.current_len + encoded_len > self.max_segment_bytes {
             self.rotate(record.index)?;
         }
         let offset = self.current_len;
-        self.current.write_all(encoded)?;
+        write_parts(&mut self.current, header, payload)?;
         if durable {
             self.current.sync_data()?;
         }
-        self.current_len += encoded.len() as u64;
+        self.current_len += encoded_len;
         let checksum = self
             .checksums
             .entry(self.current_path.clone())
             .or_insert((offset, 0));
         checksum.0 = self.current_len;
-        checksum.1 = crc32c::crc32c_append(checksum.1, encoded);
+        checksum.1 = crc32c::crc32c_append(checksum.1, header);
+        for part in payload {
+            checksum.1 = crc32c::crc32c_append(checksum.1, part);
+        }
         let location = RecordLocation {
             index: record.index,
             segment: Arc::clone(&self.current_segment),
             offset,
-            encoded_len: encoded.len() as u64,
+            encoded_len,
         };
         self.records.push(location.clone());
         Ok(location)
@@ -285,182 +350,56 @@ impl SegmentLog {
         &self.records
     }
 
-    pub fn truncate_suffix(&mut self, from_index: u64) -> Result<(), StorageError> {
-        self.ensure_available()?;
-        let result = self.truncate_suffix_inner(from_index);
-        if result.is_err() {
-            self.isolate();
-        }
-        result
+    pub fn current_segment_path(&self) -> &Path {
+        &self.current_path
     }
 
-    fn truncate_suffix_inner(&mut self, from_index: u64) -> Result<(), StorageError> {
-        let Some(first_removed) = self
+    pub fn recovery_metadata(&self, path: &Path) -> Option<&[u8]> {
+        self.recovery_metadata.get(path).map(Vec::as_slice)
+    }
+
+    pub fn record_index_range(&self, path: &Path) -> Option<(u64, u64)> {
+        let first = segment_base_index(path)?;
+        let start = self.records.partition_point(|record| record.index < first);
+        let found = self.records.get(start)?;
+        if found.segment.as_ref() != path {
+            return None;
+        }
+        let next = self
+            .checksums
+            .keys()
+            .filter_map(|candidate| segment_base_index(candidate))
+            .find(|base| *base > first)
+            .unwrap_or_else(|| self.next_index());
+        Some((first, next.saturating_sub(1)))
+    }
+
+    pub fn persist_recovery_index(
+        &mut self,
+        path: &Path,
+        metadata: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        self.ensure_available()?;
+        if path == self.current_path {
+            return Err(StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot index the active segment",
+            )));
+        }
+        let (segment_len, segment_crc32c) = self.checksums.get(path).copied().ok_or_else(|| {
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "segment checksum is unavailable",
+            ))
+        })?;
+        let locations: Vec<_> = self
             .records
             .iter()
-            .position(|record| record.index >= from_index)
-        else {
-            return Ok(());
-        };
-        let location = self.records[first_removed].clone();
-        let removed_paths: Vec<PathBuf> = self.records[first_removed..]
-            .iter()
-            .map(|item| item.segment.as_ref().clone())
-            .filter(|path| path != location.segment.as_ref())
+            .filter(|location| location.segment.as_ref() == path)
+            .cloned()
             .collect();
-
-        OpenOptions::new()
-            .write(true)
-            .open(location.segment.as_ref())?
-            .set_len(location.offset)?;
-        for path in removed_paths {
-            if path.exists() {
-                fs::remove_file(&path)?;
-            }
-            self.checksums.remove(&path);
-        }
-        let (_, _, bytes, crc32c) = scan_segment(location.segment.as_ref(), true)?;
-        self.checksums
-            .insert(location.segment.as_ref().clone(), (bytes, crc32c));
-        self.records.truncate(first_removed);
-        self.current_path = location.segment.as_ref().clone();
-        self.current_segment = location.segment;
-        self.current = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.current_path)?;
-        self.current_len = self.current.metadata()?.len();
-        self.current.sync_all()?;
-        File::open(&self.directory)?.sync_all()?;
-        Ok(())
-    }
-
-    /// Removes only immutable segments whose final record is at or below `through_index`.
-    /// The active segment is never removed, even when every record in it is eligible.
-    pub fn purge_prefix(&mut self, through_index: u64) -> Result<usize, StorageError> {
-        self.purge_prefix_retaining(through_index, &BTreeSet::new())
-    }
-
-    pub fn purge_prefix_retaining(
-        &mut self,
-        through_index: u64,
-        retained: &BTreeSet<PathBuf>,
-    ) -> Result<usize, StorageError> {
-        self.ensure_available()?;
-        let result = self.purge_prefix_retaining_inner(through_index, retained);
-        if result.is_err() {
-            self.isolate();
-        }
-        result
-    }
-
-    fn purge_prefix_retaining_inner(
-        &mut self,
-        through_index: u64,
-        retained: &BTreeSet<PathBuf>,
-    ) -> Result<usize, StorageError> {
-        let mut removable = Vec::new();
-        for path in segment_paths(&self.directory)? {
-            if path == self.current_path || retained.contains(&path) {
-                continue;
-            }
-            let last_index = self
-                .records
-                .iter()
-                .rev()
-                .find(|record| record.segment.as_ref() == &path)
-                .map(|record| record.index);
-            if last_index.is_some_and(|index| index <= through_index) {
-                removable.push(path);
-            }
-        }
-        if removable.is_empty() {
-            return Ok(0);
-        }
-        self.current.sync_all()?;
-        crash_failpoint("gc_before_segment_delete");
-        for path in &removable {
-            fs::remove_file(path)?;
-            self.checksums.remove(path);
-        }
-        self.records
-            .retain(|record| !removable.iter().any(|path| path == record.segment.as_ref()));
-        if let Some(first) = self.records.first() {
-            self.start_index = first.index;
-        } else {
-            self.start_index = through_index.saturating_add(1);
-        }
-        crash_failpoint("gc_after_segment_delete_before_dir_fsync");
-        File::open(&self.directory)?.sync_all()?;
-        Ok(removable.len())
-    }
-
-    pub fn scrub(&self) -> Result<usize, StorageError> {
-        self.ensure_available()?;
-        let mut count = 0;
-        for path in segment_paths(&self.directory)? {
-            let locations = match scan_segment_readonly(&path) {
-                Ok(locations) => locations,
-                Err(error) => {
-                    self.isolate();
-                    return Err(error);
-                }
-            };
-            count += locations.len();
-        }
-        Ok(count)
-    }
-
-    pub fn segment_paths(&self) -> Result<Vec<PathBuf>, StorageError> {
-        Ok(segment_paths(&self.directory)?)
-    }
-
-    /// Seals the current segment so every existing payload path is immutable.
-    pub fn seal(&mut self) -> Result<(), StorageError> {
-        self.ensure_available()?;
-        let result = self.seal_inner();
-        if result.is_err() {
-            self.isolate();
-        }
-        result
-    }
-
-    pub fn immutable_file(&self, path: &Path) -> Option<(u64, u32)> {
-        (path != self.current_path)
-            .then(|| self.checksums.get(path).copied())
-            .flatten()
-    }
-
-    pub fn oldest_inactive_boundary(&self) -> Result<Option<(PathBuf, u64)>, StorageError> {
-        self.oldest_inactive_boundary_retaining(&BTreeSet::new())
-    }
-
-    pub fn oldest_inactive_boundary_retaining(
-        &self,
-        retained: &BTreeSet<PathBuf>,
-    ) -> Result<Option<(PathBuf, u64)>, StorageError> {
-        for path in segment_paths(&self.directory)? {
-            if path == self.current_path || retained.contains(&path) {
-                continue;
-            }
-            if let Some(last_index) = self
-                .records
-                .iter()
-                .rev()
-                .find(|record| record.segment.as_ref() == &path)
-                .map(|record| record.index)
-            {
-                return Ok(Some((path, last_index)));
-            }
-        }
-        Ok(None)
-    }
-
-    fn seal_inner(&mut self) -> Result<(), StorageError> {
-        self.current.sync_all()?;
-        if self.current_len > 0 {
-            self.rotate(self.next_index())?;
-        }
+        recovery_index::store(path, segment_len, segment_crc32c, &locations, &metadata)?;
+        self.recovery_metadata.insert(path.to_path_buf(), metadata);
         Ok(())
     }
 

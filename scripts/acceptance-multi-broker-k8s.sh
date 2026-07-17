@@ -17,6 +17,9 @@ LABELED_NODE=0
 NODE_KEEPER=""
 STORAGE_CLASS=""
 STORAGE_CLASS_CREATED=0
+CONSOLE_FORWARD_PID=""
+
+source "$(dirname "$0")/lib/console-multi-owner.sh"
 
 require() {
   command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 1; }
@@ -26,11 +29,16 @@ diagnostics() {
   kubectl -n "$NAMESPACE" get rustqueue,pods,pvc,statefulset,deployment,daemonset -o wide || true
   kubectl -n "$NAMESPACE" describe rustqueue "$QUEUE" || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=operator --tail=300 || true
+  kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=console --tail=300 || true
   kubectl -n "$NAMESPACE" logs operational-ledger --tail=300 || true
 }
 
 cleanup() {
-  code=$?
+    code=$?
+    if [[ -n "$CONSOLE_FORWARD_PID" ]]; then
+      kill "$CONSOLE_FORWARD_PID" >/dev/null 2>&1 || true
+      wait "$CONSOLE_FORWARD_PID" 2>/dev/null || true
+    fi
   if [[ -n "$NODE_KEEPER" ]]; then
     kill "$NODE_KEEPER" >/dev/null 2>&1 || true
     wait "$NODE_KEEPER" 2>/dev/null || true
@@ -297,7 +305,7 @@ require jq
 if [[ "$BUILD_IMAGES" == "1" ]]; then
   BUILD_VERSION=0.7.0-e2e-a MAX_STORAGE_FEATURE_LEVEL=1 make image
   docker tag rustqueue:dev "$BROKER_IMAGE_A"
-  BUILD_VERSION=0.7.0-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image
+  BUILD_VERSION=0.7.0-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image-from-dist
   docker tag rustqueue:dev "$BROKER_IMAGE_B"
   [[ "$(docker image inspect "$BROKER_IMAGE_A" -f '{{.Id}}')" != \
      "$(docker image inspect "$BROKER_IMAGE_B" -f '{{.Id}}')" ]] || {
@@ -320,8 +328,10 @@ select_expandable_storage_class
 kubectl delete namespace "$NAMESPACE" --ignore-not-found --wait=false >/dev/null
 wait_namespace_deleted
 kubectl create namespace "$NAMESPACE" >/dev/null
-kubectl apply -f "$CHART/crds/rustqueue.io_rustqueues.yaml" >/dev/null
-kubectl wait --for=condition=Established crd/rustqueues.rustqueue.io --timeout=60s
+  kubectl apply -f "$CHART/crds" >/dev/null
+  kubectl wait --for=condition=Established crd/rustqueues.rustqueue.io --timeout=60s
+  kubectl wait --for=condition=Established crd/rustqueuetopics.rustqueue.io --timeout=60s
+  kubectl wait --for=condition=Established crd/rustqueuechannels.rustqueue.io --timeout=60s
 helm upgrade --install "$RELEASE" "$CHART" \
   --namespace "$NAMESPACE" \
   --set-string operator.image.repository="${OPERATOR_IMAGE%:*}" \
@@ -334,6 +344,7 @@ helm upgrade --install "$RELEASE" "$CHART" \
   --set-string queue.storageClassName="$STORAGE_CLASS" --set-string queue.storageSize=1Gi \
   --set queue.minFreeBytes=0 --set queue.protectiveEvictionEnabled=false \
   --set queue.bootstrapRetentionSeconds=1 \
+  --set console.management.enabled=true --set console.pollIntervalSeconds=5 \
   --wait --timeout 5m
 
 wait_queue_ready 1 300
@@ -360,6 +371,8 @@ kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p '{"spec":{"storageSize":"2Gi"}}' >/dev/null
 complete_orbstack_local_path_resize 2Gi
 wait_storage_ready 2Gi 240
+
+run_console_multi_owner_crash_acceptance
 
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p "{\"spec\":{\"maintenance\":{\"broker\":\"$QUEUE-2\",\"enabled\":true}}}" >/dev/null

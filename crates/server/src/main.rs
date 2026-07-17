@@ -65,13 +65,18 @@ async fn main() -> anyhow::Result<()> {
         ),
         max_ack_gap: config.queue.max_ack_gap,
         max_backlog_messages: config.queue.max_backlog_messages,
+        max_topics: config.queue.max_topics,
+        max_publish_workers: config.queue.max_publish_workers,
+        publish_worker_idle: std::time::Duration::from_secs(
+            config.queue.publish_worker_idle_seconds,
+        ),
         entry_cache_bytes: config.storage.entry_cache_bytes,
         payload_read_workers: config.storage.payload_read_workers,
         payload_read_queue: config.storage.payload_read_queue,
+        scrub_bytes_per_second: config.storage.scrub_bytes_per_second,
         storage_feature_level: config.storage.feature_level,
+        require_management_fence_sync: config.security.console_management_enabled,
     })?);
-    broker.scrub().await.context("startup data scrub")?;
-
     let config = Arc::new(config);
     let metrics = Arc::new(Metrics::default());
     let accepting = Arc::new(AtomicBool::new(true));
@@ -156,9 +161,9 @@ async fn monitor_storage_health(broker: Arc<Broker>) -> anyhow::Result<()> {
 
 async fn run_scrubber(broker: Arc<Broker>, interval: std::time::Duration) -> anyhow::Result<()> {
     loop {
-        tokio::time::sleep(interval).await;
         let records = broker.scrub().await.context("background queue scrub")?;
         tracing::info!(records, "background data scrub completed");
+        tokio::time::sleep(interval).await;
     }
 }
 

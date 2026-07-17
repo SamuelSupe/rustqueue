@@ -17,6 +17,14 @@ impl Config {
             "RUSTQUEUE_BROADCAST_ADDRESS",
             &mut self.node.broadcast_address,
         );
+        set_from_env(
+            "RUSTQUEUE_DETAILED_QUEUE_METRICS",
+            &mut self.metrics.detailed_queue_metrics,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_MAX_DETAILED_METRIC_SERIES",
+            &mut self.metrics.max_detailed_series,
+        )?;
         set_from_env("RUSTQUEUE_TCP_ADDRESS", &mut self.network.tcp_address)?;
         set_from_env("RUSTQUEUE_HTTP_ADDRESS", &mut self.network.http_address)?;
         if let Ok(value) = env::var("RUSTQUEUE_DATA_PATH") {
@@ -27,12 +35,25 @@ impl Config {
             &mut self.storage.feature_level,
         )?;
         set_from_env(
+            "RUSTQUEUE_SCRUB_BYTES_PER_SECOND",
+            &mut self.storage.scrub_bytes_per_second,
+        )?;
+        set_from_env(
             "RUSTQUEUE_MAX_MESSAGE_BYTES",
             &mut self.queue.max_message_bytes,
         )?;
         set_from_env(
             "RUSTQUEUE_BOOTSTRAP_RETENTION_SECONDS",
             &mut self.queue.bootstrap_retention_seconds,
+        )?;
+        set_from_env("RUSTQUEUE_MAX_TOPICS", &mut self.queue.max_topics)?;
+        set_from_env(
+            "RUSTQUEUE_MAX_PUBLISH_WORKERS",
+            &mut self.queue.max_publish_workers,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_PUBLISH_WORKER_IDLE_SECONDS",
+            &mut self.queue.publish_worker_idle_seconds,
         )?;
         set_from_env("RUSTQUEUE_MAX_BODY_BYTES", &mut self.limits.max_body_bytes)?;
         set_from_env(

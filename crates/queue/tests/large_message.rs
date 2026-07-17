@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use rustqueue_queue::{Broker, BrokerConfig};
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ async fn persists_and_delivers_a_twenty_mebibyte_message() {
     broker.create_topic("large").await.unwrap();
     broker.create_channel("large", "workers").await.unwrap();
 
-    let body = vec![0x5a; 20 * 1024 * 1024];
+    let body = Bytes::from(vec![0x5a; 20 * 1024 * 1024]);
     broker
         .publish("large", vec![body.clone()], Duration::ZERO)
         .await
@@ -23,5 +24,5 @@ async fn persists_and_delivers_a_twenty_mebibyte_message() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(delivery.body.as_ref(), body);
+    assert_eq!(delivery.body.as_ref(), body.as_ref());
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::eviction::{self, ProtectiveEviction};
 use crate::model::TopicStats;
+use rustqueue_storage::ScrubTarget;
 use std::collections::BTreeSet;
 
 impl Topic {
@@ -33,6 +34,7 @@ impl Topic {
 
     pub fn stats(&self) -> TopicStats {
         let last = self.last_position();
+        let (segment_count, segment_bytes) = self.log.storage_usage();
         let mut channels: Vec<_> = self
             .channels
             .values()
@@ -43,6 +45,8 @@ impl Topic {
             name: self.name.clone(),
             paused: self.manifest.paused,
             message_count: self.messages.len() as u64,
+            segment_count,
+            segment_bytes,
             channels,
         }
     }
@@ -59,7 +63,7 @@ impl Topic {
         if self.messages.is_empty() {
             return Ok(None);
         }
-        self.log.seal()?;
+        self.seal_log()?;
         let Some((segment, through_index)) = self
             .log
             .oldest_inactive_boundary_retaining(retained_paths)?
@@ -115,10 +119,12 @@ impl Topic {
     ) -> Result<usize, BrokerError> {
         let cutoff =
             now_ns().saturating_sub(bootstrap_retention.as_nanos().min(i64::MAX as u128) as i64);
+        let bootstrap_index = self
+            .messages
+            .partition_point(|message| message.timestamp_ns < cutoff);
         let bootstrap_from = self
             .messages
-            .iter()
-            .find(|message| message.timestamp_ns >= cutoff)
+            .get(bootstrap_index)
             .map_or(self.manifest.next_position, |message| message.position);
         let channel_from = self
             .channels
@@ -133,11 +139,15 @@ impl Topic {
             .filter_map(|channel| channel.state.first_in_flight_position())
             .min()
             .unwrap_or(self.manifest.next_position);
-        let outbox_from = self
-            .messages
+        let outbox_from = retained_message_ids
             .iter()
-            .filter(|message| retained_message_ids.contains(&message.id))
-            .map(|message| message.position)
+            .filter_map(|id| {
+                let index = self.messages.partition_point(|message| message.id < *id);
+                self.messages
+                    .get(index)
+                    .filter(|message| message.id == *id)
+                    .map(|message| message.position)
+            })
             .min()
             .unwrap_or(self.manifest.next_position);
         let retain_from = bootstrap_from
@@ -145,16 +155,13 @@ impl Topic {
             .min(in_flight_from)
             .min(outbox_from);
         let through_index = self
-            .messages
-            .iter()
-            .take_while(|message| message.position < retain_from)
-            .last()
+            .message_before(retain_from)
             .map(|message| message.log_index);
         let Some(through_index) = through_index else {
             return Ok(0);
         };
         store_atomic(&self.manifest_path, &self.manifest)?;
-        self.log.seal()?;
+        self.seal_log()?;
         let removed = self
             .log
             .purge_prefix_retaining(through_index, retained_paths)?;
@@ -164,8 +171,8 @@ impl Topic {
         Ok(removed)
     }
 
-    pub fn scrub(&self) -> Result<usize, BrokerError> {
-        Ok(self.log.scrub()?)
+    pub fn scrub_targets(&self) -> Result<Vec<ScrubTarget>, BrokerError> {
+        Ok(self.log.scrub_targets(false)?)
     }
 
     pub fn sync(&self) -> Result<(), BrokerError> {
@@ -199,5 +206,17 @@ impl Topic {
             self.messages.pop_front();
         }
         Ok(())
+    }
+
+    fn message_before(&self, position: u64) -> Option<&crate::model::MessageMeta> {
+        let first = self.messages.front()?.position;
+        if position <= first {
+            return None;
+        }
+        let wanted = position
+            .saturating_sub(1)
+            .min(self.messages.back()?.position);
+        let offset = usize::try_from(wanted.saturating_sub(first)).ok()?;
+        self.messages.get(offset)
     }
 }

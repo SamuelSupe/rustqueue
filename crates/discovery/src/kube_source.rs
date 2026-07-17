@@ -1,4 +1,4 @@
-use crate::{BrokerEndpoint, BrokerRegistry, Directory};
+use crate::{BrokerEndpoint, BrokerRegistry, BrokerRegistryHead, Directory};
 use anyhow::Context;
 use futures::stream::{FuturesUnordered, StreamExt};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -97,11 +97,31 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
         let token = config.registry_token.clone();
         let permits = Arc::clone(&permits);
         let metrics = directory.metrics().clone();
+        let directory = directory.clone();
         polls.push(async move {
             let _permit = permits.acquire_owned().await.ok()?;
             let _timer = metrics.registry_poll.timer();
+            let mut request = http.get(endpoint.registry_head_url());
+            if let Some(token) = token.as_deref() {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.ok()?;
+            let needs_registry = if response.status() == reqwest::StatusCode::NOT_FOUND {
+                true
+            } else {
+                let head = response
+                    .error_for_status()
+                    .ok()?
+                    .json::<BrokerRegistryHead>()
+                    .await
+                    .ok()?;
+                directory.observe_head(&endpoint, &head)
+            };
+            if !needs_registry {
+                return Some((endpoint, None));
+            }
             let mut request = http.get(endpoint.registry_url());
-            if let Some(token) = token {
+            if let Some(token) = token.as_deref() {
                 request = request.bearer_auth(token);
             }
             let registry = request
@@ -113,11 +133,11 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
                 .json::<BrokerRegistry>()
                 .await
                 .ok()?;
-            Some((endpoint, registry))
+            Some((endpoint, Some(registry)))
         });
     }
     while let Some(observation) = polls.next().await {
-        if let Some((endpoint, registry)) = observation {
+        if let Some((endpoint, Some(registry))) = observation {
             directory.observe(endpoint, registry);
         }
     }

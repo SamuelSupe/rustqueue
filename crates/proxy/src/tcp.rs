@@ -19,17 +19,18 @@ pub async fn serve(
             tracing::debug!(%peer, "rejecting producer because proxy connection limit is reached");
             continue;
         };
-        let Some(backend) = pool.shuffled(1).pop() else {
+        let Some(backend) = pool.lease() else {
             tracing::debug!(%peer, "rejecting producer because no broker is ready");
             continue;
         };
         let metrics = metrics.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _backend_lease = backend;
             let connect_timer = metrics.backend.timer();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                tokio::net::TcpStream::connect(backend.tcp_address()),
+                tokio::net::TcpStream::connect(_backend_lease.tcp_address()),
             )
             .await
             {
@@ -45,11 +46,11 @@ pub async fn serve(
                 }
                 Ok(Err(error)) => {
                     drop(connect_timer);
-                    tracing::debug!(%peer, %error, node_id = backend.node_id, "broker connect failed")
+                    tracing::debug!(%peer, %error, node_id = _backend_lease.node_id, "broker connect failed")
                 }
                 Err(_) => {
                     drop(connect_timer);
-                    tracing::debug!(%peer, node_id = backend.node_id, "broker connect timed out")
+                    tracing::debug!(%peer, node_id = _backend_lease.node_id, "broker connect timed out")
                 }
             }
         });

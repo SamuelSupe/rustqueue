@@ -83,8 +83,8 @@ async fn sigkill_publish_boundaries_preserve_the_acknowledged_ledger() {
 #[tokio::test]
 async fn sigkill_channel_wal_boundaries_are_at_least_once() {
     for (failpoint, must_be_finished) in [
-        ("channel_after_wal_append_before_fsync", false),
-        ("channel_after_wal_fsync_before_return", true),
+        ("channel_group_after_append_before_fsync", false),
+        ("channel_group_after_fsync_before_reply", true),
     ] {
         let root = tempfile::tempdir().unwrap();
         publish_fixture(root.path()).await;

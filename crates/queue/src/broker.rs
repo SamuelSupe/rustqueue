@@ -1,10 +1,16 @@
+#[path = "broker/channel_commit.rs"]
+mod channel_commit;
 #[path = "broker/group_commit.rs"]
 mod group_commit;
 #[path = "broker/io.rs"]
 mod io;
 #[path = "broker/maintenance.rs"]
 mod maintenance;
+#[path = "broker/management.rs"]
+mod management;
 
+use crate::management::FenceCatalog;
+use crate::management_ops::OperationCatalog;
 use crate::metadata::{
     load_optional, load_topic_manifest, store_atomic, topic_directory, BrokerMeta,
 };
@@ -35,10 +41,15 @@ pub struct BrokerConfig {
     pub bootstrap_retention: Duration,
     pub max_ack_gap: usize,
     pub max_backlog_messages: usize,
+    pub max_topics: usize,
+    pub max_publish_workers: usize,
+    pub publish_worker_idle: Duration,
     pub entry_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
+    pub scrub_bytes_per_second: u64,
     pub storage_feature_level: u32,
+    pub require_management_fence_sync: bool,
 }
 
 impl Default for BrokerConfig {
@@ -52,10 +63,15 @@ impl Default for BrokerConfig {
             bootstrap_retention: Duration::from_secs(30),
             max_ack_gap: 65_536,
             max_backlog_messages: 10_000_000,
+            max_topics: 10_000,
+            max_publish_workers: 1_024,
+            publish_worker_idle: Duration::from_secs(60),
             entry_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
+            scrub_bytes_per_second: 64 * 1024 * 1024,
             storage_feature_level: BASE_STORAGE_FEATURE_LEVEL,
+            require_management_fence_sync: false,
         }
     }
 }
@@ -70,8 +86,18 @@ pub enum BrokerError {
     TopicNotFound,
     #[error("topic deletion is still draining in-process readers")]
     TopicRetiring,
+    #[error("topic is protected by an active deletion tombstone")]
+    TopicTombstoned,
     #[error("channel does not exist")]
     ChannelNotFound,
+    #[error("channel is protected by an active deletion tombstone")]
+    ChannelTombstoned,
+    #[error("management fence catalog has not been synchronized")]
+    ManagementUnavailable,
+    #[error("registry revision conflict: expected {expected}, actual {actual}")]
+    RevisionConflict { expected: u64, actual: u64 },
+    #[error("management operation conflicts with an existing operation ID")]
+    OperationConflict,
     #[error("message does not exist")]
     MessageNotFound,
     #[error("message is not in flight")]
@@ -82,6 +108,12 @@ pub enum BrokerError {
     BatchTooLarge,
     #[error("topic backlog limit reached")]
     BacklogLimit,
+    #[error("broker topic limit reached")]
+    TopicLimit,
+    #[error("active topic publish worker limit reached")]
+    PublishWorkerLimit,
+    #[error("active topic channel commit worker limit reached")]
+    ChannelWorkerLimit,
     #[error("message ID sequence exhausted")]
     SequenceExhausted,
     #[error("local storage is isolated after an earlier failure; restart is required")]
@@ -109,9 +141,15 @@ struct BrokerInner {
     topics: RwLock<HashMap<String, Arc<TopicHandle>>>,
     retired_topics: Mutex<HashMap<String, Arc<TopicHandle>>>,
     payload_reader: Arc<PayloadReader>,
+    fences_path: PathBuf,
+    fences: Mutex<FenceCatalog>,
+    management_ops_path: PathBuf,
+    management_ops: Mutex<OperationCatalog>,
+    management_fences_ready: AtomicBool,
     registry_revision: AtomicU64,
     storage_healthy: AtomicBool,
     publish_groups: group_commit::PublishGroups,
+    channel_groups: channel_commit::ChannelGroups,
     metrics: QueueMetrics,
     compatibility: CompatibilityState,
 }
@@ -126,6 +164,14 @@ impl Broker {
         if config.node_id == 0 || config.node_id > u16::MAX as u64 {
             return Err(BrokerError::InvalidRecord(
                 "node ID must fit 16 bits".into(),
+            ));
+        }
+        if config.max_topics == 0
+            || config.max_publish_workers == 0
+            || config.publish_worker_idle.is_zero()
+        {
+            return Err(BrokerError::InvalidRecord(
+                "topic and publish worker limits must be greater than zero".into(),
             ));
         }
         ensure_data_format(&config.data_path)
@@ -156,6 +202,9 @@ impl Broker {
             }
         };
         let metrics = QueueMetrics::default();
+        let (fences_path, fences) = FenceCatalog::load(&config.data_path)?;
+        let (management_ops_path, management_ops) = OperationCatalog::load(&config.data_path)?;
+        let require_fence_sync = config.require_management_fence_sync;
         let payload_reader = PayloadReader::new(
             config.entry_cache_bytes,
             config.payload_read_workers,
@@ -184,8 +233,23 @@ impl Broker {
             let name = handle.state.lock().name.clone();
             topics.insert(name, handle);
         }
+        if topics.len() > config.max_topics {
+            return Err(BrokerError::InvalidRecord(format!(
+                "stored topic count {} exceeds configured maximum {}",
+                topics.len(),
+                config.max_topics
+            )));
+        }
         let revision = meta.registry_revision;
         let next_sequence = meta.next_sequence;
+        let publish_groups = group_commit::PublishGroups::new(
+            config.max_publish_workers,
+            config.publish_worker_idle,
+        );
+        let channel_groups = channel_commit::ChannelGroups::new(
+            config.max_publish_workers,
+            config.publish_worker_idle,
+        );
         let broker = Self {
             inner: Arc::new(BrokerInner {
                 config,
@@ -200,14 +264,26 @@ impl Broker {
                 topics: RwLock::new(topics),
                 retired_topics: Mutex::new(HashMap::new()),
                 payload_reader,
+                fences_path,
+                fences: Mutex::new(fences),
+                management_ops_path,
+                management_ops: Mutex::new(management_ops),
+                management_fences_ready: AtomicBool::new(true),
                 registry_revision: AtomicU64::new(revision),
                 storage_healthy: AtomicBool::new(true),
-                publish_groups: group_commit::PublishGroups::default(),
+                publish_groups,
+                channel_groups,
                 metrics,
                 compatibility,
             }),
         };
         broker.recover_outbox()?;
+        if require_fence_sync {
+            broker
+                .inner
+                .management_fences_ready
+                .store(false, Ordering::Release);
+        }
         Ok(broker)
     }
 
@@ -224,32 +300,12 @@ impl Broker {
 
     pub async fn delete_topic(&self, name: &str) -> Result<(), BrokerError> {
         validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
+        self.ensure_management_access(name, None)?;
         let broker = self.clone();
         let name = name.to_owned();
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
-            let handle = broker
-                .inner
-                .topics
-                .read()
-                .get(&name)
-                .cloned()
-                .ok_or(BrokerError::TopicNotFound)?;
-            handle.state.lock().mark_deleted()?;
-            broker.inner.topics.write().remove(&name);
-            let directory = topic_directory(&broker.inner.config.data_path, &name);
-            if Arc::strong_count(&handle) == 1
-                && !broker.inner.payload_reader.has_active_under(&directory)
-            {
-                std::fs::remove_dir_all(directory)?;
-                std::fs::File::open(&broker.inner.topics_root)?.sync_all()?;
-            } else {
-                broker
-                    .inner
-                    .retired_topics
-                    .lock()
-                    .insert(name.clone(), handle);
-            }
+            broker.delete_topic_locked(&name)?;
             broker.bump_registry()?;
             Ok(())
         })
@@ -258,6 +314,7 @@ impl Broker {
 
     pub async fn create_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
         validate_channel(channel)?;
+        self.ensure_management_access(topic, Some(channel))?;
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
@@ -277,6 +334,7 @@ impl Broker {
     }
 
     pub async fn delete_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        self.ensure_management_access(topic, Some(channel))?;
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
@@ -293,6 +351,7 @@ impl Broker {
     }
 
     pub async fn set_topic_paused(&self, topic: &str, paused: bool) -> Result<(), BrokerError> {
+        self.ensure_management_access(topic, None)?;
         let broker = self.clone();
         let topic = topic.to_owned();
         self.storage_task(move || broker.topic(&topic)?.state.lock().set_paused(paused))
@@ -305,6 +364,7 @@ impl Broker {
         channel: &str,
         paused: bool,
     ) -> Result<(), BrokerError> {
+        self.ensure_management_access(topic, Some(channel))?;
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
@@ -319,6 +379,7 @@ impl Broker {
     }
 
     pub async fn empty_topic(&self, topic: &str) -> Result<(), BrokerError> {
+        self.ensure_management_access(topic, None)?;
         let broker = self.clone();
         let topic = topic.to_owned();
         self.storage_task(move || broker.topic(&topic)?.state.lock().empty_topic())
@@ -326,6 +387,7 @@ impl Broker {
     }
 
     pub async fn empty_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        self.ensure_management_access(topic, Some(channel))?;
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
@@ -354,6 +416,7 @@ impl Broker {
         topics.sort_by(|left, right| left.name.cmp(&right.name));
         BrokerStats {
             publish_group_commit: self.inner.publish_groups.stats(),
+            channel_group_commit: self.inner.channel_groups.stats(),
             latency: self.inner.metrics.snapshot(),
             topics,
         }
@@ -401,14 +464,22 @@ impl Broker {
 
     fn get_or_create_topic(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
         validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
+        self.ensure_management_access(name, None)?;
         if let Some(topic) = self.inner.topics.read().get(name).cloned() {
             return Ok(topic);
         }
         let _lifecycle = self.inner.topic_lifecycle.lock();
+        self.get_or_create_topic_locked(name)
+    }
+
+    fn get_or_create_topic_locked(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
         self.cleanup_retired_topic(name)?;
         let mut topics = self.inner.topics.write();
         if let Some(topic) = topics.get(name).cloned() {
             return Ok(topic);
+        }
+        if topics.len() >= self.inner.config.max_topics {
+            return Err(BrokerError::TopicLimit);
         }
         let directory = topic_directory(&self.inner.config.data_path, name);
         let topic = TopicHandle::create(
@@ -444,6 +515,27 @@ impl Broker {
         }
         std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
         Ok(())
+    }
+
+    fn delete_topic_locked(&self, name: &str) -> Result<bool, BrokerError> {
+        let Some(handle) = self.inner.topics.read().get(name).cloned() else {
+            return Ok(false);
+        };
+        handle.state.lock().mark_deleted()?;
+        self.inner.topics.write().remove(name);
+        let directory = topic_directory(&self.inner.config.data_path, name);
+        if Arc::strong_count(&handle) == 1
+            && !self.inner.payload_reader.has_active_under(&directory)
+        {
+            std::fs::remove_dir_all(directory)?;
+            std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
+        } else {
+            self.inner
+                .retired_topics
+                .lock()
+                .insert(name.to_owned(), handle);
+        }
+        Ok(true)
     }
 
     fn topic(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {

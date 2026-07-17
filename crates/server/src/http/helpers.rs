@@ -61,6 +61,7 @@ pub(super) async fn read_publish_body(
     state: &AppState,
     request: Request<Body>,
     maximum: usize,
+    shape: crate::admission::PublishShape,
 ) -> Result<(Bytes, crate::admission::PublishReservation), ApiError> {
     let declared = request
         .headers()
@@ -81,7 +82,7 @@ pub(super) async fn read_publish_body(
     }
     let reservation = state
         .publish_admission
-        .try_reserve(declared.unwrap_or(maximum))
+        .try_reserve_publish(declared.unwrap_or(maximum), shape)
         .ok_or_else(|| ApiError::throttled("publish byte budget is exhausted; retry later"))?;
     let body = axum::body::to_bytes(request.into_body(), maximum)
         .await
@@ -142,6 +143,38 @@ pub(super) fn authorize(
         .or(alternate)
         .is_some_and(|provided| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
     {
+        return Ok(());
+    }
+    Err(ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "E_UNAUTHORIZED",
+        detail: format!("{scope} authorization required"),
+    })
+}
+
+pub(super) fn authorize_any(
+    headers: &HeaderMap,
+    expected: &[Option<&str>],
+    scope: &'static str,
+) -> Result<(), ApiError> {
+    let expected: Vec<_> = expected.iter().flatten().copied().collect();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get("x-rustqueue-token")
+                .and_then(|value| value.to_str().ok())
+        });
+    if provided.is_some_and(|provided| {
+        expected
+            .iter()
+            .any(|expected| constant_time_eq(provided.as_bytes(), expected.as_bytes()))
+    }) {
         return Ok(());
     }
     Err(ApiError {

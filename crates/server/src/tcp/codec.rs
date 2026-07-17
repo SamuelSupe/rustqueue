@@ -143,9 +143,14 @@ where
         command,
         Command::Publish { .. } | Command::MultiPublish { .. } | Command::DeferredPublish { .. }
     ) {
+        let shape = if matches!(command, Command::MultiPublish { .. }) {
+            crate::admission::PublishShape::Multi
+        } else {
+            crate::admission::PublishShape::Single
+        };
         Some(
             admission
-                .try_reserve_connection(length, connection_budget)
+                .try_reserve_connection_publish(length, shape, connection_budget)
                 .ok_or_else(|| {
                     CommandReadError::protocol(
                         "E_THROTTLED",

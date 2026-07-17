@@ -5,4 +5,5 @@ fuzz/artifacts
 data
 certs
 benchmarks/results
+console-ui/node_modules
 .DS_Store

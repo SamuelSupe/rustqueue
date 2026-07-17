@@ -36,6 +36,11 @@ queue:
   bootstrapRetentionSeconds: 30
   maxMessageBytes: 20971520
   maxBacklogMessages: 10000000
+  maxTopics: 10000
+  maxPublishWorkers: 1024
+  publishWorkerIdleSeconds: 60
+  detailedQueueMetrics: false
+  maxDetailedMetricSeries: 1000
   registrySecretName: ""
   clientTlsSecretName: ""
   discoveryReplicas: 2
@@ -56,6 +61,20 @@ queue:
     memoryRequest: 256Mi
     cpuLimit: ""
     memoryLimit: ""
+
+console:
+  enabled: true
+  image: ""
+  imagePullPolicy: ""
+  pollIntervalSeconds: 2
+  historyMinutes: 15
+  management:
+    enabled: false
+    unlockSeconds: 1800
+    tombstoneSeconds: 600
+  resources:
+    requests: {cpu: 50m, memory: 96Mi}
+    limits: {cpu: 500m, memory: 256Mi}
 
 monitoring:
   serviceMonitor:

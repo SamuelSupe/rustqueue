@@ -16,21 +16,20 @@ const COALESCE_DELAY: Duration = Duration::from_millis(1);
 type PublishResult = Result<Vec<u64>, BrokerError>;
 
 pub(super) struct PublishGroups {
-    senders: Mutex<HashMap<String, mpsc::Sender<PublishRequest>>>,
+    senders: Mutex<HashMap<String, WorkerEntry>>,
+    max_workers: usize,
+    idle_timeout: Duration,
+    next_worker_id: AtomicU64,
     commits: AtomicU64,
     requests: AtomicU64,
     max_batch_requests: AtomicU64,
+    retired_workers: AtomicU64,
+    rejected_workers: AtomicU64,
 }
 
-impl Default for PublishGroups {
-    fn default() -> Self {
-        Self {
-            senders: Mutex::new(HashMap::new()),
-            commits: AtomicU64::new(0),
-            requests: AtomicU64::new(0),
-            max_batch_requests: AtomicU64::new(0),
-        }
-    }
+struct WorkerEntry {
+    id: u64,
+    sender: mpsc::Sender<PublishRequest>,
 }
 
 struct PublishRequest {
@@ -47,19 +46,63 @@ struct PendingPublish {
 }
 
 impl PublishGroups {
-    fn sender(&self, broker: &Broker, topic: &str) -> mpsc::Sender<PublishRequest> {
+    pub(super) fn new(max_workers: usize, idle_timeout: Duration) -> Self {
+        Self {
+            senders: Mutex::new(HashMap::new()),
+            max_workers,
+            idle_timeout,
+            next_worker_id: AtomicU64::new(1),
+            commits: AtomicU64::new(0),
+            requests: AtomicU64::new(0),
+            max_batch_requests: AtomicU64::new(0),
+            retired_workers: AtomicU64::new(0),
+            rejected_workers: AtomicU64::new(0),
+        }
+    }
+
+    fn sender(
+        &self,
+        broker: &Broker,
+        topic: &str,
+    ) -> Result<mpsc::Sender<PublishRequest>, BrokerError> {
         let mut senders = self.senders.lock();
-        if let Some(sender) = senders.get(topic).filter(|sender| !sender.is_closed()) {
-            return sender.clone();
+        senders.retain(|_, entry| !entry.sender.is_closed());
+        if let Some(entry) = senders.get(topic) {
+            return Ok(entry.sender.clone());
+        }
+        if senders.len() >= self.max_workers {
+            self.rejected_workers.fetch_add(1, Ordering::Relaxed);
+            return Err(BrokerError::PublishWorkerLimit);
         }
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
-        senders.insert(topic.to_owned(), sender.clone());
+        let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
+        senders.insert(
+            topic.to_owned(),
+            WorkerEntry {
+                id: worker_id,
+                sender: sender.clone(),
+            },
+        );
         tokio::spawn(run_worker(
             Arc::downgrade(&broker.inner),
             topic.to_owned(),
+            worker_id,
+            self.idle_timeout,
             receiver,
         ));
-        sender
+        Ok(sender)
+    }
+
+    fn retire_idle(&self, topic: &str, worker_id: u64) -> bool {
+        let mut senders = self.senders.lock();
+        let removable = senders
+            .get(topic)
+            .is_some_and(|entry| entry.id == worker_id && entry.sender.strong_count() == 1);
+        if removable {
+            senders.remove(topic);
+            self.retired_workers.fetch_add(1, Ordering::Relaxed);
+        }
+        removable
     }
 
     fn record(&self, requests: usize) {
@@ -70,10 +113,18 @@ impl PublishGroups {
     }
 
     pub(super) fn stats(&self) -> PublishGroupCommitStats {
+        let active_workers = {
+            let mut senders = self.senders.lock();
+            senders.retain(|_, entry| !entry.sender.is_closed());
+            senders.len() as u64
+        };
         PublishGroupCommitStats {
             commits: self.commits.load(Ordering::Relaxed),
             requests: self.requests.load(Ordering::Relaxed),
             max_batch_requests: self.max_batch_requests.load(Ordering::Relaxed),
+            active_workers,
+            retired_workers: self.retired_workers.load(Ordering::Relaxed),
+            rejected_workers: self.rejected_workers.load(Ordering::Relaxed),
         }
     }
 }
@@ -92,7 +143,7 @@ impl Broker {
         self.ensure_storage_healthy()?;
         let bodies: Vec<Bytes> = bodies.into_iter().map(Into::into).collect();
         let encoded_bytes = self.validate_publish_request(topic, &bodies)?;
-        let sender = self.inner.publish_groups.sender(self, topic);
+        let sender = self.inner.publish_groups.sender(self, topic)?;
         let (reply, result) = oneshot::channel();
         sender
             .send(PublishRequest {
@@ -128,6 +179,10 @@ impl Broker {
             }
         };
         let mut topic_state = handle.state.lock();
+        if let Err(error) = self.ensure_management_access(topic, None) {
+            fail_requests(requests, &error);
+            return;
+        }
         let mut pending = Vec::with_capacity(requests.len());
         let mut requests = requests.into_iter();
 
@@ -186,15 +241,26 @@ impl Broker {
 async fn run_worker(
     broker: Weak<BrokerInner>,
     topic: String,
+    worker_id: u64,
+    idle_timeout: Duration,
     mut receiver: mpsc::Receiver<PublishRequest>,
 ) {
     let mut carry = None;
     loop {
         let first = match carry.take() {
             Some(request) => request,
-            None => match receiver.recv().await {
-                Some(request) => request,
-                None => return,
+            None => match tokio::time::timeout(idle_timeout, receiver.recv()).await {
+                Ok(Some(request)) => request,
+                Ok(None) => return,
+                Err(_) => {
+                    let Some(inner) = broker.upgrade() else {
+                        return;
+                    };
+                    if inner.publish_groups.retire_idle(&topic, worker_id) {
+                        return;
+                    }
+                    continue;
+                }
             },
         };
         let (requests, next) = collect_group(first, &mut receiver).await;
@@ -262,25 +328,36 @@ fn fail_requests(requests: impl IntoIterator<Item = PublishRequest>, error: &Bro
     }
 }
 
-fn is_storage_error(error: &BrokerError) -> bool {
+pub(super) fn is_storage_error(error: &BrokerError) -> bool {
     matches!(
         error,
         BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_)
     )
 }
 
-fn copy_error(error: &BrokerError) -> BrokerError {
+pub(super) fn copy_error(error: &BrokerError) -> BrokerError {
     match error {
         BrokerError::InvalidTopic => BrokerError::InvalidTopic,
         BrokerError::InvalidChannel => BrokerError::InvalidChannel,
         BrokerError::TopicNotFound => BrokerError::TopicNotFound,
         BrokerError::TopicRetiring => BrokerError::TopicRetiring,
+        BrokerError::TopicTombstoned => BrokerError::TopicTombstoned,
         BrokerError::ChannelNotFound => BrokerError::ChannelNotFound,
+        BrokerError::ChannelTombstoned => BrokerError::ChannelTombstoned,
+        BrokerError::ManagementUnavailable => BrokerError::ManagementUnavailable,
+        BrokerError::RevisionConflict { expected, actual } => BrokerError::RevisionConflict {
+            expected: *expected,
+            actual: *actual,
+        },
+        BrokerError::OperationConflict => BrokerError::OperationConflict,
         BrokerError::MessageNotFound => BrokerError::MessageNotFound,
         BrokerError::MessageNotInFlight => BrokerError::MessageNotInFlight,
         BrokerError::MessageTooLarge => BrokerError::MessageTooLarge,
         BrokerError::BatchTooLarge => BrokerError::BatchTooLarge,
         BrokerError::BacklogLimit => BrokerError::BacklogLimit,
+        BrokerError::TopicLimit => BrokerError::TopicLimit,
+        BrokerError::PublishWorkerLimit => BrokerError::PublishWorkerLimit,
+        BrokerError::ChannelWorkerLimit => BrokerError::ChannelWorkerLimit,
         BrokerError::SequenceExhausted => BrokerError::SequenceExhausted,
         BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {
             BrokerError::StorageUnavailable

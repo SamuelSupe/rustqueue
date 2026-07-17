@@ -325,7 +325,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
 
 fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
     let mut output = format!(
-        "[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_backlog_messages = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\n# secret: {secret_name}\n",
+        "[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_backlog_messages = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\nconsole_management_enabled = {}\n# secret: {secret_name}\n",
         cluster.spec.storage_feature_level,
         cluster.spec.min_free_bytes,
         cluster.spec.disk_high_watermark_percent,
@@ -335,6 +335,12 @@ fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
         cluster.spec.bootstrap_retention_seconds,
         cluster.spec.max_message_bytes,
         cluster.spec.max_backlog_messages,
+        cluster.spec.max_topics,
+        cluster.spec.max_publish_workers,
+        cluster.spec.publish_worker_idle_seconds,
+        cluster.spec.detailed_queue_metrics,
+        cluster.spec.max_detailed_metric_series,
+        cluster.spec.console_management_enabled,
     );
     if cluster.spec.client_tls_secret_name.is_some() {
         output.push_str("\n[security.tls]\ncertificate_file = \"/run/tls/rustqueue/tls.crt\"\nprivate_key_file = \"/run/tls/rustqueue/tls.key\"\nclient_ca_file = \"/run/tls/rustqueue/ca.crt\"\nrequire_client_certificate = false\nrequired = false\n");
@@ -426,7 +432,13 @@ mod tests {
                 bootstrap_retention_seconds: 30,
                 max_message_bytes: 20 * 1024 * 1024,
                 max_backlog_messages: 10_000_000,
+                max_topics: 10_000,
+                max_publish_workers: 1_024,
+                publish_worker_idle_seconds: 60,
+                detailed_queue_metrics: false,
+                max_detailed_metric_series: 1_000,
                 registry_secret_name: None,
+                console_management_enabled: false,
                 client_tls_secret_name: None,
                 proxy_node_selector: BTreeMap::new(),
                 discovery_replicas: 2,
@@ -450,6 +462,16 @@ mod tests {
             mounted_secret_revision: "1",
         })
         .unwrap();
+        assert!(resources
+            .config
+            .data
+            .as_ref()
+            .and_then(|data| data.get("rustqueue.toml"))
+            .is_some_and(|config| {
+                config.contains("console_token_file")
+                    && config.contains("detailed_queue_metrics = false")
+                    && config.contains("max_detailed_series = 1000")
+            }));
         let spec = resources.brokers.spec.unwrap();
         assert_eq!(spec.replicas, Some(3));
         assert_eq!(spec.service_name.as_deref(), Some("queue-brokers"));

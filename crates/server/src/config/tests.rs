@@ -27,3 +27,20 @@ fn rejects_limits_above_the_stable_wire_contract() {
     config.limits.connection_publish_inflight_bytes = config.limits.max_body_bytes;
     assert!(config.validate().is_err());
 }
+
+#[test]
+fn rejects_unbounded_topic_worker_configuration() {
+    let mut config = Config::default();
+    config.queue.max_publish_workers = 0;
+    assert!(config.validate().is_err());
+    config.queue.max_publish_workers = 1;
+    config.queue.max_topics = 0;
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn rejects_an_unbounded_detailed_metric_configuration() {
+    let mut config = Config::default();
+    config.metrics.max_detailed_series = 0;
+    assert!(config.validate().is_err());
+}

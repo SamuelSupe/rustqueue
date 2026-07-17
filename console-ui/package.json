@@ -1,0 +1,33 @@
+{
+  "name": "rustqueue-console-ui",
+  "private": true,
+  "version": "0.7.0",
+  "packageManager": "pnpm@11.9.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "build": "pnpm typecheck && vite build",
+    "check": "pnpm typecheck && vitest run"
+  },
+  "dependencies": {
+    "@carbon/charts": "1.27.16",
+    "@carbon/charts-react": "1.27.16",
+    "@carbon/icons-react": "11.84.0",
+    "@carbon/react": "1.112.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "6.0.3",
+    "jsdom": "29.1.1",
+    "sass": "1.101.0",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "vitest": "4.1.8"
+  }
+}

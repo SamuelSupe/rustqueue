@@ -1,6 +1,6 @@
 use super::*;
 use crate::RecordKind;
-use std::io::{Seek, SeekFrom};
+use std::io::{Seek, SeekFrom, Write};
 use tempfile::tempdir;
 
 fn record(index: u64, payload: &[u8]) -> Record {
@@ -27,6 +27,92 @@ fn appends_rotates_and_recovers() {
     let log = SegmentLog::open(directory.path(), 100).unwrap();
     assert_eq!(log.last_index(), Some(2));
     assert_eq!(log.read(2).unwrap().unwrap().payload, vec![2; 20]);
+}
+
+#[test]
+fn multipart_append_preserves_the_record_wire_format() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 4096).unwrap();
+    let header = RecordHeader {
+        kind: RecordKind::PublishBatch,
+        flags: 0,
+        index: 1,
+        timestamp_ns: 7,
+        message_id: 9,
+        available_at_ms: 11,
+    };
+    let location = log
+        .append_parts_at_with_location(header, &[b"one", b"two"], true)
+        .unwrap();
+    let record = log.read_location(&location).unwrap();
+    assert_eq!(record.payload, b"onetwo");
+    assert_eq!(record.timestamp_ns, 7);
+    assert_eq!(record.message_id, 9);
+}
+
+#[test]
+fn sealed_segments_recover_from_the_sidecar_index() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    log.append(record(0, &[1; 20]), true).unwrap();
+    log.append(record(0, &[2; 20]), true).unwrap();
+    let sealed = log.segment_paths().unwrap()[0].clone();
+    log.persist_recovery_index(&sealed, b"queue-metadata".to_vec())
+        .unwrap();
+    drop(log);
+
+    let log = SegmentLog::open(directory.path(), 100).unwrap();
+    assert_eq!(log.recovery_report().indexed_records, 1);
+    assert_eq!(log.recovery_report().scanned_records, 1);
+    assert_eq!(log.recovery_metadata(&sealed), Some(&b"queue-metadata"[..]));
+    assert_eq!(log.read(1).unwrap().unwrap().payload, vec![1; 20]);
+}
+
+#[test]
+fn corrupt_sidecar_falls_back_to_a_full_segment_scan() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    log.append(record(0, &[1; 20]), true).unwrap();
+    log.append(record(0, &[2; 20]), true).unwrap();
+    let sealed = log.segment_paths().unwrap()[0].clone();
+    log.persist_recovery_index(&sealed, Vec::new()).unwrap();
+    drop(log);
+    std::fs::write(sealed.with_extension("rqidx"), b"corrupt").unwrap();
+
+    let log = SegmentLog::open(directory.path(), 100).unwrap();
+    assert_eq!(log.recovery_report().indexed_records, 0);
+    assert_eq!(log.recovery_report().scanned_records, 2);
+    assert_eq!(log.read(1).unwrap().unwrap().payload, vec![1; 20]);
+}
+
+#[test]
+fn indexed_cold_corruption_is_isolated_by_scrub() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    log.append(record(0, &[1; 20]), true).unwrap();
+    log.append(record(0, &[2; 20]), true).unwrap();
+    let sealed = log.segment_paths().unwrap()[0].clone();
+    log.persist_recovery_index(&sealed, Vec::new()).unwrap();
+    drop(log);
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&sealed)
+        .unwrap();
+    file.seek(SeekFrom::Start(HEADER_LEN as u64)).unwrap();
+    file.write_all(b"X").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let log = SegmentLog::open(directory.path(), 100).unwrap();
+    assert_eq!(log.recovery_report().indexed_records, 1);
+    assert!(matches!(log.scrub(), Err(StorageError::Corrupt { .. })));
+    let mut log = log;
+    assert!(matches!(
+        log.append(record(0, b"blocked"), true),
+        Err(StorageError::Isolated)
+    ));
 }
 
 #[test]
@@ -120,6 +206,21 @@ fn purges_only_complete_inactive_segments() {
     assert_eq!(log.segment_paths().unwrap().len(), 2);
     assert!(log.read(2).unwrap().is_none());
     assert_eq!(log.read(3).unwrap().unwrap().payload, vec![3; 20]);
+}
+
+#[test]
+fn retained_oldest_segment_blocks_non_contiguous_gc() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    for value in 1..=4 {
+        log.append(record(0, &[value; 20]), true).unwrap();
+    }
+    let paths = log.segment_paths().unwrap();
+    let retained = [paths[0].clone()].into_iter().collect();
+    assert_eq!(log.purge_prefix_retaining(3, &retained).unwrap(), 0);
+    assert_eq!(log.segment_paths().unwrap().len(), 4);
+    assert_eq!(log.purge_prefix(3).unwrap(), 3);
+    assert_eq!(log.first_index(), Some(4));
 }
 
 #[cfg(unix)]

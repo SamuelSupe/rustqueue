@@ -4,6 +4,14 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const PERMIT_BYTES: usize = 4096;
+const RECORD_FIXED_BYTES: usize = rustqueue_storage::HEADER_LEN + 4;
+const MESSAGE_WORKING_BYTES: usize = 128;
+
+#[derive(Clone, Copy)]
+pub enum PublishShape {
+    Single,
+    Multi,
+}
 
 pub struct PublishAdmission {
     permits: Arc<Semaphore>,
@@ -52,6 +60,14 @@ impl PublishAdmission {
         self.try_reserve_inner(bytes, None)
     }
 
+    pub fn try_reserve_publish(
+        &self,
+        bytes: usize,
+        shape: PublishShape,
+    ) -> Option<PublishReservation> {
+        self.try_reserve(working_set_bytes(bytes, shape))
+    }
+
     pub fn try_reserve_connection(
         &self,
         bytes: usize,
@@ -65,6 +81,15 @@ impl PublishAdmission {
             }
         };
         self.try_reserve_inner(bytes, connection)
+    }
+
+    pub fn try_reserve_connection_publish(
+        &self,
+        bytes: usize,
+        shape: PublishShape,
+        connection: &ConnectionBudget,
+    ) -> Option<PublishReservation> {
+        self.try_reserve_connection(working_set_bytes(bytes, shape), connection)
     }
 
     fn try_reserve_inner(
@@ -130,6 +155,16 @@ fn units(bytes: usize) -> usize {
     bytes.max(1).div_ceil(PERMIT_BYTES)
 }
 
+pub(crate) fn working_set_bytes(bytes: usize, shape: PublishShape) -> usize {
+    let messages = match shape {
+        PublishShape::Single => 1,
+        PublishShape::Multi => rustqueue_protocol::MAX_MPUB_MESSAGES.min(bytes.max(1)),
+    };
+    bytes
+        .saturating_add(RECORD_FIXED_BYTES)
+        .saturating_add(messages.saturating_mul(MESSAGE_WORKING_BYTES))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +178,14 @@ mod tests {
         assert_eq!(metrics.publish_inflight_bytes.load(Ordering::Relaxed), 5000);
         drop(first);
         assert!(admission.try_reserve(8192).is_some());
+    }
+
+    #[test]
+    fn publish_reservation_charges_internal_metadata_without_body_copies() {
+        assert_eq!(
+            working_set_bytes(20 * 1024 * 1024, PublishShape::Single),
+            20 * 1024 * 1024 + RECORD_FIXED_BYTES + MESSAGE_WORKING_BYTES
+        );
+        assert!(working_set_bytes(64 * 1024 * 1024, PublishShape::Multi) > 64 * 1024 * 1024);
     }
 }

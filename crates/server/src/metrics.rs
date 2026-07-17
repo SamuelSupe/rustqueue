@@ -1,5 +1,7 @@
+use crate::config::MetricsConfig;
 use rustqueue_queue::BrokerStats;
 use rustqueue_telemetry::render_prometheus;
+use serde::Serialize;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 #[derive(Default)]
@@ -31,7 +33,71 @@ pub struct Metrics {
     pub protective_evicted_messages: AtomicU64,
 }
 
-pub fn render_broker(stats: &BrokerStats) -> String {
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeMetricsSnapshot {
+    pub tcp_connections: i64,
+    pub publish_messages: u64,
+    pub publish_bytes: u64,
+    pub publish_inflight_bytes: i64,
+    pub publish_throttled_requests: u64,
+    pub publish_throttled_bytes: u64,
+    pub delivered_messages: u64,
+    pub fetch_requests: u64,
+    pub fetch_empty: u64,
+    pub fetch_batches: u64,
+    pub fetch_messages: u64,
+    pub fetch_bytes: u64,
+    pub finished_messages: u64,
+    pub requeued_messages: u64,
+    pub dead_letter_messages: u64,
+    pub retention_expired_messages: u64,
+    pub protocol_errors: u64,
+    pub auth_failures: u64,
+    pub storage_errors: u64,
+    pub disk_total_bytes: u64,
+    pub disk_available_bytes: u64,
+    pub disk_used_percent: u64,
+    pub disk_pressure: i64,
+    pub protective_evictions: u64,
+    pub protective_evicted_messages: u64,
+}
+
+pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
+    let topic_count = stats.topics.len() as u64;
+    let message_count = stats
+        .topics
+        .iter()
+        .map(|topic| topic.message_count)
+        .sum::<u64>();
+    let channel_count = stats
+        .topics
+        .iter()
+        .map(|topic| topic.channels.len() as u64)
+        .sum::<u64>();
+    let channel_depth = stats
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.channels)
+        .map(|channel| channel.depth)
+        .sum::<u64>();
+    let channel_in_flight = stats
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.channels)
+        .map(|channel| channel.in_flight_count)
+        .sum::<u64>();
+    let channel_deferred = stats
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.channels)
+        .map(|channel| channel.deferred_count)
+        .sum::<u64>();
+    let channel_ack_gap = stats
+        .topics
+        .iter()
+        .flat_map(|topic| &topic.channels)
+        .map(|channel| channel.ack_gap)
+        .sum::<u64>();
     let mut output = format!(
         "# TYPE rustqueue_publish_group_commits_total counter\n\
          rustqueue_publish_group_commits_total {}\n\
@@ -39,32 +105,52 @@ pub fn render_broker(stats: &BrokerStats) -> String {
          rustqueue_publish_group_requests_total {}\n\
          # TYPE rustqueue_publish_group_max_requests gauge\n\
          rustqueue_publish_group_max_requests {}\n\
-         # TYPE rustqueue_topic_messages gauge\n\
-         # TYPE rustqueue_channel_depth gauge\n\
-         # TYPE rustqueue_channel_in_flight gauge\n\
-         # TYPE rustqueue_channel_deferred gauge\n\
-         # TYPE rustqueue_channel_ack_gap gauge\n",
+         # TYPE rustqueue_publish_workers gauge\n\
+         rustqueue_publish_workers {}\n\
+         # TYPE rustqueue_publish_workers_retired_total counter\n\
+         rustqueue_publish_workers_retired_total {}\n\
+         # TYPE rustqueue_publish_workers_rejected_total counter\n\
+         rustqueue_publish_workers_rejected_total {}\n\
+         # TYPE rustqueue_channel_group_commits_total counter\n\
+         rustqueue_channel_group_commits_total {}\n\
+         # TYPE rustqueue_channel_group_requests_total counter\n\
+         rustqueue_channel_group_requests_total {}\n\
+         # TYPE rustqueue_channel_group_max_requests gauge\n\
+         rustqueue_channel_group_max_requests {}\n\
+         # TYPE rustqueue_channel_commit_workers gauge\n\
+         rustqueue_channel_commit_workers {}\n\
+         # TYPE rustqueue_channel_commit_workers_retired_total counter\n\
+         rustqueue_channel_commit_workers_retired_total {}\n\
+         # TYPE rustqueue_channel_commit_workers_rejected_total counter\n\
+         rustqueue_channel_commit_workers_rejected_total {}\n\
+         # TYPE rustqueue_topics gauge\n\
+         rustqueue_topics {topic_count}\n\
+         # TYPE rustqueue_topic_messages_total gauge\n\
+         rustqueue_topic_messages_total {message_count}\n\
+         # TYPE rustqueue_channels gauge\n\
+         rustqueue_channels {channel_count}\n\
+         # TYPE rustqueue_channel_depth_total gauge\n\
+         rustqueue_channel_depth_total {channel_depth}\n\
+         # TYPE rustqueue_channel_in_flight_total gauge\n\
+         rustqueue_channel_in_flight_total {channel_in_flight}\n\
+         # TYPE rustqueue_channel_deferred_total gauge\n\
+         rustqueue_channel_deferred_total {channel_deferred}\n\
+         # TYPE rustqueue_channel_ack_gap_total gauge\n\
+         rustqueue_channel_ack_gap_total {channel_ack_gap}\n",
         stats.publish_group_commit.commits,
         stats.publish_group_commit.requests,
         stats.publish_group_commit.max_batch_requests,
+        stats.publish_group_commit.active_workers,
+        stats.publish_group_commit.retired_workers,
+        stats.publish_group_commit.rejected_workers,
+        stats.channel_group_commit.commits,
+        stats.channel_group_commit.requests,
+        stats.channel_group_commit.max_batch_requests,
+        stats.channel_group_commit.active_workers,
+        stats.channel_group_commit.retired_workers,
+        stats.channel_group_commit.rejected_workers,
     );
-    for topic in &stats.topics {
-        let topic_label = format!("topic=\"{}\"", topic.name);
-        output.push_str(&format!(
-            "rustqueue_topic_messages{{{topic_label}}} {}\n",
-            topic.message_count
-        ));
-        for channel in &topic.channels {
-            let labels = format!("{topic_label},channel=\"{}\"", channel.name);
-            output.push_str(&format!(
-                "rustqueue_channel_depth{{{labels}}} {}\n\
-                     rustqueue_channel_in_flight{{{labels}}} {}\n\
-                     rustqueue_channel_deferred{{{labels}}} {}\n\
-                     rustqueue_channel_ack_gap{{{labels}}} {}\n",
-                channel.depth, channel.in_flight_count, channel.deferred_count, channel.ack_gap,
-            ));
-        }
-    }
+    render_detailed_queue_metrics(&mut output, stats, config);
     for (name, help, snapshot) in [
         (
             "rustqueue_storage_fsync_duration_seconds",
@@ -80,6 +166,21 @@ pub fn render_broker(stats: &BrokerStats) -> String {
             "rustqueue_publish_ack_duration_seconds",
             "End-to-end broker publish acknowledgement latency.",
             &stats.latency.publish_ack,
+        ),
+        (
+            "rustqueue_channel_fsync_duration_seconds",
+            "Time spent making a FIN or REQ group durable.",
+            &stats.latency.channel_fsync,
+        ),
+        (
+            "rustqueue_channel_group_commit_wait_duration_seconds",
+            "Time a FIN or REQ waits before group commit processing.",
+            &stats.latency.channel_group_commit_wait,
+        ),
+        (
+            "rustqueue_channel_ack_duration_seconds",
+            "End-to-end broker FIN or REQ acknowledgement latency.",
+            &stats.latency.channel_ack,
         ),
         (
             "rustqueue_payload_read_duration_seconds",
@@ -102,7 +203,98 @@ pub fn render_broker(stats: &BrokerStats) -> String {
     output
 }
 
+fn render_detailed_queue_metrics(output: &mut String, stats: &BrokerStats, config: &MetricsConfig) {
+    let desired = stats.topics.len()
+        + stats
+            .topics
+            .iter()
+            .map(|topic| topic.channels.len().saturating_mul(4))
+            .sum::<usize>();
+    let mut emitted = 0usize;
+    if config.detailed_queue_metrics {
+        output.push_str(
+            "# TYPE rustqueue_topic_messages gauge\n\
+             # TYPE rustqueue_channel_depth gauge\n\
+             # TYPE rustqueue_channel_in_flight gauge\n\
+             # TYPE rustqueue_channel_deferred gauge\n\
+             # TYPE rustqueue_channel_ack_gap gauge\n",
+        );
+        for topic in &stats.topics {
+            if emitted < config.max_detailed_series {
+                let topic_label = format!("topic=\"{}\"", escape_label(&topic.name));
+                output.push_str(&format!(
+                    "rustqueue_topic_messages{{{topic_label}}} {}\n",
+                    topic.message_count
+                ));
+                emitted += 1;
+            }
+            for channel in &topic.channels {
+                if emitted.saturating_add(4) > config.max_detailed_series {
+                    continue;
+                }
+                let labels = format!(
+                    "topic=\"{}\",channel=\"{}\"",
+                    escape_label(&topic.name),
+                    escape_label(&channel.name)
+                );
+                output.push_str(&format!(
+                    "rustqueue_channel_depth{{{labels}}} {}\n\
+                     rustqueue_channel_in_flight{{{labels}}} {}\n\
+                     rustqueue_channel_deferred{{{labels}}} {}\n\
+                     rustqueue_channel_ack_gap{{{labels}}} {}\n",
+                    channel.depth, channel.in_flight_count, channel.deferred_count, channel.ack_gap,
+                ));
+                emitted += 4;
+            }
+        }
+    }
+    output.push_str(&format!(
+        "# TYPE rustqueue_detailed_queue_metric_series gauge\n\
+         rustqueue_detailed_queue_metric_series {emitted}\n\
+         # TYPE rustqueue_detailed_queue_metric_series_omitted gauge\n\
+         rustqueue_detailed_queue_metric_series_omitted {}\n",
+        desired.saturating_sub(emitted),
+    ));
+}
+
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
+}
+
 impl Metrics {
+    pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
+        RuntimeMetricsSnapshot {
+            tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
+            publish_messages: self.publish_messages.load(Ordering::Relaxed),
+            publish_bytes: self.publish_bytes.load(Ordering::Relaxed),
+            publish_inflight_bytes: self.publish_inflight_bytes.load(Ordering::Relaxed),
+            publish_throttled_requests: self.publish_throttled_requests.load(Ordering::Relaxed),
+            publish_throttled_bytes: self.publish_throttled_bytes.load(Ordering::Relaxed),
+            delivered_messages: self.delivered_messages.load(Ordering::Relaxed),
+            fetch_requests: self.fetch_requests.load(Ordering::Relaxed),
+            fetch_empty: self.fetch_empty.load(Ordering::Relaxed),
+            fetch_batches: self.fetch_batches.load(Ordering::Relaxed),
+            fetch_messages: self.fetch_messages.load(Ordering::Relaxed),
+            fetch_bytes: self.fetch_bytes.load(Ordering::Relaxed),
+            finished_messages: self.finished_messages.load(Ordering::Relaxed),
+            requeued_messages: self.requeued_messages.load(Ordering::Relaxed),
+            dead_letter_messages: self.dead_letter_messages.load(Ordering::Relaxed),
+            retention_expired_messages: self.retention_expired_messages.load(Ordering::Relaxed),
+            protocol_errors: self.protocol_errors.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
+            storage_errors: self.storage_errors.load(Ordering::Relaxed),
+            disk_total_bytes: self.disk_total_bytes.load(Ordering::Relaxed),
+            disk_available_bytes: self.disk_available_bytes.load(Ordering::Relaxed),
+            disk_used_percent: self.disk_used_percent.load(Ordering::Relaxed),
+            disk_pressure: self.disk_pressure.load(Ordering::Relaxed),
+            protective_evictions: self.protective_evictions.load(Ordering::Relaxed),
+            protective_evicted_messages: self.protective_evicted_messages.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn render(&self) -> String {
         format!(
             concat!(
@@ -183,5 +375,64 @@ impl Metrics {
             self.protective_evictions.load(Ordering::Relaxed),
             self.protective_evicted_messages.load(Ordering::Relaxed),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustqueue_queue::{ChannelStats, TopicStats};
+
+    fn broker_stats() -> BrokerStats {
+        BrokerStats {
+            topics: vec![TopicStats {
+                name: "events".into(),
+                paused: false,
+                message_count: 7,
+                segment_count: 1,
+                segment_bytes: 100,
+                channels: vec![ChannelStats {
+                    name: "workers".into(),
+                    depth: 3,
+                    in_flight_count: 2,
+                    deferred_count: 1,
+                    paused: false,
+                    ephemeral: false,
+                    ack_cursor: 4,
+                    ack_gap: 2,
+                }],
+            }],
+            ..BrokerStats::default()
+        }
+    }
+
+    #[test]
+    fn queue_metrics_are_aggregate_only_by_default() {
+        let output = render_broker(&broker_stats(), &MetricsConfig::default());
+        assert!(output.contains("rustqueue_topic_messages_total 7\n"));
+        assert!(output.contains("rustqueue_channel_depth_total 3\n"));
+        assert!(!output.contains("topic=\"events\""));
+        assert!(output.contains("rustqueue_detailed_queue_metric_series 0\n"));
+        assert!(output.contains("rustqueue_detailed_queue_metric_series_omitted 5\n"));
+    }
+
+    #[test]
+    fn detailed_queue_metrics_honor_the_global_series_budget() {
+        let output = render_broker(
+            &broker_stats(),
+            &MetricsConfig {
+                detailed_queue_metrics: true,
+                max_detailed_series: 4,
+            },
+        );
+        assert!(output.contains("rustqueue_topic_messages{topic=\"events\"} 7\n"));
+        assert!(!output.contains("rustqueue_channel_depth{topic="));
+        assert!(output.contains("rustqueue_detailed_queue_metric_series 1\n"));
+        assert!(output.contains("rustqueue_detailed_queue_metric_series_omitted 4\n"));
+    }
+
+    #[test]
+    fn prometheus_label_values_are_escaped() {
+        assert_eq!(escape_label("a\\b\n\"c"), "a\\\\b\\n\\\"c");
     }
 }

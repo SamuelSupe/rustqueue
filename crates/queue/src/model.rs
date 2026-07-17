@@ -21,9 +21,11 @@ pub(crate) struct MessageMeta {
     pub payload: PayloadRef,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BrokerStats {
     pub publish_group_commit: PublishGroupCommitStats,
+    #[serde(default)]
+    pub channel_group_commit: ChannelGroupCommitStats,
     #[serde(default)]
     pub latency: BrokerLatencyStats,
     pub topics: Vec<TopicStats>,
@@ -34,6 +36,9 @@ pub struct BrokerLatencyStats {
     pub fsync: HistogramSnapshot,
     pub group_commit_wait: HistogramSnapshot,
     pub publish_ack: HistogramSnapshot,
+    pub channel_fsync: HistogramSnapshot,
+    pub channel_group_commit_wait: HistogramSnapshot,
+    pub channel_ack: HistogramSnapshot,
     pub payload_read: HistogramSnapshot,
     pub scrub: HistogramSnapshot,
     pub gc: HistogramSnapshot,
@@ -44,6 +49,22 @@ pub struct PublishGroupCommitStats {
     pub commits: u64,
     pub requests: u64,
     pub max_batch_requests: u64,
+    #[serde(default)]
+    pub active_workers: u64,
+    #[serde(default)]
+    pub retired_workers: u64,
+    #[serde(default)]
+    pub rejected_workers: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ChannelGroupCommitStats {
+    pub commits: u64,
+    pub requests: u64,
+    pub max_batch_requests: u64,
+    pub active_workers: u64,
+    pub retired_workers: u64,
+    pub rejected_workers: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -51,6 +72,10 @@ pub struct TopicStats {
     pub name: String,
     pub paused: bool,
     pub message_count: u64,
+    #[serde(default)]
+    pub segment_count: u64,
+    #[serde(default)]
+    pub segment_bytes: u64,
     pub channels: Vec<ChannelStats>,
 }
 

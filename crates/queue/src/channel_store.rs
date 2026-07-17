@@ -79,6 +79,14 @@ impl ChannelStore {
     }
 
     pub fn append(&mut self, command: &ChannelCommand) -> Result<(), BrokerError> {
+        self.append_buffered(command)?;
+        rustqueue_storage::crash_failpoint("channel_after_wal_append_before_fsync");
+        self.sync()?;
+        rustqueue_storage::crash_failpoint("channel_after_wal_fsync_before_return");
+        Ok(())
+    }
+
+    pub fn append_buffered(&mut self, command: &ChannelCommand) -> Result<(), BrokerError> {
         self.ensure_available()?;
         let body = encode_command(command);
         if body.len() > MAX_COMMAND_BYTES {
@@ -95,6 +103,15 @@ impl ChannelStore {
             return Err(error);
         }
         self.commands_since_checkpoint += 1;
+        Ok(())
+    }
+
+    pub fn sync(&mut self) -> Result<(), BrokerError> {
+        self.ensure_available()?;
+        if let Err(error) = self.wal.sync_data() {
+            self.isolated = true;
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -118,9 +135,6 @@ impl ChannelStore {
     fn append_bytes(&mut self, header: &[u8], body: &[u8]) -> Result<(), BrokerError> {
         self.wal.write_all(header)?;
         self.wal.write_all(body)?;
-        rustqueue_storage::crash_failpoint("channel_after_wal_append_before_fsync");
-        self.wal.sync_data()?;
-        rustqueue_storage::crash_failpoint("channel_after_wal_fsync_before_return");
         Ok(())
     }
 

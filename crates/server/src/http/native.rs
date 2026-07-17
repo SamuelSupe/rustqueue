@@ -38,6 +38,15 @@ pub(super) async fn health(State(state): State<AppState>) -> Response {
         )
             .into_response();
     }
+    if !state.broker.management_fences_ready() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not_ready", "reason": "management_fences_stale", "node_id": state.config.node.id,
+            })),
+        )
+            .into_response();
+    }
     Json(json!({
         "status": "ready", "node_id": state.config.node.id,
         "storage": "healthy", "mode": "share-nothing", "data_format": 7,
@@ -49,15 +58,27 @@ pub(super) async fn registry(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.registry_token.as_deref(), "registry")?;
+    authorize_any(
+        &headers,
+        &[
+            state.registry_token.as_deref(),
+            state.console_token.as_deref(),
+        ],
+        "registry or console",
+    )?;
     let stats = state.broker.stats();
     let topics = registry_topics(&stats);
     let (stored_messages, depth, in_flight) = backlog(&stats);
     let process_ready = state.accepting.load(Ordering::Acquire);
     let storage_ready = state.broker.storage_healthy();
-    let publish_ready = process_ready && storage_ready && state.publish_admission.storage_ready();
-    let consume_ready =
-        storage_ready && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0);
+    let management_ready = state.broker.management_fences_ready();
+    let publish_ready = process_ready
+        && storage_ready
+        && management_ready
+        && state.publish_admission.storage_ready();
+    let consume_ready = management_ready
+        && storage_ready
+        && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0);
     let (binary, storage) = state.broker.capabilities();
     Ok(Json(json!({
         "format": 7,
@@ -77,11 +98,47 @@ pub(super) async fn registry(
     })))
 }
 
+pub(super) async fn registry_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize_any(
+        &headers,
+        &[
+            state.registry_token.as_deref(),
+            state.console_token.as_deref(),
+        ],
+        "registry or console",
+    )?;
+    let process_ready = state.accepting.load(Ordering::Acquire);
+    let storage_ready = state.broker.storage_healthy();
+    let management_ready = state.broker.management_fences_ready();
+    let publish_ready = process_ready
+        && storage_ready
+        && management_ready
+        && state.publish_admission.storage_ready();
+    Ok(Json(json!({
+        "format": 7,
+        "revision": state.broker.registry_revision(),
+        "node_id": state.config.node.id,
+        "ready": storage_ready && management_ready,
+        "publish_ready": publish_ready,
+        "consume_ready": storage_ready && management_ready,
+    })))
+}
+
 pub(super) async fn capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.registry_token.as_deref(), "registry")?;
+    authorize_any(
+        &headers,
+        &[
+            state.registry_token.as_deref(),
+            state.console_token.as_deref(),
+        ],
+        "registry or console",
+    )?;
     let (binary, storage) = state.broker.capabilities();
     Ok(Json(json!({"binary": binary, "storage": storage})))
 }
@@ -110,7 +167,14 @@ pub(super) async fn drain_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.registry_token.as_deref(), "registry")?;
+    authorize_any(
+        &headers,
+        &[
+            state.registry_token.as_deref(),
+            state.console_token.as_deref(),
+        ],
+        "registry or console",
+    )?;
     let stats = state.broker.stats();
     let (stored_messages, depth, in_flight) = backlog(&stats);
     Ok(Json(json!({
@@ -156,6 +220,69 @@ pub(super) async fn native_stats(
         "collected_at_ms": now_ms(),
         "topics": filtered.topics,
     }))
+}
+
+pub(super) async fn observe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&headers, state.console_token.as_deref(), "console")?;
+    let stats = state.broker.stats();
+    let (stored_messages, depth, in_flight) = backlog(&stats);
+    let segment_count = stats
+        .topics
+        .iter()
+        .map(|topic| topic.segment_count)
+        .sum::<u64>();
+    let segment_bytes = stats
+        .topics
+        .iter()
+        .map(|topic| topic.segment_bytes)
+        .sum::<u64>();
+    let process_ready = state.accepting.load(Ordering::Acquire);
+    let storage_healthy = state.broker.storage_healthy();
+    let disk_ready = state.publish_admission.storage_ready();
+    let (binary, storage) = state.broker.capabilities();
+    let runtime = state.metrics.snapshot();
+    Ok(Json(json!({
+        "schema_version": 1,
+        "registry_revision": state.broker.registry_revision(),
+        "collected_at_ms": now_ms(),
+        "node": {
+            "id": state.config.node.id,
+            "address": state.config.node.broadcast_address,
+            "version": env!("CARGO_PKG_VERSION"),
+            "data_format": 7,
+            "compatibility": {"binary": binary, "storage": storage},
+        },
+        "readiness": {
+            "process_ready": process_ready,
+            "storage_healthy": storage_healthy,
+            "disk_ready": disk_ready,
+            "publish_ready": process_ready && storage_healthy && disk_ready && state.broker.management_fences_ready(),
+            "consume_ready": state.broker.management_fences_ready() && storage_healthy && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0),
+            "draining": !process_ready,
+            "management_fences_ready": state.broker.management_fences_ready(),
+        },
+        "disk": {
+            "total_bytes": runtime.disk_total_bytes,
+            "available_bytes": runtime.disk_available_bytes,
+            "used_percent": runtime.disk_used_percent,
+            "pressure": runtime.disk_pressure != 0,
+            "high_watermark_percent": state.config.storage.disk_high_watermark_percent,
+            "low_watermark_percent": state.config.storage.disk_low_watermark_percent,
+            "min_free_bytes": state.config.storage.min_free_bytes,
+            "protective_eviction_enabled": state.config.storage.protective_eviction_enabled,
+        },
+        "storage": {"segment_count": segment_count, "segment_bytes": segment_bytes},
+        "runtime": runtime,
+        "queue": stats,
+        "limits": {
+            "max_message_bytes": state.config.queue.max_message_bytes,
+            "max_backlog_messages": state.config.queue.max_backlog_messages,
+            "max_connections": state.config.limits.max_connections,
+        },
+    })))
 }
 
 pub(super) async fn scrub(

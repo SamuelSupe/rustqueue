@@ -76,8 +76,8 @@ window. The guarantee is bounded:
 ### 2.4 Routing and scale
 
 - Producers connect to a node-local proxy DaemonSet.
-- The proxy chooses a random publish-ready broker for each new TCP connection
-  and for each HTTP request.
+- The proxy chooses a least-active publish-ready broker for each new TCP
+  connection and a randomized ready broker for each HTTP request.
 - A persistent TCP connection stays on one broker until it closes.
 - Ambiguous failures may cause a producer retry to create a duplicate on a
   different broker.
@@ -85,6 +85,9 @@ window. The guarantee is bounded:
   owner, including approximately 500 owners, is an accepted product tradeoff.
 - Consumers bypass the producer proxy and use discovery plus direct broker
   connections.
+- The number of Brokers used concurrently by TCP publishing cannot exceed the
+  producer connection count. Least-active placement removes avoidable random
+  collisions, but it cannot turn 16 streams into 500-way concurrent disk I/O.
 
 ### 2.5 Ordering and identity
 
@@ -121,10 +124,12 @@ The broker exposes a small authenticated discovery endpoint containing:
 Each replica:
 
 1. watches the broker Kubernetes EndpointSlice;
-2. polls broker registries every 2 seconds with bounded concurrency sized for
-   the 500-broker target;
+2. polls a small broker revision/readiness head every 2 seconds and downloads
+   the full registry only for a new Broker or changed registry revision;
 3. expires stale broker observations after 5 seconds;
-4. serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, and `/info`.
+4. maintains topic, channel, consumer, and publisher indexes incrementally, so
+   lookup requests do not scan every Broker registry;
+5. serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, and `/info`.
 
 Discovery state is derived and is never authoritative message metadata. A
 restart reconstructs the complete index from ready brokers. Replicas do not
@@ -136,8 +141,9 @@ coordinate and clients may union their answers exactly as with multiple
 `rustqueue-proxy` runs as a DaemonSet on application nodes so older Kubernetes
 versions do not need `PreferSameNode` support.
 
-- TCP is a bounded L4 pass-through. It chooses one backend per accepted
-  connection and does not parse or replay commands.
+- TCP is a bounded L4 pass-through. It chooses the ready backend with the fewest
+  active proxy connections, keeps a lease until disconnect, and does not parse
+  or replay commands.
 - HTTP is a bounded reverse proxy. Node-level connection and in-flight body
   budgets reject excess load instead of allowing proxy memory to grow without
   limit. It may retry only before receiving a backend response; an ambiguous
@@ -191,6 +197,7 @@ audited administrative action.
       manifest
       segments/
         segment-00000000000000000001.rqlog
+        segment-00000000000000000001.rqidx
       channels/
         <encoded-channel>.checkpoint
         <encoded-channel>.wal
@@ -201,13 +208,22 @@ audited administrative action.
 
 ### 4.1 Message segment
 
-- Immutable, length-prefixed binary records.
+- Immutable, length-prefixed binary records. New publishes use vectored
+  header/metadata/body writes, so a 10-20 MiB body is not copied into a batch
+  Vec and then copied again into a complete record Vec.
 - Record header contains format, kind, message ID, timestamp, delayed target,
   payload length, and CRC32C.
 - The payload is stored once per broker regardless of channel count.
 - Tail short writes are truncated during recovery.
-- A bad record before the valid tail fails broker startup and requires operator
-  action; a broker must not silently skip it.
+- Each sealed segment has an atomic CRC-protected recovery index containing
+  record locations and fixed-size queue metadata. Startup validates the index
+  and segment length instead of reading every live payload; a missing or bad
+  index safely falls back to a full scan and is rebuilt.
+- The active tail is always fully scanned. Cold indexed payload corruption is
+  detected and isolated on payload read or by the immediate background scrub.
+  Scrub pins an immutable file list while holding the Topic lock, then releases
+  that lock and verifies the files sequentially with a configurable bandwidth
+  ceiling (`scrub_bytes_per_second`, 64 MiB/s by default).
 - A runtime write, fsync, or integrity failure poisons the affected storage
   handle, removes the broker from readiness, and terminates the process for a
   clean recovery. No later request may append through an uncertain file
@@ -219,6 +235,9 @@ audited administrative action.
   requeue targets, attempts that reached a durable `REQ`, paused state, and
   retention cursor.
 - State mutations append to a per-channel WAL.
+- Concurrent FIN/REQ mutations for one topic are combined into groups of at
+  most 64 requests or 1 ms. Each touched durable channel is fsynced once before
+  any request in that group is acknowledged.
 - Periodic checkpoints use temporary-file, file fsync, rename, and directory
   fsync before the covered WAL can be removed.
 - In-flight leases are not checkpointed. Recovery makes their messages
@@ -241,6 +260,12 @@ write an audit record. There is no quorum because there is no replica.
 Reader references are acquired while holding the topic lock. GC, protective
 eviction, and topic deletion inspect those leases under the same lock order, so
 a segment cannot disappear between delivery reservation and payload read.
+
+The normal GC retention plan uses binary searches over monotonic timestamps,
+message IDs, positions, and log indexes. It does not linearly walk a 10-million
+message backlog on every five-second pass. Physical deletion remains a
+contiguous immutable-segment prefix, and removed message metadata is released
+once, amortized with actual reclamation.
 
 ### 4.4 DLQ
 
@@ -356,9 +381,10 @@ The implementation is complete only when all of the following pass:
 10. OrbStack Kubernetes functional acceptance passes. A real 500-node cluster
     is not required; discovery behavior is tested with synthetic endpoint and
     registry fixtures representing 500 brokers.
-11. Prometheus histograms expose fsync, group-commit wait, publish ACK, payload
-    read, scrub/GC, proxy backend, and discovery polling latency without
-    per-topic or per-broker cardinality.
+11. Prometheus histograms expose publish/channel fsync, group-commit wait,
+    publish/FIN/REQ ACK, payload read, scrub/GC, proxy backend, and discovery
+    polling latency. Queue metrics are aggregate-only by default; optional
+    topic/channel labels have a global series budget and report omissions.
 12. Fuzz targets cover protocol and compression plus storage record, channel
     WAL/checkpoint, topic manifest, proxy HTTP metadata, and registry-response
     parsing.
@@ -366,6 +392,9 @@ The implementation is complete only when all of the following pass:
     fuzz smoke and official Go/Python compatibility. OrbStack acceptance is an
     explicit local release gate because CI does not emulate multi-node PVC
     detach/attach behavior.
+14. Console management acceptance creates a real three-owner topic, forces the
+    Console Pod down after one owner is durably recorded, and verifies the new
+    Pod completes the remaining owners without reapplying the finished owner.
 
 ## 10. Explicit non-goals
 

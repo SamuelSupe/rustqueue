@@ -22,6 +22,7 @@ impl Broker {
         timeout: Option<Duration>,
     ) -> Result<Vec<Delivery>, BrokerError> {
         self.ensure_storage_healthy()?;
+        self.ensure_management_access(topic, Some(channel))?;
         let handle = self.topic(topic)?;
         let mut wake = handle.wake.subscribe();
         let timeout = timeout.unwrap_or(self.inner.config.message_timeout);
@@ -111,7 +112,21 @@ impl Broker {
     }
 
     pub async fn finish(&self, topic: &str, channel: &str, id: u64) -> Result<(), BrokerError> {
-        self.finish_inner(topic, channel, id, true).await
+        let _timer = self.inner.metrics.channel_ack.timer();
+        self.ensure_storage_healthy()?;
+        self.ensure_management_access(topic, Some(channel))?;
+        self.inner
+            .channel_groups
+            .submit(
+                self,
+                topic,
+                channel.to_owned(),
+                super::channel_commit::ChannelOperation::Finish {
+                    id,
+                    require_in_flight: true,
+                },
+            )
+            .await
     }
 
     async fn finish_inner(
@@ -121,6 +136,7 @@ impl Broker {
         id: u64,
         require_in_flight: bool,
     ) -> Result<(), BrokerError> {
+        self.ensure_management_access(topic, Some(channel))?;
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
@@ -141,14 +157,22 @@ impl Broker {
         id: u64,
         delay: Duration,
     ) -> Result<(), BrokerError> {
-        let handle = self.topic(topic)?;
-        let work = Arc::clone(&handle);
-        let channel = channel.to_owned();
+        let _timer = self.inner.metrics.channel_ack.timer();
+        self.ensure_storage_healthy()?;
+        self.ensure_management_access(topic, Some(channel))?;
         let available = now_ms().saturating_add(delay.as_millis().min(i64::MAX as u128) as i64);
-        self.storage_task(move || work.state.lock().requeue(&channel, id, available))
-            .await?;
-        handle.signal();
-        Ok(())
+        self.inner
+            .channel_groups
+            .submit(
+                self,
+                topic,
+                channel.to_owned(),
+                super::channel_commit::ChannelOperation::Requeue {
+                    id,
+                    available_at_ms: available,
+                },
+            )
+            .await
     }
 
     pub fn touch(
@@ -159,6 +183,7 @@ impl Broker {
         timeout: Option<Duration>,
     ) -> Result<(), BrokerError> {
         self.ensure_storage_healthy()?;
+        self.ensure_management_access(topic, Some(channel))?;
         self.topic(topic)?.state.lock().touch(
             channel,
             id,
@@ -230,6 +255,7 @@ impl Broker {
         bodies: &[Bytes],
     ) -> Result<usize, BrokerError> {
         validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
+        self.ensure_management_access(topic, None)?;
         if bodies.is_empty() || bodies.len() > MAX_BATCH_MESSAGES {
             return Err(BrokerError::BatchTooLarge);
         }

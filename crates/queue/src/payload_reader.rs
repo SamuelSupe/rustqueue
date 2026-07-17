@@ -25,6 +25,11 @@ pub(crate) struct PayloadLease {
     payloads: Vec<PayloadRef>,
 }
 
+pub(crate) struct PathLease {
+    active_paths: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    paths: Vec<PathBuf>,
+}
+
 const MAX_COALESCED_READ: u64 = 2 * 1024 * 1024;
 const MAX_COALESCE_GAP: u64 = 64 * 1024;
 
@@ -111,6 +116,19 @@ impl PayloadReader {
         }
     }
 
+    pub fn retain_paths(&self, paths: Vec<PathBuf>) -> PathLease {
+        {
+            let mut active = self.active_paths.lock();
+            for path in &paths {
+                *active.entry(path.clone()).or_default() += 1;
+            }
+        }
+        PathLease {
+            active_paths: Arc::clone(&self.active_paths),
+            paths,
+        }
+    }
+
     pub async fn read_retained(&self, lease: PayloadLease) -> io::Result<Vec<Arc<[u8]>>> {
         let _timer = self.latency.timer();
         let payloads = lease.payloads.clone();
@@ -188,6 +206,21 @@ impl PayloadReader {
 impl Drop for PayloadLease {
     fn drop(&mut self) {
         release_paths(&self.active_paths, &self.payloads);
+    }
+}
+
+impl Drop for PathLease {
+    fn drop(&mut self) {
+        let mut active = self.active_paths.lock();
+        for path in &self.paths {
+            let Some(count) = active.get_mut(path) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                active.remove(path);
+            }
+        }
     }
 }
 

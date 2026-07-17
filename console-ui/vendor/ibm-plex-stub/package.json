@@ -1,0 +1,6 @@
+{
+  "name": "@ibm/plex",
+  "version": "6.4.1",
+  "private": true,
+  "description": "Build-only stub. Carbon is configured to use its per-family Plex packages."
+}

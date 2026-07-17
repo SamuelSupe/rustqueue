@@ -1,0 +1,63 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rustqueuechannels.rustqueue.io
+spec:
+  group: rustqueue.io
+  scope: Namespaced
+  names:
+    kind: RustQueueChannel
+    plural: rustqueuechannels
+    singular: rustqueuechannel
+    shortNames: [rqc]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - {name: Queue, type: string, jsonPath: .spec.queue}
+        - {name: Topic, type: string, jsonPath: .spec.topic}
+        - {name: Channel, type: string, jsonPath: .spec.channel}
+        - {name: Phase, type: string, jsonPath: .spec.phase}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion: {type: string}
+            kind: {type: string}
+            metadata: {type: object}
+            spec:
+              type: object
+              required: [queue, topic, channel, phase]
+              properties:
+                queue: {type: string, minLength: 1}
+                topic: {type: string, minLength: 1}
+                channel: {type: string, minLength: 1}
+                owners:
+                  type: array
+                  default: []
+                  items: {type: string}
+                phase:
+                  type: string
+                  enum: [PREPARING, ACTIVE, APPLYING, FAILED, TOMBSTONED]
+                revision: {type: integer, format: int64, minimum: 0, default: 0}
+                paused: {type: boolean, default: false}
+                ephemeral: {type: boolean, default: false}
+                tombstoneUntilMs: {type: integer, format: int64, nullable: true}
+                lastError: {type: string, nullable: true, maxLength: 1024}
+                operation:
+                  type: object
+                  nullable: true
+                  required: [id, action, createdAtMs, updatedAtMs]
+                  properties:
+                    id: {type: string, minLength: 16, maxLength: 128}
+                    action:
+                      type: string
+                      enum: [CREATE, PAUSE, UNPAUSE, EMPTY, DELETE]
+                    completedOwners:
+                      type: array
+                      default: []
+                      items: {type: string}
+                    attempt: {type: integer, format: int32, minimum: 0, default: 0}
+                    createdAtMs: {type: integer, format: int64}
+                    updatedAtMs: {type: integer, format: int64}

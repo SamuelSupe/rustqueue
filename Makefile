@@ -1,10 +1,14 @@
-.PHONY: test check fmt clippy release-bin image operator-release-bin operator-image \
-	helm-lint helm-template k8s-acceptance k8s-multi-acceptance up down compat compat-go compat-python \
+.PHONY: test check fmt clippy release-bin image image-from-dist operator-release-bin operator-image console-ui-build console-ui-check \
+	helm-lint helm-template k8s-acceptance k8s-console-management-acceptance k8s-multi-acceptance up down compat compat-go compat-python \
 	fuzz-smoke benchmark release-gate
 
 RUST_IMAGE := rust:1.88-bookworm
 CARGO_CACHE := rustqueue-cargo-registry
 RUSTUP_CACHE := rustqueue-rustup
+UI_IMAGE := node:24-bookworm-slim
+UI_MODULES := rustqueue-console-node-modules
+UI_COREPACK := rustqueue-console-corepack
+UI_DOCKER_ARGS ?=
 BUILD_VERSION ?=
 MAX_STORAGE_FEATURE_LEVEL ?=
 RUN := docker run --rm -e RUSTUP_TOOLCHAIN=1.88.0 -e CARGO_INCREMENTAL=0 \
@@ -29,13 +33,29 @@ clippy:
 release-bin:
 	$(RUN) cargo build --locked --release \
 		--bin rustqueued --bin rustqueue-discovery --bin rustqueue-proxy --bin rustqueue-bench \
-		--bin rustqueuectl
+		--bin rustqueuectl --bin rustqueue-console
 	mkdir -p .docker-bin
 	cp target/release/rustqueued target/release/rustqueue-discovery \
 		target/release/rustqueue-proxy target/release/rustqueue-bench \
-		target/release/rustqueuectl .docker-bin/
+		target/release/rustqueuectl target/release/rustqueue-console .docker-bin/
 
-image: release-bin
+console-ui-build:
+	docker run --rm $(UI_DOCKER_ARGS) -e CI=true -e HOME=/tmp -e COREPACK_HOME=/tmp/corepack \
+		-v $(CURDIR):/work -w /work/console-ui -v $(UI_MODULES):/work/console-ui/node_modules \
+		-v $(UI_COREPACK):/tmp/corepack \
+		$(UI_IMAGE) sh -lc 'corepack enable && corepack pnpm install --frozen-lockfile && corepack pnpm build'
+
+console-ui-check:
+	docker run --rm $(UI_DOCKER_ARGS) -e CI=true -e HOME=/tmp -e COREPACK_HOME=/tmp/corepack \
+		-v $(CURDIR):/work -w /work/console-ui -v $(UI_MODULES):/work/console-ui/node_modules \
+		-v $(UI_COREPACK):/tmp/corepack \
+		$(UI_IMAGE) sh -lc 'corepack enable && corepack pnpm install --frozen-lockfile && corepack pnpm check'
+
+image: release-bin console-ui-build
+	docker build -f Dockerfile.runtime -t rustqueue:dev .
+
+image-from-dist: release-bin
+	test -f console-ui/dist/index.html
 	docker build -f Dockerfile.runtime -t rustqueue:dev .
 
 operator-release-bin:
@@ -61,6 +81,9 @@ helm-template:
 
 k8s-acceptance:
 	./scripts/acceptance-k8s.sh
+
+k8s-console-management-acceptance:
+	./scripts/acceptance-console-management.sh
 
 k8s-multi-acceptance:
 	./scripts/acceptance-multi-broker-k8s.sh

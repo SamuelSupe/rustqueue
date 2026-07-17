@@ -1,0 +1,148 @@
+{{- if and .Values.queue.create .Values.console.enabled }}
+{{- $name := printf "%s-console" .Values.queue.name -}}
+{{- $labels := dict "app.kubernetes.io/name" "rustqueue" "app.kubernetes.io/instance" .Values.queue.name "app.kubernetes.io/component" "console" "app.kubernetes.io/managed-by" "Helm" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+rules:
+  - apiGroups: ["rustqueue.io"]
+    resources: ["rustqueues"]
+    resourceNames: [{{ .Values.queue.name | quote }}]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims", "events"]
+    verbs: ["get", "list", "watch"]
+  {{- if .Values.console.management.enabled }}
+  - apiGroups: ["rustqueue.io"]
+    resources: ["rustqueuetopics", "rustqueuechannels"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rustqueue
+    app.kubernetes.io/instance: {{ .Values.queue.name }}
+    app.kubernetes.io/component: console
+  ports:
+    - name: http
+      port: 4180
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    # Console is the single writer for management CRDs and broker fences.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustqueue
+      app.kubernetes.io/instance: {{ .Values.queue.name }}
+      app.kubernetes.io/component: console
+  template:
+    metadata:
+      labels:
+        {{- toYaml $labels | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: console
+          image: {{ default .Values.queue.image .Values.console.image | quote }}
+          imagePullPolicy: {{ default .Values.queue.imagePullPolicy .Values.console.imagePullPolicy | quote }}
+          command: ["rustqueue-console"]
+          ports:
+            - name: http
+              containerPort: 4180
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: RUSTQUEUE_NAME
+              value: {{ .Values.queue.name | quote }}
+            - name: RUSTQUEUE_CONSOLE_TOKEN_FILE
+              value: /run/secrets/rustqueue/console-token
+            - name: RUSTQUEUE_CONSOLE_POLL_SECONDS
+              value: {{ .Values.console.pollIntervalSeconds | quote }}
+            - name: RUSTQUEUE_CONSOLE_HISTORY_MINUTES
+              value: {{ .Values.console.historyMinutes | quote }}
+            - name: RUSTQUEUE_CONSOLE_MANAGEMENT_ENABLED
+              value: {{ .Values.console.management.enabled | quote }}
+            - name: RUSTQUEUE_CONSOLE_MANAGEMENT_UNLOCK_SECONDS
+              value: {{ .Values.console.management.unlockSeconds | quote }}
+            - name: RUSTQUEUE_CONSOLE_TOMBSTONE_SECONDS
+              value: {{ .Values.console.management.tombstoneSeconds | quote }}
+          volumeMounts:
+            - name: auth
+              mountPath: /run/secrets/rustqueue
+              readOnly: true
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.console.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+      volumes:
+        - name: auth
+          secret:
+            secretName: {{ default (printf "%s-auth" .Values.queue.name) .Values.queue.registrySecretName }}
+            items:
+              - key: console-token
+                path: console-token
+{{- end }}

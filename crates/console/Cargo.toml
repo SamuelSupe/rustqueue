@@ -1,0 +1,34 @@
+[package]
+name = "rustqueue-console"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rustqueue-console"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+crc32c.workspace = true
+futures.workspace = true
+hex.workspace = true
+k8s-openapi.workspace = true
+kube.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+rustls.workspace = true
+rustqueue-operator = { path = "../operator" }
+rustqueue-protocol = { path = "../protocol" }
+rustqueue-queue = { path = "../queue" }
+rustqueue-telemetry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

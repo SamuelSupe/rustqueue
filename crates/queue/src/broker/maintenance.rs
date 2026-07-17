@@ -56,14 +56,26 @@ impl Broker {
         let _timer = self.inner.metrics.scrub.timer();
         let broker = self.clone();
         self.storage_task(move || {
-            broker
-                .inner
-                .topics
-                .read()
-                .values()
-                .try_fold(0usize, |count, topic| {
-                    Ok(count + topic.state.lock().scrub()?)
-                })
+            let topics: Vec<_> = broker.inner.topics.read().values().cloned().collect();
+            let mut count = 0usize;
+            for topic in topics {
+                let (targets, _lease) = {
+                    let topic = topic.state.lock();
+                    let targets = topic.scrub_targets()?;
+                    let lease = broker
+                        .inner
+                        .payload_reader
+                        .retain_paths(targets.iter().map(|target| target.path.clone()).collect());
+                    (targets, lease)
+                };
+                for target in targets {
+                    count += rustqueue_storage::SegmentLog::scrub_target(
+                        &target,
+                        broker.inner.config.scrub_bytes_per_second,
+                    )?;
+                }
+            }
+            Ok(count)
         })
         .await
     }

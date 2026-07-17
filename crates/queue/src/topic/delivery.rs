@@ -75,6 +75,26 @@ impl Topic {
         id: u64,
         require_in_flight: bool,
     ) -> Result<(), BrokerError> {
+        let command = self.finish_command(channel, id, require_in_flight)?;
+        self.persist_channel(channel, command)
+    }
+
+    pub fn finish_buffered(
+        &mut self,
+        channel: &str,
+        id: u64,
+        require_in_flight: bool,
+    ) -> Result<(), BrokerError> {
+        let command = self.finish_command(channel, id, require_in_flight)?;
+        self.persist_channel_buffered(channel, command)
+    }
+
+    fn finish_command(
+        &self,
+        channel: &str,
+        id: u64,
+        require_in_flight: bool,
+    ) -> Result<ChannelCommand, BrokerError> {
         let position = if require_in_flight {
             self.channels
                 .get(channel)
@@ -84,21 +104,28 @@ impl Topic {
             self.position_by_id(id)
                 .ok_or(BrokerError::MessageNotFound)?
         };
-        self.persist_channel(
-            channel,
-            ChannelCommand::Finish {
-                position,
-                message_id: id,
-            },
-        )
+        Ok(ChannelCommand::Finish {
+            position,
+            message_id: id,
+        })
     }
 
-    pub fn requeue(
+    pub fn requeue_buffered(
         &mut self,
         channel: &str,
         id: u64,
         available_at_ms: i64,
     ) -> Result<(), BrokerError> {
+        let command = self.requeue_command(channel, id, available_at_ms)?;
+        self.persist_channel_buffered(channel, command)
+    }
+
+    fn requeue_command(
+        &self,
+        channel: &str,
+        id: u64,
+        available_at_ms: i64,
+    ) -> Result<ChannelCommand, BrokerError> {
         let runtime = self
             .channels
             .get(channel)
@@ -108,15 +135,12 @@ impl Topic {
             .in_flight_position(id)
             .ok_or(BrokerError::MessageNotInFlight)?;
         let attempts = runtime.state.delivery_attempts(position);
-        self.persist_channel(
-            channel,
-            ChannelCommand::Requeue {
-                position,
-                message_id: id,
-                available_at_ms,
-                attempts,
-            },
-        )
+        Ok(ChannelCommand::Requeue {
+            position,
+            message_id: id,
+            available_at_ms,
+            attempts,
+        })
     }
 
     pub fn touch(&mut self, channel: &str, id: u64, timeout: Duration) -> Result<(), BrokerError> {

@@ -1,16 +1,19 @@
 use crate::model::MessageMeta;
 use crate::BrokerError;
+use bytes::Bytes;
 use rustqueue_storage::{PayloadRef, Record, RecordLocation, HEADER_LEN};
 use std::sync::Arc;
 
 const ITEM_HEADER: usize = 20;
 
-pub(crate) struct EncodedBatch {
-    pub payload: Vec<u8>,
+pub(crate) struct EncodedBatch<'a> {
+    count: [u8; 4],
+    bodies: &'a [Bytes],
     pub entries: Vec<EncodedEntry>,
 }
 
 pub(crate) struct EncodedEntry {
+    header: [u8; ITEM_HEADER],
     pub position: u64,
     pub id: u64,
     pub body_offset: usize,
@@ -18,31 +21,25 @@ pub(crate) struct EncodedEntry {
     pub crc32c: u32,
 }
 
-pub(crate) fn encode<B: AsRef<[u8]>>(
+pub(crate) fn encode(
     first_position: u64,
     first_id: u64,
-    bodies: &[B],
-) -> Result<EncodedBatch, BrokerError> {
-    let capacity = 4usize.saturating_add(
-        bodies
-            .iter()
-            .map(|body| ITEM_HEADER + body.as_ref().len())
-            .sum::<usize>(),
-    );
-    let mut payload = Vec::with_capacity(capacity);
-    payload.extend_from_slice(&(bodies.len() as u32).to_be_bytes());
+    bodies: &[Bytes],
+) -> Result<EncodedBatch<'_>, BrokerError> {
     let mut entries = Vec::with_capacity(bodies.len());
+    let mut payload_offset = 4usize;
     for (ordinal, body) in bodies.iter().enumerate() {
-        let body = body.as_ref();
         let len = u32::try_from(body.len()).map_err(|_| BrokerError::MessageTooLarge)?;
         let position = first_position.saturating_add(ordinal as u64);
         let id = first_id.saturating_add(ordinal as u64);
-        payload.extend_from_slice(&position.to_be_bytes());
-        payload.extend_from_slice(&id.to_be_bytes());
-        payload.extend_from_slice(&len.to_be_bytes());
-        let body_offset = payload.len();
-        payload.extend_from_slice(body);
+        let mut header = [0u8; ITEM_HEADER];
+        header[0..8].copy_from_slice(&position.to_be_bytes());
+        header[8..16].copy_from_slice(&id.to_be_bytes());
+        header[16..20].copy_from_slice(&len.to_be_bytes());
+        let body_offset = payload_offset.saturating_add(ITEM_HEADER);
+        payload_offset = body_offset.saturating_add(body.len());
         entries.push(EncodedEntry {
+            header,
             position,
             id,
             body_offset,
@@ -50,7 +47,23 @@ pub(crate) fn encode<B: AsRef<[u8]>>(
             crc32c: crc32c::crc32c(body),
         });
     }
-    Ok(EncodedBatch { payload, entries })
+    Ok(EncodedBatch {
+        count: (bodies.len() as u32).to_be_bytes(),
+        bodies,
+        entries,
+    })
+}
+
+impl EncodedBatch<'_> {
+    pub fn parts(&self) -> Vec<&[u8]> {
+        let mut parts = Vec::with_capacity(1 + self.entries.len() * 2);
+        parts.push(self.count.as_slice());
+        for (entry, body) in self.entries.iter().zip(self.bodies) {
+            parts.push(entry.header.as_slice());
+            parts.push(body.as_ref());
+        }
+        parts
+    }
 }
 
 pub(crate) fn metas(
@@ -119,7 +132,7 @@ pub(crate) fn metas_after_append(
     timestamp_ns: i64,
     available_at_ms: i64,
     location: &RecordLocation,
-    batch: &EncodedBatch,
+    batch: &EncodedBatch<'_>,
 ) -> Vec<MessageMeta> {
     batch
         .entries
@@ -138,4 +151,19 @@ pub(crate) fn metas_after_append(
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encoded_batch_borrows_message_bodies() {
+        let body = Bytes::from(vec![0x5a; 1024]);
+        let batch = encode(1, 2, std::slice::from_ref(&body)).unwrap();
+        let parts = batch.parts();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[2].as_ptr(), body.as_ptr());
+        assert_eq!(parts[2].len(), body.len());
+    }
 }

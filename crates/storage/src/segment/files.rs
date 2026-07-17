@@ -79,10 +79,6 @@ pub(super) fn scan_segment(
     Ok((locations, 0, offset, checksum))
 }
 
-pub(super) fn scan_segment_readonly(path: &Path) -> Result<Vec<RecordLocation>, StorageError> {
-    scan_segment(path, false).map(|(locations, _, _, _)| locations)
-}
-
 fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> StorageError {
     StorageError::Corrupt {
         path: path.to_path_buf(),

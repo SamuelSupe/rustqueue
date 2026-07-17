@@ -7,7 +7,9 @@ COPY .docker-bin/rustqueue-discovery /usr/local/bin/rustqueue-discovery
 COPY .docker-bin/rustqueue-proxy /usr/local/bin/rustqueue-proxy
 COPY .docker-bin/rustqueue-bench /usr/local/bin/rustqueue-bench
 COPY .docker-bin/rustqueuectl /usr/local/bin/rustqueuectl
+COPY .docker-bin/rustqueue-console /usr/local/bin/rustqueue-console
+COPY console-ui/dist /usr/share/rustqueue-console
 USER 65532:65532
 WORKDIR /var/lib/rustqueue
-EXPOSE 4150 4151 4161
+EXPOSE 4150 4151 4161 4180
 ENTRYPOINT ["/usr/local/bin/rustqueued"]

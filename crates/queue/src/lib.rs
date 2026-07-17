@@ -3,6 +3,8 @@ mod broker;
 mod channel;
 mod channel_store;
 mod eviction;
+mod management;
+mod management_ops;
 mod metadata;
 mod model;
 mod outbox;
@@ -12,8 +14,13 @@ mod topic;
 
 pub use broker::{Broker, BrokerConfig, BrokerError};
 pub use eviction::ProtectiveEviction;
+pub use management::{
+    ChannelFence, ChannelManagementAction, ManagementFenceSnapshot, ManagementResult,
+    TopicManagementAction,
+};
 pub use model::{
-    BrokerLatencyStats, BrokerStats, ChannelStats, Delivery, PublishGroupCommitStats, TopicStats,
+    BrokerLatencyStats, BrokerStats, ChannelGroupCommitStats, ChannelStats, Delivery,
+    PublishGroupCommitStats, TopicStats,
 };
 
 #[doc(hidden)]

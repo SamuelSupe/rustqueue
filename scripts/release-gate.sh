@@ -9,6 +9,8 @@ make fmt
 make check
 make test
 make clippy
+make console-ui-check
+make console-ui-build
 make helm-lint
 make helm-template
 FUZZ_SECONDS="$FUZZ_SECONDS" ./scripts/fuzz-smoke.sh
@@ -23,6 +25,7 @@ if [[ "$K8S_ACCEPTANCE" == "1" ]]; then
     exit 1
   }
   make k8s-acceptance
+  make k8s-console-management-acceptance
   make k8s-multi-acceptance
 fi
 

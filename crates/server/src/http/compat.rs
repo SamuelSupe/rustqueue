@@ -25,8 +25,13 @@ pub(super) async fn publish(
 ) -> Result<&'static str, ApiError> {
     authorize(&headers, state.publish_token.as_deref(), "publish")?;
     validate_defer(query.defer, &state.config)?;
-    let (body, _reservation) =
-        read_publish_body(&state, request, state.config.queue.max_message_bytes).await?;
+    let (body, _reservation) = read_publish_body(
+        &state,
+        request,
+        state.config.queue.max_message_bytes,
+        crate::admission::PublishShape::Single,
+    )
+    .await?;
     if body.is_empty() {
         return Err(ApiError::bad_request("E_BAD_MESSAGE", "message is empty"));
     }
@@ -51,8 +56,13 @@ pub(super) async fn multi_publish(
 ) -> Result<&'static str, ApiError> {
     authorize(&headers, state.publish_token.as_deref(), "publish")?;
     validate_defer(query.defer, &state.config)?;
-    let (body, _reservation) =
-        read_publish_body(&state, request, state.config.limits.max_body_bytes).await?;
+    let (body, _reservation) = read_publish_body(
+        &state,
+        request,
+        state.config.limits.max_body_bytes,
+        crate::admission::PublishShape::Multi,
+    )
+    .await?;
     let messages = if query.binary {
         parse_binary_mpub(body, state.config.queue.max_message_bytes)?
     } else {
@@ -144,7 +154,10 @@ pub(super) async fn nodes(State(state): State<AppState>) -> Json<Value> {
 
 pub(super) async fn metrics_handler(State(state): State<AppState>) -> Response {
     let mut output = state.metrics.render();
-    output.push_str(&crate::metrics::render_broker(&state.broker.stats()));
+    output.push_str(&crate::metrics::render_broker(
+        &state.broker.stats(),
+        &state.config.metrics,
+    ));
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         output,

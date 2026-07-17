@@ -21,6 +21,7 @@ pub struct Config {
     pub queue: QueueConfig,
     pub security: SecurityConfig,
     pub limits: LimitsConfig,
+    pub metrics: MetricsConfig,
     pub shutdown: ShutdownConfig,
     pub log_format: String,
 }
@@ -51,6 +52,7 @@ pub struct StorageConfig {
     pub feature_level: u32,
     pub max_segment_bytes: u64,
     pub scrub_interval_seconds: u64,
+    pub scrub_bytes_per_second: u64,
     pub entry_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
@@ -70,6 +72,9 @@ pub struct QueueConfig {
     pub max_defer_ms: u64,
     pub max_ack_gap: usize,
     pub max_backlog_messages: usize,
+    pub max_topics: usize,
+    pub max_publish_workers: usize,
+    pub publish_worker_idle_seconds: u64,
     pub bootstrap_retention_seconds: u64,
     pub message_retention_seconds: u64,
     pub max_delivery_attempts: u16,
@@ -84,6 +89,8 @@ pub struct SecurityConfig {
     pub admin_token_file: Option<PathBuf>,
     pub publish_token_file: Option<PathBuf>,
     pub registry_token_file: Option<PathBuf>,
+    pub console_token_file: Option<PathBuf>,
+    pub console_management_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -120,6 +127,13 @@ pub struct LimitsConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct MetricsConfig {
+    pub detailed_queue_metrics: bool,
+    pub max_detailed_series: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ShutdownConfig {
     pub grace_seconds: u64,
 }
@@ -133,6 +147,7 @@ impl Default for Config {
             queue: QueueConfig::default(),
             security: SecurityConfig::default(),
             limits: LimitsConfig::default(),
+            metrics: MetricsConfig::default(),
             shutdown: ShutdownConfig::default(),
             log_format: "text".into(),
         }
@@ -169,6 +184,7 @@ impl Default for StorageConfig {
             feature_level: rustqueue_storage::BASE_STORAGE_FEATURE_LEVEL,
             max_segment_bytes: 100 * 1024 * 1024,
             scrub_interval_seconds: 3600,
+            scrub_bytes_per_second: 64 * 1024 * 1024,
             entry_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
@@ -190,6 +206,9 @@ impl Default for QueueConfig {
             max_defer_ms: 60 * 60_000,
             max_ack_gap: 65_536,
             max_backlog_messages: 10_000_000,
+            max_topics: 10_000,
+            max_publish_workers: 1_024,
+            publish_worker_idle_seconds: 60,
             bootstrap_retention_seconds: 30,
             message_retention_seconds: 0,
             max_delivery_attempts: 16,
@@ -215,7 +234,7 @@ impl Default for LimitsConfig {
         Self {
             max_body_bytes: MAX_SUPPORTED_BATCH_BYTES,
             node_publish_inflight_bytes: 512 * 1024 * 1024,
-            connection_publish_inflight_bytes: MAX_SUPPORTED_BATCH_BYTES,
+            connection_publish_inflight_bytes: 80 * 1024 * 1024,
             max_rdy_count: 2500,
             max_connections: 10_000,
             client_handshake_timeout_ms: 5_000,
@@ -237,6 +256,15 @@ impl Default for LimitsConfig {
 impl Default for ShutdownConfig {
     fn default() -> Self {
         Self { grace_seconds: 30 }
+    }
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            detailed_queue_metrics: false,
+            max_detailed_series: 1_000,
+        }
     }
 }
 
@@ -270,7 +298,12 @@ impl Config {
         if self.queue.bootstrap_retention_seconds == 0 {
             bail!("queue.bootstrap_retention_seconds must be greater than zero");
         }
-        if self.queue.max_ack_gap == 0 || self.queue.max_backlog_messages == 0 {
+        if self.queue.max_ack_gap == 0
+            || self.queue.max_backlog_messages == 0
+            || self.queue.max_topics == 0
+            || self.queue.max_publish_workers == 0
+            || self.queue.publish_worker_idle_seconds == 0
+        {
             bail!("queue limits must be greater than zero");
         }
         if self.queue.max_delivery_attempts == 0 {
@@ -299,6 +332,7 @@ impl Config {
             );
         }
         if self.storage.scrub_interval_seconds == 0
+            || self.storage.scrub_bytes_per_second == 0
             || self.storage.entry_cache_bytes == 0
             || self.storage.payload_read_queue == 0
         {
@@ -314,6 +348,9 @@ impl Config {
         }
         if self.shutdown.grace_seconds == 0 {
             bail!("shutdown.grace_seconds must be greater than zero");
+        }
+        if self.metrics.max_detailed_series == 0 {
+            bail!("metrics.max_detailed_series must be greater than zero");
         }
         self.validate_protocol_limits()?;
         if !matches!(self.log_format.as_str(), "text" | "json") {
@@ -333,6 +370,7 @@ impl Config {
             self.security.admin_token_file.as_ref(),
             self.security.publish_token_file.as_ref(),
             self.security.registry_token_file.as_ref(),
+            self.security.console_token_file.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -340,6 +378,9 @@ impl Config {
             if !path.is_file() {
                 bail!("secret file {} is not readable", path.display());
             }
+        }
+        if self.security.console_management_enabled && self.security.console_token_file.is_none() {
+            bail!("security.console_token_file is required when console management is enabled");
         }
         Ok(())
     }
@@ -355,6 +396,9 @@ impl Config {
     }
     pub fn read_registry_token(&self) -> anyhow::Result<Option<String>> {
         read_optional_secret(self.security.registry_token_file.as_deref())
+    }
+    pub fn read_console_token(&self) -> anyhow::Result<Option<String>> {
+        read_optional_secret(self.security.console_token_file.as_deref())
     }
 }
 

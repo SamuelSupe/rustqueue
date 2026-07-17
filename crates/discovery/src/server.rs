@@ -23,6 +23,7 @@ pub fn router(directory: Directory) -> Router {
         .route("/topics", get(topics))
         .route("/channels", get(channels))
         .route("/nodes", get(nodes))
+        .route("/v1/publishers/head", get(publishers_head))
         .route("/v1/publishers", get(publishers))
         .route("/v1/health", get(health))
         .route("/metrics", get(prometheus))
@@ -96,7 +97,17 @@ async fn nodes(State(directory): State<Directory>) -> Json<Value> {
 }
 
 async fn publishers(State(directory): State<Directory>) -> Json<Value> {
-    Json(json!({"producers": directory.publishers()}))
+    Json(json!({
+        "revision": directory.revision(),
+        "producers": directory.publishers(),
+    }))
+}
+
+async fn publishers_head(State(directory): State<Directory>) -> Json<Value> {
+    Json(json!({
+        "revision": directory.revision(),
+        "broker_count": directory.publisher_count(),
+    }))
 }
 
 async fn health(State(directory): State<Directory>) -> Json<Value> {

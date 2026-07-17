@@ -1,4 +1,5 @@
 use super::{Config, MAX_SUPPORTED_BATCH_BYTES};
+use crate::admission::{working_set_bytes, PublishShape};
 use anyhow::bail;
 
 impl Config {
@@ -7,11 +8,12 @@ impl Config {
         {
             bail!("limits.max_body_bytes must be in 1..={MAX_SUPPORTED_BATCH_BYTES}");
         }
-        if self.limits.connection_publish_inflight_bytes < self.limits.max_body_bytes
+        if self.limits.connection_publish_inflight_bytes
+            < working_set_bytes(self.limits.max_body_bytes, PublishShape::Multi)
             || self.limits.node_publish_inflight_bytes
                 < self.limits.connection_publish_inflight_bytes
         {
-            bail!("publish inflight limits must satisfy max_body_bytes <= connection <= node");
+            bail!("publish inflight limits must fit the encoded working set and satisfy connection <= node");
         }
         if self.limits.client_handshake_timeout_ms == 0 || self.limits.auth_cache_max_entries == 0 {
             bail!("limits handshake timeout and auth cache size must be greater than zero");

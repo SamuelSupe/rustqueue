@@ -12,6 +12,10 @@
 deploy/dev-certs/
 deploy/generated/
 benchmarks/results/
+/console-ui/node_modules/
+/console-ui/dist/
+/console-ui/*.tsbuildinfo
+/.pnpm-store/
 .DS_Store
 /.workflow/
 /README 2.md
