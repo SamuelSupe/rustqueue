@@ -1,6 +1,6 @@
 use crate::backend::BackendPool;
 use crate::metrics::ProxyMetrics;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -11,6 +11,8 @@ use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+
+const MAX_BACKEND_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ProxyState {
@@ -134,10 +136,10 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
 async fn backend_response(response: reqwest::Response) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
-    let body = match response.bytes().await {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::debug!(%error, "backend response body failed");
+    let body = match read_body_bounded(response, MAX_BACKEND_RESPONSE_BYTES).await {
+        Some(body) => body,
+        None => {
+            tracing::debug!("backend response body failed or exceeded its limit");
             return unavailable();
         }
     };
@@ -150,6 +152,23 @@ async fn backend_response(response: reqwest::Response) -> Response {
     output
         .body(Body::from(body))
         .unwrap_or_else(|_| unavailable())
+}
+
+async fn read_body_bounded(mut response: reqwest::Response, maximum: usize) -> Option<Bytes> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if body.len().saturating_add(chunk.len()) > maximum {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(Bytes::from(body))
 }
 
 fn unavailable() -> Response {

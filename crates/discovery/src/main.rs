@@ -24,6 +24,12 @@ struct Cli {
     address: SocketAddr,
     #[arg(long, env = "RUSTQUEUE_BROKER_HTTP_PORT", default_value_t = 4151)]
     broker_http_port: u16,
+    #[arg(
+        long,
+        env = "RUSTQUEUE_ENDPOINT_SLICE_TIMEOUT_MS",
+        default_value_t = 1500
+    )]
+    endpoint_slice_timeout_ms: u64,
     #[arg(long, env = "RUSTQUEUE_REGISTRY_TOKEN_FILE")]
     registry_token_file: Option<PathBuf>,
 }
@@ -37,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    if cli.endpoint_slice_timeout_ms == 0 {
+        anyhow::bail!("EndpointSlice timeout must be greater than zero");
+    }
     let token = cli
         .registry_token_file
         .map(std::fs::read_to_string)
@@ -50,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
             service_name: cli.broker_service,
             fallback_http_port: cli.broker_http_port,
             poll_interval: Duration::from_secs(2),
+            endpoint_slice_timeout: Duration::from_millis(cli.endpoint_slice_timeout_ms),
             stale_after: Duration::from_secs(5),
             registry_token: token,
             max_parallel_polls: 128,

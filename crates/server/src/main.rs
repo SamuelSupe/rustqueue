@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         message_index_cache_bytes: config.storage.message_index_cache_bytes,
         payload_read_workers: config.storage.payload_read_workers,
         payload_read_queue: config.storage.payload_read_queue,
+        delivery_inflight_bytes: config.limits.node_delivery_inflight_bytes,
         scrub_bytes_per_second: config.storage.scrub_bytes_per_second,
         storage_feature_level: config.storage.feature_level,
         require_management_fence_sync: config.security.console_management_enabled,
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
     let metrics = Arc::new(Metrics::default());
     let accepting = Arc::new(AtomicBool::new(true));
+    let delivering = Arc::new(AtomicBool::new(true));
     let publish_admission = Arc::new(PublishAdmission::new(
         config.limits.node_publish_inflight_bytes,
         Arc::clone(&metrics),
@@ -99,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&broker),
         Arc::clone(&metrics),
         Arc::clone(&accepting),
+        Arc::clone(&delivering),
         Arc::clone(&publish_admission),
     ));
     let http_task = tokio::spawn(http::serve(
@@ -106,10 +109,12 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&broker),
         Arc::clone(&metrics),
         Arc::clone(&accepting),
+        Arc::clone(&delivering),
         Arc::clone(&publish_admission),
     ));
     let scrub_task = tokio::spawn(run_scrubber(
         Arc::clone(&broker),
+        std::time::Duration::from_secs(config.storage.maintenance_startup_delay_seconds),
         std::time::Duration::from_secs(config.storage.scrub_interval_seconds),
     ));
     let disk_task = tokio::spawn(disk_guard::run(
@@ -130,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         _ = shutdown_signal() => {
             info!("shutdown signal received");
             accepting.store(false, Ordering::Release);
+            delivering.store(false, Ordering::Release);
             let deadline = tokio::time::Instant::now()
                 + std::time::Duration::from_secs(config.shutdown.grace_seconds);
             while metrics.tcp_connections.load(Ordering::Acquire) > 0
@@ -159,7 +165,12 @@ async fn monitor_storage_health(broker: Arc<Broker>) -> anyhow::Result<()> {
     }
 }
 
-async fn run_scrubber(broker: Arc<Broker>, interval: std::time::Duration) -> anyhow::Result<()> {
+async fn run_scrubber(
+    broker: Arc<Broker>,
+    startup_delay: std::time::Duration,
+    interval: std::time::Duration,
+) -> anyhow::Result<()> {
+    tokio::time::sleep(startup_delay).await;
     loop {
         let records = broker.scrub().await.context("background queue scrub")?;
         tracing::info!(records, "background data scrub completed");

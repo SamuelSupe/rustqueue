@@ -6,11 +6,13 @@ use std::collections::BTreeMap;
 
 pub fn broker_from_pod(pod: Pod, pvcs: &BTreeMap<String, PvcView>) -> BrokerView {
     let name = pod.name_any();
+    let uid = pod.metadata.uid.clone().unwrap_or_default();
     let status = pod.status.as_ref();
     let container = status
         .and_then(|status| status.container_statuses.as_ref())
         .and_then(|statuses| statuses.iter().find(|status| status.name == "broker"));
     BrokerView {
+        uid,
         pvc: pvcs.get(&format!("data-{name}")).cloned(),
         node_name: pod
             .spec

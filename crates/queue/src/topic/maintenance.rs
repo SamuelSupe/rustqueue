@@ -1,6 +1,6 @@
 use super::*;
 use crate::eviction::{self, ProtectiveEviction};
-use crate::model::TopicStats;
+use crate::model::{QueueAggregateStats, TopicStats};
 use rustqueue_storage::ScrubTarget;
 use std::collections::BTreeSet;
 
@@ -48,6 +48,25 @@ impl Topic {
             segment_count,
             segment_bytes,
             channels,
+        }
+    }
+
+    pub fn add_aggregate_stats(&self, aggregate: &mut QueueAggregateStats) {
+        let last = self.last_position();
+        let (segment_count, segment_bytes) = self.log.storage_usage();
+        aggregate.topic_count = aggregate.topic_count.saturating_add(1);
+        aggregate.message_count = aggregate
+            .message_count
+            .saturating_add(self.messages.total_count());
+        aggregate.segment_count = aggregate.segment_count.saturating_add(segment_count);
+        aggregate.segment_bytes = aggregate.segment_bytes.saturating_add(segment_bytes);
+        for channel in self.channels.values() {
+            let (depth, in_flight, deferred, ack_gap) = channel.state.metric_counts(last);
+            aggregate.channel_count = aggregate.channel_count.saturating_add(1);
+            aggregate.channel_depth = aggregate.channel_depth.saturating_add(depth);
+            aggregate.channel_in_flight = aggregate.channel_in_flight.saturating_add(in_flight);
+            aggregate.channel_deferred = aggregate.channel_deferred.saturating_add(deferred);
+            aggregate.channel_ack_gap = aggregate.channel_ack_gap.saturating_add(ack_gap);
         }
     }
 
@@ -108,8 +127,6 @@ impl Topic {
         retained_paths: &BTreeSet<PathBuf>,
         retained_message_ids: &BTreeSet<u64>,
     ) -> Result<usize, BrokerError> {
-        store_atomic(&self.manifest_path, &self.manifest)?;
-        self.seal_log()?;
         let cutoff =
             now_ns().saturating_sub(bootstrap_retention.as_nanos().min(i64::MAX as u128) as i64);
         let bootstrap_from = self
@@ -135,10 +152,27 @@ impl Topic {
             .min(channel_from)
             .min(in_flight_from)
             .min(outbox_from);
+        if self
+            .messages
+            .active_last_position()
+            .is_some_and(|position| position < retain_from)
+        {
+            self.seal_log()?;
+        }
         let through_index = self.messages.purge_through_log_index(retain_from);
         let Some(through_index) = through_index else {
             return Ok(0);
         };
+        if self
+            .messages
+            .first_purge_path(retain_from)
+            .is_some_and(|path| retained_paths.contains(path))
+        {
+            return Ok(0);
+        }
+        // The manifest position must reach disk before its source segments are
+        // removed, otherwise an empty topic could reuse positions after restart.
+        store_atomic(&self.manifest_path, &self.manifest)?;
         let removed = self
             .log
             .purge_prefix_retaining(through_index, retained_paths)?;
@@ -156,6 +190,13 @@ impl Topic {
         self.log.sync()?;
         store_atomic(&self.manifest_path, &self.manifest)?;
         Ok(())
+    }
+
+    pub fn expire_in_flight(&mut self) -> usize {
+        self.channels
+            .values_mut()
+            .map(|channel| channel.state.expire_in_flight())
+            .sum()
     }
 
     pub fn checkpoint_channels(&mut self) -> Result<(), BrokerError> {

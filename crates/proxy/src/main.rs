@@ -8,6 +8,7 @@ use backend::BackendPool;
 use clap::Parser;
 use metrics::ProxyMetrics;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -46,6 +47,12 @@ struct Cli {
         default_value_t = 10_000
     )]
     max_connections: usize,
+    #[arg(
+        long,
+        env = "RUSTQUEUE_PROXY_TCP_MAX_CONNECTION_AGE_SECONDS",
+        default_value_t = 300
+    )]
+    tcp_max_connection_age_seconds: u64,
 }
 
 #[tokio::main]
@@ -68,7 +75,13 @@ async fn main() -> anyhow::Result<()> {
     let metrics = ProxyMetrics::default();
     tokio::select! {
         result = discovery::run(pool.clone(), cli.discovery_urls, metrics.clone()) => result,
-        result = tcp::serve(cli.tcp_address, pool.clone(), cli.max_connections, metrics.clone()) => result,
+        result = tcp::serve(
+            cli.tcp_address,
+            pool.clone(),
+            cli.max_connections,
+            Duration::from_secs(cli.tcp_max_connection_age_seconds),
+            metrics.clone(),
+        ) => result,
         result = http::serve(cli.http_address, pool, cli.max_body_bytes, cli.max_inflight_bytes, metrics) => result,
     }
 }

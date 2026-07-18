@@ -9,6 +9,8 @@ const WAL_MAGIC: &[u8; 4] = b"RCW7";
 const CHECKPOINT_MAGIC: &[u8; 4] = b"RCC7";
 const HEADER_LEN: usize = 12;
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
+const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RECOVERY_COMMANDS: usize = 2_048;
 const CHECKPOINT_INTERVAL: usize = 1024;
 
 pub(crate) struct ChannelStore {
@@ -195,6 +197,11 @@ pub(crate) fn checkpoint_paths(directory: &Path) -> Result<Vec<PathBuf>, BrokerE
 fn write_checkpoint(path: &Path, checkpoint: &ChannelCheckpoint) -> Result<(), BrokerError> {
     let body = serde_json::to_vec(checkpoint)
         .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
+    if body.len() as u64 > MAX_CHECKPOINT_BYTES {
+        return Err(BrokerError::InvalidRecord(
+            "channel checkpoint exceeds the maximum size".into(),
+        ));
+    }
     let mut bytes = Vec::with_capacity(HEADER_LEN + body.len());
     bytes.extend_from_slice(CHECKPOINT_MAGIC);
     bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -209,6 +216,11 @@ fn write_checkpoint(path: &Path, checkpoint: &ChannelCheckpoint) -> Result<(), B
 }
 
 fn read_checkpoint(path: &Path) -> Result<ChannelCheckpoint, BrokerError> {
+    if fs::metadata(path)?.len() > MAX_CHECKPOINT_BYTES + HEADER_LEN as u64 {
+        return Err(BrokerError::InvalidRecord(
+            "channel checkpoint exceeds the maximum size".into(),
+        ));
+    }
     let bytes = fs::read(path)?;
     parse_checkpoint(&bytes)
 }
@@ -220,7 +232,8 @@ fn parse_checkpoint(bytes: &[u8]) -> Result<ChannelCheckpoint, BrokerError> {
         ));
     }
     let len = u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize;
-    if len != bytes.len() - HEADER_LEN
+    if len as u64 > MAX_CHECKPOINT_BYTES
+        || len != bytes.len() - HEADER_LEN
         || crc32c::crc32c(&bytes[HEADER_LEN..])
             != u32::from_be_bytes(bytes[8..12].try_into().unwrap())
     {
@@ -316,6 +329,11 @@ fn recover_wal(path: &Path) -> Result<Vec<ChannelCommand>, BrokerError> {
             )));
         }
         commands.push(decode_command(&body)?);
+        if commands.len() > MAX_RECOVERY_COMMANDS {
+            return Err(BrokerError::InvalidRecord(
+                "channel WAL contains too many commands without a checkpoint".into(),
+            ));
+        }
         offset = end;
     }
     Ok(commands)
@@ -362,23 +380,23 @@ fn encode_command(command: &ChannelCommand) -> Vec<u8> {
 fn decode_command(body: &[u8]) -> Result<ChannelCommand, BrokerError> {
     let invalid = || BrokerError::InvalidRecord("channel WAL command is invalid".into());
     match body.first().copied() {
-        Some(1) if body.len() >= 17 => Ok(ChannelCommand::Finish {
+        Some(1) if body.len() == 17 => Ok(ChannelCommand::Finish {
             position: u64::from_be_bytes(body[1..9].try_into().unwrap()),
             message_id: u64::from_be_bytes(body[9..17].try_into().unwrap()),
         }),
-        Some(2) if body.len() >= 27 => Ok(ChannelCommand::Requeue {
+        Some(2) if body.len() == 27 => Ok(ChannelCommand::Requeue {
             position: u64::from_be_bytes(body[1..9].try_into().unwrap()),
             message_id: u64::from_be_bytes(body[9..17].try_into().unwrap()),
             available_at_ms: i64::from_be_bytes(body[17..25].try_into().unwrap()),
             attempts: u16::from_be_bytes(body[25..27].try_into().unwrap()),
         }),
-        Some(3) if body.len() >= 2 && body[1] <= 1 => Ok(ChannelCommand::Pause {
+        Some(3) if body.len() == 2 && body[1] <= 1 => Ok(ChannelCommand::Pause {
             paused: body[1] == 1,
         }),
-        Some(4) if body.len() >= 9 => Ok(ChannelCommand::Empty {
+        Some(4) if body.len() == 9 => Ok(ChannelCommand::Empty {
             through_position: u64::from_be_bytes(body[1..9].try_into().unwrap()),
         }),
-        Some(5) if body.len() >= 9 => Ok(ChannelCommand::Evict {
+        Some(5) if body.len() == 9 => Ok(ChannelCommand::Evict {
             through_position: u64::from_be_bytes(body[1..9].try_into().unwrap()),
         }),
         _ => Err(invalid()),
@@ -446,5 +464,16 @@ mod tests {
             ChannelStore::open(&checkpoint, 65_536),
             Err(BrokerError::InvalidRecord(message)) if message.contains("checksum")
         ));
+    }
+
+    #[test]
+    fn command_decoder_rejects_trailing_bytes() {
+        let command = ChannelCommand::Finish {
+            position: 1,
+            message_id: 7,
+        };
+        let mut encoded = encode_command(&command);
+        encoded.push(0);
+        assert!(decode_command(&encoded).is_err());
     }
 }

@@ -206,21 +206,21 @@ async fn reconcile_rollout(
         .as_ref()
         .and_then(|status| status.current_operation.as_ref())
         .filter(|operation| operation.id == id);
-    let waiting_for_human = previous.is_some_and(|operation| {
-        matches!(
-            operation.phase.as_str(),
-            "Paused" | "AwaitingCanaryApproval"
-        )
-    });
     let timed_out = previous
-        .filter(|_| !waiting_for_human)
+        .filter(|operation| rollout_phase_can_timeout(&operation.phase))
         .and_then(|operation| status::elapsed_seconds(&operation.started_at))
         .is_some_and(|elapsed| elapsed >= cluster.spec.rollout.timeout_seconds);
     let previous_image = match previous.and_then(|operation| operation.previous_image.clone()) {
         Some(image) => Some(image),
         None => drain::previous_image(context, cluster, namespace, revision).await?,
     };
-    let progress = if timed_out {
+    let progress = if let Some(failed) = previous.filter(|operation| operation.phase == "Failed") {
+        drain::Progress {
+            target: failed.current_broker.clone(),
+            phase: "Failed",
+            message: failed.message.clone(),
+        }
+    } else if timed_out {
         drain::Progress {
             target: previous.and_then(|operation| operation.current_broker.clone()),
             phase: "Failed",
@@ -267,4 +267,32 @@ async fn reconcile_rollout(
         current_broker: progress.target,
     };
     Ok((phase.into(), progress.message, Some(operation)))
+}
+
+fn rollout_phase_can_timeout(phase: &str) -> bool {
+    !matches!(
+        phase,
+        "Completed" | "Failed" | "Blocked" | "Paused" | "AwaitingCanaryApproval"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_and_human_gated_rollouts_never_time_out() {
+        for phase in [
+            "Completed",
+            "Failed",
+            "Blocked",
+            "Paused",
+            "AwaitingCanaryApproval",
+        ] {
+            assert!(!rollout_phase_can_timeout(phase), "{phase}");
+        }
+        for phase in ["Draining", "Replacing", "WaitingForReady"] {
+            assert!(rollout_phase_can_timeout(phase), "{phase}");
+        }
+    }
 }

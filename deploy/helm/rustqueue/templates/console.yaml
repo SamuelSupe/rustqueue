@@ -112,6 +112,8 @@ spec:
               value: /run/secrets/rustqueue/console-token
             - name: RUSTQUEUE_CONSOLE_POLL_SECONDS
               value: {{ .Values.console.pollIntervalSeconds | quote }}
+            - name: RUSTQUEUE_CONSOLE_CATALOG_REFRESH_SECONDS
+              value: {{ .Values.console.catalogRefreshIntervalSeconds | quote }}
             - name: RUSTQUEUE_CONSOLE_HISTORY_MINUTES
               value: {{ .Values.console.historyMinutes | quote }}
             - name: RUSTQUEUE_CONSOLE_MANAGEMENT_ENABLED

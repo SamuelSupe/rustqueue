@@ -54,6 +54,7 @@ impl Broker {
         let handle = retired.remove(name).expect("retired topic still exists");
         drop(handle);
         if directory.exists() {
+            self.inner.payload_reader.invalidate_under(&directory);
             std::fs::remove_dir_all(directory)?;
         }
         std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
@@ -70,6 +71,8 @@ impl Broker {
         if Arc::strong_count(&handle) == 1
             && !self.inner.payload_reader.has_active_under(&directory)
         {
+            self.inner.payload_reader.invalidate_under(&directory);
+            drop(handle);
             std::fs::remove_dir_all(directory)?;
             std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
         } else {

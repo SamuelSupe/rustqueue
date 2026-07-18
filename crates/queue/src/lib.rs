@@ -2,6 +2,8 @@ mod batch;
 mod broker;
 mod channel;
 mod channel_store;
+mod delivery_budget;
+mod delivery_guard;
 mod eviction;
 mod management;
 mod management_ops;
@@ -13,6 +15,8 @@ mod telemetry;
 mod topic;
 
 pub use broker::{Broker, BrokerConfig, BrokerError};
+pub use delivery_budget::DeliveryHold;
+pub use delivery_guard::DeliveryGuard;
 pub use eviction::ProtectiveEviction;
 pub use management::{
     ChannelFence, ChannelManagementAction, ManagementFenceSnapshot, ManagementResult,
@@ -20,7 +24,7 @@ pub use management::{
 };
 pub use model::{
     BrokerLatencyStats, BrokerStats, ChannelGroupCommitStats, ChannelStats, Delivery,
-    PublishGroupCommitStats, TopicStats,
+    DeliveryBatch, DeliveryBudgetStats, PublishGroupCommitStats, QueueAggregateStats, TopicStats,
 };
 
 #[doc(hidden)]

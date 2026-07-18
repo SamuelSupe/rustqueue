@@ -11,6 +11,39 @@ pub struct Delivery {
     pub body: Arc<[u8]>,
 }
 
+pub struct DeliveryBatch {
+    deliveries: Vec<Delivery>,
+    guard: crate::delivery_guard::DeliveryGuard,
+}
+
+impl DeliveryBatch {
+    pub(crate) fn new(
+        deliveries: Vec<Delivery>,
+        guard: crate::delivery_guard::DeliveryGuard,
+    ) -> Self {
+        Self { deliveries, guard }
+    }
+
+    pub fn into_parts(mut self) -> (Vec<Delivery>, crate::delivery_guard::DeliveryGuard) {
+        (
+            std::mem::take(&mut self.deliveries),
+            std::mem::take(&mut self.guard),
+        )
+    }
+
+    pub(crate) fn into_deliveries(mut self) -> Vec<Delivery> {
+        self.guard.accept_all();
+        std::mem::take(&mut self.deliveries)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DeliveryBudgetStats {
+    pub in_flight_bytes: u64,
+    pub waiters: u64,
+    pub waits_total: u64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct MessageMeta {
     pub position: u64,
@@ -28,7 +61,42 @@ pub struct BrokerStats {
     pub channel_group_commit: ChannelGroupCommitStats,
     #[serde(default)]
     pub latency: BrokerLatencyStats,
+    #[serde(default)]
+    pub delivery_budget: DeliveryBudgetStats,
+    #[serde(default)]
+    pub aggregate: QueueAggregateStats,
     pub topics: Vec<TopicStats>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct QueueAggregateStats {
+    pub topic_count: u64,
+    pub message_count: u64,
+    pub segment_count: u64,
+    pub segment_bytes: u64,
+    pub channel_count: u64,
+    pub channel_depth: u64,
+    pub channel_in_flight: u64,
+    pub channel_deferred: u64,
+    pub channel_ack_gap: u64,
+}
+
+impl QueueAggregateStats {
+    pub(crate) fn add_topic(&mut self, topic: &TopicStats) {
+        self.topic_count = self.topic_count.saturating_add(1);
+        self.message_count = self.message_count.saturating_add(topic.message_count);
+        self.segment_count = self.segment_count.saturating_add(topic.segment_count);
+        self.segment_bytes = self.segment_bytes.saturating_add(topic.segment_bytes);
+        for channel in &topic.channels {
+            self.channel_count = self.channel_count.saturating_add(1);
+            self.channel_depth = self.channel_depth.saturating_add(channel.depth);
+            self.channel_in_flight = self
+                .channel_in_flight
+                .saturating_add(channel.in_flight_count);
+            self.channel_deferred = self.channel_deferred.saturating_add(channel.deferred_count);
+            self.channel_ack_gap = self.channel_ack_gap.saturating_add(channel.ack_gap);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

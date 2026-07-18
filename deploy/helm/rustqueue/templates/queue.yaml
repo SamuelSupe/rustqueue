@@ -16,6 +16,9 @@ spec:
   storageSize: {{ .Values.queue.storageSize | quote }}
   storageFeatureLevel: {{ .Values.queue.storageFeatureLevel }}
   messageIndexCacheBytes: {{ .Values.queue.messageIndexCacheBytes | int64 }}
+  maintenanceStartupDelaySeconds: {{ .Values.queue.maintenanceStartupDelaySeconds | int64 }}
+  nodeDeliveryInflightBytes: {{ .Values.queue.nodeDeliveryInflightBytes | int64 }}
+  connectionDeliveryInflightBytes: {{ .Values.queue.connectionDeliveryInflightBytes | int64 }}
   minFreeBytes: {{ .Values.queue.minFreeBytes | int64 }}
   diskHighWatermarkPercent: {{ .Values.queue.diskHighWatermarkPercent }}
   diskLowWatermarkPercent: {{ .Values.queue.diskLowWatermarkPercent }}
@@ -32,6 +35,7 @@ spec:
   discoveryReplicas: {{ .Values.queue.discoveryReplicas }}
   proxyNodeSelector:
     {{- toYaml .Values.queue.proxyNodeSelector | nindent 4 }}
+  proxyTcpMaxConnectionAgeSeconds: {{ .Values.queue.proxyTcpMaxConnectionAgeSeconds | int64 }}
   rollout:
     paused: {{ .Values.queue.rollout.paused }}
     requireCanaryApproval: {{ .Values.queue.rollout.requireCanaryApproval }}

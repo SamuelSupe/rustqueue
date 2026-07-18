@@ -29,20 +29,14 @@ pub async fn apply_owner(
     };
     let path = format!("/v1/manage/{resource}/{}", operation.action);
     let (broker, revision) = target(snapshot, operation.owner)?;
-    post(
-        state,
-        &token,
-        &broker,
-        &path,
-        json!({
-            "operation_id": operation.operation_id,
-            "topic": operation.topic,
-            "channel": operation.channel,
-            "expected_revision": revision,
-            "tombstone_until_ms": operation.tombstone_until_ms,
-        }),
-    )
-    .await
+    let body = json!({
+        "operation_id": operation.operation_id,
+        "topic": operation.topic,
+        "channel": operation.channel,
+        "expected_revision": revision,
+        "tombstone_until_ms": operation.tombstone_until_ms,
+    });
+    post(state, &token, &broker, &path, &body).await
 }
 
 pub async fn sync_fences(state: &AppState, snapshot: &Snapshot) -> Result<(), ManagementError> {
@@ -54,19 +48,21 @@ pub async fn sync_fences(state: &AppState, snapshot: &Snapshot) -> Result<(), Ma
     )
     .await
     .map_err(|error| ManagementError::unavailable(error.to_string()))?;
-    let fences = serde_json::to_value(managed.fences())
-        .map_err(|error| ManagementError::internal(error.to_string()))?;
+    let fences = Arc::new(
+        serde_json::to_value(managed.fences())
+            .map_err(|error| ManagementError::internal(error.to_string()))?,
+    );
     stream::iter(snapshot.brokers.clone())
         .map(|broker| {
             let token = Arc::clone(&token);
-            let fences = fences.clone();
+            let fences = Arc::clone(&fences);
             async move {
                 post(
                     state,
                     token.as_ref(),
                     &broker,
                     "/v1/manage/fences/sync",
-                    fences,
+                    fences.as_ref(),
                 )
                 .await
             }
@@ -114,7 +110,7 @@ async fn post(
     token: &str,
     broker: &BrokerView,
     path: &str,
-    body: serde_json::Value,
+    body: &serde_json::Value,
 ) -> Result<(), ManagementError> {
     if broker.pod_ip.is_empty() {
         return Err(ManagementError::unavailable(format!(
@@ -130,7 +126,7 @@ async fn post(
         ))
         .bearer_auth(token)
         .timeout(Duration::from_secs(15))
-        .json(&body)
+        .json(body)
         .send()
         .await
         .map_err(|error| ManagementError::unavailable(format!("{}: {error}", broker.name)))?;
@@ -138,7 +134,7 @@ async fn post(
         return Ok(());
     }
     let status = response.status();
-    let detail = response.text().await.unwrap_or_default();
+    let detail = read_text_bounded(response, 64 * 1024).await;
     if status.as_u16() == 409 {
         Err(ManagementError::conflict(
             "E_BROKER_STATE_DRIFT",
@@ -155,4 +151,15 @@ async fn post(
             broker.name
         )))
     }
+}
+
+async fn read_text_bounded(mut response: reqwest::Response, maximum: usize) -> String {
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return "response body exceeded its limit".into();
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }

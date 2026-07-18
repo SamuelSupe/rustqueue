@@ -62,6 +62,26 @@ func main() {
 		fmt.Println("go discovery lookup compatibility: ok")
 		return
 	}
+	if mode == "lookup-default-bootstrap" {
+		if len(os.Args) != 5 {
+			log.Fatal("lookup-default-bootstrap mode requires lookup HTTP, seed Broker HTTP, and new-owner Broker HTTP addresses")
+		}
+		if err := runDefaultLookupBootstrap(os.Args[2], os.Args[3], os.Args[4]); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("go default lookup bootstrap retention: ok")
+		return
+	}
+	if mode == "proxy-rotation" {
+		if len(os.Args) != 4 {
+			log.Fatal("proxy-rotation mode requires proxy TCP and lookup HTTP addresses")
+		}
+		if err := runProxyRotation(os.Args[2], os.Args[3]); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("go producer proxy connection rotation: ok")
+		return
+	}
 	if mode == "consume-one" {
 		if len(os.Args) != 6 {
 			log.Fatal("consume-one mode requires NSQD address, topic, channel, and expected body")

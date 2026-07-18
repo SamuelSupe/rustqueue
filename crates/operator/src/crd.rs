@@ -31,6 +31,12 @@ pub struct RustQueueSpec {
     pub storage_feature_level: u32,
     #[serde(default = "default_message_index_cache_bytes")]
     pub message_index_cache_bytes: usize,
+    #[serde(default = "default_maintenance_startup_delay")]
+    pub maintenance_startup_delay_seconds: u64,
+    #[serde(default = "default_node_delivery_inflight_bytes")]
+    pub node_delivery_inflight_bytes: usize,
+    #[serde(default = "default_connection_delivery_inflight_bytes")]
+    pub connection_delivery_inflight_bytes: usize,
     #[serde(default = "default_min_free_bytes")]
     pub min_free_bytes: u64,
     #[serde(default = "default_disk_high_watermark")]
@@ -63,6 +69,8 @@ pub struct RustQueueSpec {
     pub client_tls_secret_name: Option<String>,
     #[serde(default)]
     pub proxy_node_selector: BTreeMap<String, String>,
+    #[serde(default = "default_proxy_tcp_connection_age")]
+    pub proxy_tcp_max_connection_age_seconds: u64,
     #[serde(default = "default_discovery_replicas")]
     pub discovery_replicas: i32,
     #[serde(default)]
@@ -254,13 +262,25 @@ fn default_disk_pressure_grace() -> u64 {
     60
 }
 fn default_bootstrap_retention() -> u64 {
-    30
+    90
+}
+fn default_proxy_tcp_connection_age() -> u64 {
+    300
 }
 fn default_max_message_bytes() -> usize {
     20 * 1024 * 1024
 }
 fn default_message_index_cache_bytes() -> usize {
     64 * 1024 * 1024
+}
+fn default_maintenance_startup_delay() -> u64 {
+    30
+}
+fn default_node_delivery_inflight_bytes() -> usize {
+    512 * 1024 * 1024
+}
+fn default_connection_delivery_inflight_bytes() -> usize {
+    32 * 1024 * 1024
 }
 fn default_max_topics() -> usize {
     10_000
@@ -300,6 +320,9 @@ mod tests {
         let crd = serde_json::to_value(RustQueue::crd()).unwrap();
         let schema = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
         assert!(schema.to_string().contains("eligibleNodeSelector"));
+        assert!(schema
+            .to_string()
+            .contains("proxyTcpMaxConnectionAgeSeconds"));
         assert!(!schema.to_string().contains("replicationFactor"));
         assert!(!schema.to_string().contains("cell"));
     }

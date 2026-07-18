@@ -154,8 +154,12 @@ pub(super) async fn nodes(State(state): State<AppState>) -> Json<Value> {
 
 pub(super) async fn metrics_handler(State(state): State<AppState>) -> Response {
     let mut output = state.metrics.render();
+    let queue_stats = state.broker.metrics_stats(
+        state.config.metrics.detailed_queue_metrics,
+        state.config.metrics.max_detailed_series,
+    );
     output.push_str(&crate::metrics::render_broker(
-        &state.broker.stats(),
+        &queue_stats,
         &state.config.metrics,
     ));
     (

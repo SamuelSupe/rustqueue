@@ -23,6 +23,8 @@ entry_cache_bytes = 67108864
 message_index_cache_bytes = 67108864
 payload_read_workers = 0
 payload_read_queue = 4096
+# Keep recovery/readiness clear of immediate full-volume maintenance I/O.
+maintenance_startup_delay_seconds = 30
 disk_high_watermark_percent = 85
 disk_low_watermark_percent = 75
 min_free_bytes = 10737418240
@@ -42,7 +44,7 @@ max_topics = 10000
 max_publish_workers = 1024
 publish_worker_idle_seconds = 60
 # Lets consumers discover a newly owning broker without losing the first messages.
-bootstrap_retention_seconds = 30
+bootstrap_retention_seconds = 90
 message_retention_seconds = 0
 max_delivery_attempts = 16
 dead_letter_suffix = ".DLQ"
@@ -51,6 +53,9 @@ dead_letter_suffix = ".DLQ"
 max_body_bytes = 67108864
 node_publish_inflight_bytes = 536870912
 connection_publish_inflight_bytes = 83886080
+# Payload bodies held by slow consumers are bounded separately from the read cache.
+node_delivery_inflight_bytes = 536870912
+connection_delivery_inflight_bytes = 33554432
 max_rdy_count = 2500
 max_connections = 10000
 client_handshake_timeout_ms = 5000

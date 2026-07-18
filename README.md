@@ -35,8 +35,9 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 - Delivery is at least once. A restart redelivers messages without durable FIN.
 - The broker PVC is the only copy; permanent PVC loss loses its messages.
 - Topics and channels are broker-local. Lookup consumers union all owners.
-- Messages are retained for 30 seconds before a channel exists so discovery and
-  `SUB` can catch a newly selected owner without a normal-path miss.
+- Messages are retained for 90 seconds before a channel exists. This covers the
+  official Go client's default 60-second lookup poll plus its 30% jitter and
+  lets `SUB` catch a newly selected owner without a normal-path miss.
 - The stable v7 wire limit is 32 MiB; the default single-message limit is
   20 MiB and the default MPUB body limit is 64 MiB.
 - Publish bodies are written to the segment with vectored header/metadata/body
@@ -47,16 +48,23 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   Broker cache. Publish admission is therefore governed by the configured PVC
   watermarks, not by an arbitrary number of messages.
 - GC locates retention boundaries by monotonic indexes instead of rescanning a
-  full backlog every five seconds. Scrub snapshots immutable files under the
-  Topic lock, then verifies them lock-free with a default 64 MiB/s I/O limit.
+  full backlog every five seconds. A normal tick rotates across at most 128
+  Topics, and it seals an active segment only when that whole tail is already
+  reclaimable. Scrub snapshots immutable files under the Topic lock, then
+  verifies them lock-free with a default 64 MiB/s I/O limit.
+- Slow consumers share a 512 MiB node-wide delivery working-set budget; each
+  connection can request at most 32 MiB of payload. Cache misses charge both the
+  file-read buffer and delivered body before I/O, and cancelled reads return
+  their memory permits and in-flight reservations.
 
 ## Components
 
 - `rustqueued`: local durable NSQ broker and HTTP management API.
 - `rustqueue-discovery`: stateless EndpointSlice-derived lookup service with
   incremental topic/channel indexes and revision-head registry polling.
-- `rustqueue-proxy`: bounded producer TCP/HTTP proxy; TCP is connection-pinned
-  and new connections choose a least-active ready Broker.
+- `rustqueue-proxy`: bounded producer TCP/HTTP proxy; new TCP connections choose
+  a least-active ready Broker and are rotated after a jittered five-minute
+  default lifetime so a small long-lived producer pool follows fleet changes.
 - `rustqueue-operator`: creates the StatefulSet, retained PVCs, discovery,
   proxy, RBAC, disruption budgets, PVC expansion and drain-aware one-at-a-time
   rolling updates.
@@ -141,6 +149,12 @@ that trend when its Pod restarts. Topic/Channel management is disabled by
 default; enable it with `--set console.management.enabled=true`. See the [Console security and deployment
 guide](docs/operations/console.md).
 
+Console polls a small observation head every two seconds. It fetches the full
+Topic/Channel catalog only on Broker, registry-revision or management-fence
+changes, with a 30-second fallback refresh. This keeps observation traffic
+bounded by small per-Broker heads instead of transferring every catalog on
+every poll.
+
 Runtime Pods run as UID/GID 65532 with a read-only root filesystem. Broker Pods
 set `fsGroup=65532` and `fsGroupChangePolicy=OnRootMismatch` so dynamically
 provisioned PVCs are writable without an init container.
@@ -220,10 +234,16 @@ can restart it through normal tail recovery. Payload reader leases also prevent
 GC, protective eviction, or topic deletion from racing an active disk read.
 
 The producer proxy defaults to 10,000 simultaneous TCP connections, a 64 MiB
-request-body limit, and a 512 MiB node-wide in-flight HTTP body budget.
+request-body limit, a 512 MiB node-wide in-flight HTTP body budget, and a
+jittered 300-second TCP tunnel lifetime. A zero lifetime disables rotation.
 Override them with `RUSTQUEUE_PROXY_MAX_CONNECTIONS`,
-`RUSTQUEUE_PROXY_MAX_BODY_BYTES`, and
-`RUSTQUEUE_PROXY_MAX_INFLIGHT_BYTES`.
+`RUSTQUEUE_PROXY_MAX_BODY_BYTES`, `RUSTQUEUE_PROXY_MAX_INFLIGHT_BYTES`, and
+`RUSTQUEUE_PROXY_TCP_MAX_CONNECTION_AGE_SECONDS`.
+
+Discovery gives every Kubernetes EndpointSlice list an explicit 1.5-second
+deadline. Override it with `RUSTQUEUE_ENDPOINT_SLICE_TIMEOUT_MS`; timeouts are
+reported by `rustqueue_discovery_endpoint_slice_timeouts_total` and stale
+Broker observations still expire after five seconds.
 
 ## Local HTTP endpoints
 
@@ -242,6 +262,7 @@ Native broker endpoints:
 - `GET|POST /v1/drain`
 - `GET /v1/stats`
 - `GET /v1/observe` (console token, no message bodies)
+- `GET /v1/observe/head` (console token, lightweight runtime/revision head)
 - `POST /v1/manage/topics/{action}` (console token, only when enabled)
 - `POST /v1/manage/channels/{action}` (console token, only when enabled)
 - `POST /v1/manage/fences/sync` (console token, only when enabled)
@@ -265,6 +286,8 @@ group-commit queueing, publish and channel ACK, payload reads, scrub/GC, proxy
 backend calls, and discovery registry polling. Queue aggregates have fixed
 cardinality by default; `[metrics].detailed_queue_metrics` enables bounded
 per-topic/channel series up to `max_detailed_series`.
+Delivery-budget bytes, waiters and cumulative waits are exported as bounded
+aggregate gauges/counters.
 
 ## Storage and upgrades
 
@@ -311,8 +334,10 @@ queue entries; individual metadata entries carry their own CRC and are paged on
 demand. Full sidecar checksums run in background scrub, so startup is O(segment
 count), not O(message count). Missing or invalid indexes fall back to a full
 segment scan.
-Cold payload corruption is isolated by payload-read CRC or the immediate
-background scrub; active-tail corruption, invalid channel WAL and identity
+Cold payload corruption is isolated by payload-read CRC or background scrub.
+Automatic scrub and normal GC start after a configurable 30-second quiet period
+so a large PVC can become Ready without immediately competing with maintenance
+I/O; active-tail corruption, invalid channel WAL and identity
 mismatch fail startup closed.
 
 Crash-boundary integration tests stop worker processes with actual `SIGKILL`

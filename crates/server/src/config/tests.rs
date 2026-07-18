@@ -8,6 +8,20 @@ fn example_configuration_is_valid() {
 }
 
 #[test]
+fn default_bootstrap_window_covers_official_lookup_poll_jitter() {
+    assert_eq!(Config::default().queue.bootstrap_retention_seconds, 90);
+    assert!(Config::default().queue.bootstrap_retention_seconds >= 78);
+}
+
+#[test]
+fn maintenance_has_a_startup_quiet_period() {
+    assert_eq!(
+        Config::default().storage.maintenance_startup_delay_seconds,
+        30
+    );
+}
+
+#[test]
 fn accepts_the_documented_large_message_limits() {
     let mut config = Config::default();
     config.queue.max_message_bytes = MAX_SUPPORTED_MESSAGE_BYTES;
@@ -42,5 +56,16 @@ fn rejects_unbounded_topic_worker_configuration() {
 fn rejects_an_unbounded_detailed_metric_configuration() {
     let mut config = Config::default();
     config.metrics.max_detailed_series = 0;
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn delivery_budget_must_fit_a_message_and_the_node_budget() {
+    let mut config = Config::default();
+    config.limits.connection_delivery_inflight_bytes = config.queue.max_message_bytes - 1;
+    assert!(config.validate().is_err());
+
+    config.limits.connection_delivery_inflight_bytes = config.queue.max_message_bytes;
+    config.limits.node_delivery_inflight_bytes = config.queue.max_message_bytes - 1;
     assert!(config.validate().is_err());
 }

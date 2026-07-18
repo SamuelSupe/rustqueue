@@ -83,6 +83,23 @@ wait_queue_ready() {
   return 1
 }
 
+wait_replacement_pod_ready() {
+  local pod=$1 previous_uid=$2 deadline=$((SECONDS + ${3:-300})) document uid ready
+  while (( SECONDS < deadline )); do
+    document=$(kubectl -n "$NAMESPACE" get pod "$pod" -o json 2>/dev/null || true)
+    if [[ -n "$document" ]]; then
+      uid=$(jq -r '.metadata.uid // ""' <<<"$document")
+      ready=$(jq -r 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' <<<"$document")
+      if [[ -n "$uid" && "$uid" != "$previous_uid" && "$ready" == "true" ]]; then
+        return 0
+      fi
+    fi
+    sleep 2
+  done
+  echo "replacement Pod $pod did not become Ready with a new UID" >&2
+  return 1
+}
+
 wait_pod_succeeded() {
   local pod=$1 deadline=$((SECONDS + ${2:-240})) phase
   while (( SECONDS < deadline )); do
@@ -141,7 +158,8 @@ wait_managed_resource() {
 }
 
 wait_console_topic() {
-  local base=$1 topic=$2 phase=$3 deadline=$((SECONDS + 30))
+  # The catalog refresh defaults to 30 seconds; allow scheduler/network slack.
+  local base=$1 topic=$2 phase=$3 deadline=$((SECONDS + 45))
   while (( SECONDS < deadline )); do
     if curl -fsS "$base/api/v1/snapshot" | jq -e --arg topic "$topic" --arg phase "$phase" \
       'any(.topics[]; .name == $topic and .managed_phase == $phase)' >/dev/null; then
@@ -169,7 +187,8 @@ wait_managed_topic_state() {
 }
 
 wait_console_channel() {
-  local base=$1 topic=$2 channel=$3 paused=$4 depth=${5:-} deadline=$((SECONDS + 30))
+  # Queue depth is refreshed on the bounded full-catalog interval, not the head poll.
+  local base=$1 topic=$2 channel=$3 paused=$4 depth=${5:-} deadline=$((SECONDS + 45))
   while (( SECONDS < deadline )); do
     if curl -fsS "$base/api/v1/snapshot" | jq -e \
       --arg topic "$topic" --arg channel "$channel" --argjson paused "$paused" --arg depth "$depth" \
@@ -326,6 +345,10 @@ run_console_management_acceptance() {
     --data "$(console_apply_body topic retry "$topic" "" "$token" "$topic")" \
     "$base/api/v1/management/apply" >/dev/null
   wait_managed_topic_state "$topic" ACTIVE false
+  # The CRD can become ACTIVE just before the Console collector publishes its
+  # next merged snapshot. Wait for the same state the preview API consumes so
+  # the following step tests resource-version drift, not observation lag.
+  wait_console_topic "$base" "$topic" ACTIVE
 
   preview=$(console_preview "$base" "$origin" "$cookie" "$csrf" topic pause "$topic" "")
   token=$(jq -er '.action_token' <<<"$preview")
@@ -493,8 +516,7 @@ run_curl publish-recovery-message -fsS -X POST --data-binary survive-restart \
 
 POD_UID_BEFORE=$(kubectl -n "$NAMESPACE" get pod "$QUEUE-0" -o jsonpath='{.metadata.uid}')
 kubectl -n "$NAMESPACE" delete pod "$QUEUE-0" --wait=false >/dev/null
-kubectl -n "$NAMESPACE" wait --for=delete pod/"$QUEUE-0" --timeout=180s
-kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/"$QUEUE-0" --timeout=300s
+wait_replacement_pod_ready "$QUEUE-0" "$POD_UID_BEFORE" 300
 wait_queue_ready 300
 POD_UID_AFTER=$(kubectl -n "$NAMESPACE" get pod "$QUEUE-0" -o jsonpath='{.metadata.uid}')
 PVC_AFTER=$(kubectl -n "$NAMESPACE" get pvc -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}')

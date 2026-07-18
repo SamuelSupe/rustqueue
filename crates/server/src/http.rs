@@ -36,6 +36,7 @@ struct AppState {
     registry_token: Option<Arc<str>>,
     console_token: Option<Arc<str>>,
     accepting: Arc<AtomicBool>,
+    delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
 }
 
@@ -101,6 +102,7 @@ pub async fn serve(
     broker: Arc<Broker>,
     metrics: Arc<Metrics>,
     accepting: Arc<AtomicBool>,
+    delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
 ) -> anyhow::Result<()> {
     let state = AppState {
@@ -112,6 +114,7 @@ pub async fn serve(
         broker,
         metrics,
         accepting,
+        delivering,
         publish_admission,
     };
     let mut router = Router::new()
@@ -142,6 +145,7 @@ pub async fn serve(
         .route("/v1/drain", get(drain_status).post(set_drain))
         .route("/v1/stats", get(native_stats))
         .route("/v1/observe", get(observe))
+        .route("/v1/observe/head", get(observe_head))
         .route("/v1/storage/scrub", post(scrub))
         .layer(middleware::from_fn(nsq_content_negotiation));
     if config.security.console_management_enabled {
@@ -276,6 +280,8 @@ mod tests {
             publish_group_commit: Default::default(),
             channel_group_commit: Default::default(),
             latency: Default::default(),
+            delivery_budget: Default::default(),
+            aggregate: Default::default(),
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,

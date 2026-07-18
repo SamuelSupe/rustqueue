@@ -343,10 +343,10 @@ async fn sealed_backlog_uses_bounded_metadata_residency() {
     let handle = broker.topic("events").unwrap();
     let (active, sealed) = handle.state.lock().index_residency();
     assert_eq!(broker.stats().topics[0].message_count, 3_264);
-    assert!(sealed >= 101);
+    assert!(sealed >= 100);
     assert!(
-        active <= 32,
-        "only the active segment may keep per-message metadata"
+        active <= 64,
+        "only the current publish batch remains in active metadata"
     );
     drop(broker);
 
@@ -354,8 +354,8 @@ async fn sealed_backlog_uses_bounded_metadata_residency() {
     let handle = broker.topic("events").unwrap();
     let (active, sealed) = handle.state.lock().index_residency();
     assert_eq!(broker.stats().topics[0].message_count, 3_264);
-    assert!(sealed >= 101);
-    assert!(active <= 32);
+    assert!(sealed >= 100);
+    assert!(active <= 64);
     let deliveries = broker
         .fetch_batch("events", "workers", 64, usize::MAX, Duration::ZERO, None)
         .await
@@ -370,6 +370,144 @@ async fn sealed_backlog_uses_bounded_metadata_residency() {
         .iter()
         .all(|message| message.body.as_ref() == [0x6b; 64]));
     assert!(broker.inner.message_index_cache.resident_bytes() <= 2 * 1024 * 60);
+}
+
+#[tokio::test]
+async fn idle_gc_does_not_seal_a_channel_blocked_active_segment() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        bootstrap_retention: Duration::from_nanos(1),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "blocked").await.unwrap();
+    broker
+        .publish("events", vec![b"retained".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    for _ in 0..4 {
+        assert_eq!(broker.compact().await.unwrap(), 0);
+    }
+    let stats = broker.stats();
+    assert_eq!(stats.topics[0].segment_count, 1);
+    assert_eq!(stats.topics[0].message_count, 1);
+}
+
+#[tokio::test]
+async fn bounded_gc_rotates_across_topics() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        bootstrap_retention: Duration::from_nanos(1),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    for topic in ["alpha", "beta", "gamma"] {
+        broker
+            .publish(topic, vec![b"expired".to_vec()], Duration::ZERO)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(broker.compact_some(1).await.unwrap(), 1);
+    assert_eq!(
+        broker
+            .stats()
+            .topics
+            .iter()
+            .map(|topic| topic.message_count)
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(broker.compact_some(1).await.unwrap(), 1);
+    assert_eq!(
+        broker
+            .stats()
+            .topics
+            .iter()
+            .map(|topic| topic.message_count)
+            .sum::<u64>(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn delivery_budget_bounds_slow_consumers_and_cancellation_releases_reservations() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        max_message_bytes: 32,
+        delivery_inflight_bytes: 64,
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "alpha").await.unwrap();
+    broker.create_channel("events", "beta").await.unwrap();
+    broker
+        .publish("events", vec![vec![0x5a; 32]], Duration::ZERO)
+        .await
+        .unwrap();
+
+    let alpha = broker
+        .fetch_batch_retained("events", "alpha", 1, 32, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (alpha_messages, alpha_hold) = alpha.into_parts();
+    assert_eq!(alpha_messages.len(), 1);
+    assert_eq!(broker.stats().delivery_budget.in_flight_bytes, 64);
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(20),
+        broker.fetch_batch_retained("events", "beta", 1, 32, Duration::ZERO, None),
+    )
+    .await;
+    assert!(blocked.is_err());
+    assert_eq!(broker.stats().delivery_budget.waiters, 0);
+    assert!(broker.stats().delivery_budget.waits_total >= 1);
+
+    drop(alpha_messages);
+    drop(alpha_hold);
+    let beta = broker
+        .fetch_batch_retained("events", "beta", 1, 32, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (beta_messages, beta_hold) = beta.into_parts();
+    assert_eq!(beta_messages.len(), 1);
+    drop(beta_messages);
+    drop(beta_hold);
+    assert_eq!(broker.stats().delivery_budget.in_flight_bytes, 0);
+}
+
+#[tokio::test]
+async fn dropping_an_unhanded_delivery_batch_does_not_consume_an_attempt() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"payload".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    let batch = broker
+        .fetch_batch_retained("events", "workers", 1, 1024, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (messages, guard) = batch.into_parts();
+    assert_eq!(messages[0].attempts, 1);
+    drop(messages);
+    drop(guard);
+
+    let messages = broker
+        .fetch_batch("events", "workers", 1, 1024, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(messages[0].attempts, 1);
 }
 
 #[tokio::test]
@@ -640,4 +778,40 @@ async fn management_operation_results_are_idempotent_across_restart() {
         Err(BrokerError::OperationConflict)
     ));
     assert!(broker.storage_healthy());
+}
+
+#[tokio::test]
+async fn concurrent_registry_updates_persist_the_latest_revision() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    let mut tasks = Vec::new();
+    for ordinal in 0..64 {
+        let broker = broker.clone();
+        tasks.push(tokio::spawn(async move {
+            broker
+                .create_channel(&format!("topic-{ordinal}"), "workers")
+                .await
+                .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let expected = broker.registry_revision();
+    drop(broker);
+
+    let reopened = Broker::open(config).unwrap();
+    assert_eq!(reopened.registry_revision(), expected);
+}
+
+#[tokio::test]
+async fn panicked_storage_tasks_fail_the_broker_closed() {
+    let error = super::blocking::<()>(|| panic!("injected storage task panic"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, BrokerError::StorageUnavailable));
 }

@@ -4,6 +4,9 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+const MAX_NODES_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Deserialize)]
 struct NodesResponse {
     #[serde(default)]
@@ -65,7 +68,8 @@ async fn refresh_source(
     let head = match client.get(head_url).send().await {
         Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => None,
         Ok(response) => match response.error_for_status() {
-            Ok(response) => match response.json::<HeadResponse>().await {
+            Ok(response) => match read_json_bounded::<HeadResponse>(response, MAX_HEAD_BYTES).await
+            {
                 Ok(head) => Some(head),
                 Err(error) => {
                     tracing::debug!(%error, "discovery head response was invalid");
@@ -91,13 +95,15 @@ async fn refresh_source(
     let url = format!("{address}/v1/publishers");
     let nodes = match client.get(url).send().await {
         Ok(response) => match response.error_for_status() {
-            Ok(response) => match response.json::<NodesResponse>().await {
-                Ok(nodes) => nodes,
-                Err(error) => {
-                    tracing::debug!(%error, "discovery response was invalid");
-                    return;
+            Ok(response) => {
+                match read_json_bounded::<NodesResponse>(response, MAX_NODES_BYTES).await {
+                    Ok(nodes) => nodes,
+                    Err(error) => {
+                        tracing::debug!(%error, "discovery response was invalid");
+                        return;
+                    }
                 }
-            },
+            }
             Err(error) => {
                 tracing::debug!(%error, "discovery returned an error");
                 return;
@@ -116,4 +122,24 @@ async fn refresh_source(
             seen_at: Instant::now(),
         },
     );
+}
+
+async fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    maximum: usize,
+) -> anyhow::Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        anyhow::bail!("response body exceeds {maximum} bytes");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            anyhow::bail!("response body exceeds {maximum} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }

@@ -24,12 +24,17 @@ pub async fn health() -> Json<serde_json::Value> {
 }
 
 pub async fn ready(State(state): State<AppState>) -> Response {
-    if state.live.snapshot().is_some() {
+    let max_age = state
+        .config
+        .poll_interval
+        .saturating_mul(3)
+        .max(std::time::Duration::from_secs(10));
+    if state.live.is_fresh(max_age) {
         Json(json!({"status": "ready"})).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"status": "collecting"})),
+            Json(json!({"status": "stale"})),
         )
             .into_response()
     }

@@ -12,6 +12,7 @@ pub struct Config {
     pub console_token_file: PathBuf,
     pub static_dir: PathBuf,
     pub poll_interval: Duration,
+    pub catalog_refresh_interval: Duration,
     pub history_capacity: usize,
     pub broker_http_port: u16,
     pub management_enabled: bool,
@@ -28,6 +29,10 @@ impl Config {
         let history_minutes = parse("RUSTQUEUE_CONSOLE_HISTORY_MINUTES", 15usize)?;
         if !(1..=60).contains(&history_minutes) {
             bail!("RUSTQUEUE_CONSOLE_HISTORY_MINUTES must be in 1..=60");
+        }
+        let catalog_refresh_seconds = parse("RUSTQUEUE_CONSOLE_CATALOG_REFRESH_SECONDS", 30u64)?;
+        if catalog_refresh_seconds < poll_seconds || catalog_refresh_seconds > 300 {
+            bail!("RUSTQUEUE_CONSOLE_CATALOG_REFRESH_SECONDS must be in poll_seconds..=300");
         }
         let management_unlock_seconds =
             parse("RUSTQUEUE_CONSOLE_MANAGEMENT_UNLOCK_SECONDS", 1800u64)?;
@@ -52,6 +57,7 @@ impl Config {
                 .unwrap_or_else(|_| "/usr/share/rustqueue-console".into())
                 .into(),
             poll_interval: Duration::from_secs(poll_seconds),
+            catalog_refresh_interval: Duration::from_secs(catalog_refresh_seconds),
             history_capacity: history_minutes * 60 / poll_seconds as usize,
             broker_http_port: parse("RUSTQUEUE_BROKER_HTTP_PORT", 4151u16)?,
             management_enabled: parse("RUSTQUEUE_CONSOLE_MANAGEMENT_ENABLED", false)?,

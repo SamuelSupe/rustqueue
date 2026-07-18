@@ -211,6 +211,34 @@ start_operational_ledger() {
   return 1
 }
 
+run_default_lookup_bootstrap() {
+  local overrides
+  overrides=$(jq -cn --arg image "$COMPAT_IMAGE" --arg secret "$QUEUE-auth" \
+    '{apiVersion:"v1",spec:{containers:[{name:"default-lookup-bootstrap",image:$image,imagePullPolicy:"Never",args:["lookup-default-bootstrap","queue-discovery:4161","queue-0.queue-brokers:4151","queue-2.queue-brokers:4151"],env:[{name:"RUSTQUEUE_ADMIN_TOKEN",valueFrom:{secretKeyRef:{name:$secret,key:"admin-token"}}}]}]}}')
+  kubectl -n "$NAMESPACE" delete pod default-lookup-bootstrap --ignore-not-found >/dev/null
+  kubectl -n "$NAMESPACE" run default-lookup-bootstrap --restart=Never --image="$COMPAT_IMAGE" \
+    --image-pull-policy=Never --overrides="$overrides" >/dev/null
+  if ! wait_pod_succeeded default-lookup-bootstrap 150; then
+    kubectl -n "$NAMESPACE" logs default-lookup-bootstrap --all-containers || true
+    return 1
+  fi
+  kubectl -n "$NAMESPACE" logs default-lookup-bootstrap
+}
+
+run_proxy_rotation() {
+  local overrides
+  overrides=$(jq -cn --arg image "$COMPAT_IMAGE" \
+    '{apiVersion:"v1",spec:{containers:[{name:"proxy-rotation",image:$image,imagePullPolicy:"Never",args:["proxy-rotation","queue-proxy:4150","queue-discovery:4161"]}]}}')
+  kubectl -n "$NAMESPACE" delete pod proxy-rotation --ignore-not-found >/dev/null
+  kubectl -n "$NAMESPACE" run proxy-rotation --restart=Never --image="$COMPAT_IMAGE" \
+    --image-pull-policy=Never --overrides="$overrides" >/dev/null
+  if ! wait_pod_succeeded proxy-rotation 60; then
+    kubectl -n "$NAMESPACE" logs proxy-rotation --all-containers || true
+    return 1
+  fi
+  kubectl -n "$NAMESPACE" logs proxy-rotation
+}
+
 select_expandable_storage_class() {
   local default_class provisioner reclaim_policy binding_mode
   default_class=$(kubectl get storageclass -o json | jq -r \
@@ -343,7 +371,7 @@ helm upgrade --install "$RELEASE" "$CHART" \
   --set queue.minBrokers=1 --set queue.maxBrokers=3 \
   --set-string queue.storageClassName="$STORAGE_CLASS" --set-string queue.storageSize=1Gi \
   --set queue.minFreeBytes=0 --set queue.protectiveEvictionEnabled=false \
-  --set queue.bootstrapRetentionSeconds=1 \
+  --set queue.proxyTcpMaxConnectionAgeSeconds=2 \
   --set console.management.enabled=true --set console.pollIntervalSeconds=5 \
   --wait --timeout 5m
 
@@ -374,6 +402,33 @@ wait_storage_ready 2Gi 240
 
 run_console_multi_owner_crash_acceptance
 
+CONSOLE_TOKEN=$(kubectl -n "$NAMESPACE" get secret "$QUEUE-auth" \
+  -o go-template='{{index .data "console-token" | base64decode}}')
+head_observation=$(kubectl -n "$NAMESPACE" exec "$QUEUE-0" -c broker -- \
+  curl -fsS -H "Authorization: Bearer $CONSOLE_TOKEN" \
+  http://127.0.0.1:4151/v1/observe/head)
+[[ "$(jq -r 'has("queue") | not' <<<"$head_observation")" == "true" \
+  && "$(jq -r '.delivery_budget.in_flight_bytes == 0' <<<"$head_observation")" == "true" ]] || {
+  echo "lightweight Console observation unexpectedly included the queue catalog" >&2
+  exit 1
+}
+
+ADMIN_TOKEN=$(kubectl -n "$NAMESPACE" get secret "$QUEUE-auth" \
+  -o go-template='{{index .data "admin-token" | base64decode}}')
+frozen=$(kubectl -n "$NAMESPACE" exec "$QUEUE-0" -c broker -- \
+  curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"enabled":true,"freeze_deliveries":true}' \
+  http://127.0.0.1:4151/v1/drain)
+[[ "$(jq -r '.draining and .delivery_frozen and .quiesced' <<<"$frozen")" == "true" ]] || {
+  echo "Broker did not reach a stable frozen rollout barrier" >&2
+  exit 1
+}
+kubectl -n "$NAMESPACE" exec "$QUEUE-0" -c broker -- \
+  curl -fsS -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"enabled":false}' \
+  http://127.0.0.1:4151/v1/drain >/dev/null
+wait_queue_ready 3 120
+
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p "{\"spec\":{\"maintenance\":{\"broker\":\"$QUEUE-2\",\"enabled\":true}}}" >/dev/null
 wait_queue_phase Maintenance 120
@@ -386,6 +441,8 @@ kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
 wait_queue_ready 3 120
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p '{"spec":{"maintenance":null}}' >/dev/null
+run_default_lookup_bootstrap
+run_proxy_rotation
 
 uids_before=$(kubectl -n "$NAMESPACE" get pods \
   -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \
@@ -405,12 +462,27 @@ kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
 wait_queue_ready 3 120
 
 start_operational_ledger
+REGISTRY_TOKEN=$(kubectl -n "$NAMESPACE" get secret "$QUEUE-auth" \
+  -o go-template='{{index .data "registry-token" | base64decode}}')
+kubectl -n "$NAMESPACE" exec "$QUEUE-2" -c broker -- \
+  curl -fsS -X POST --data-binary preserve-through-rollout \
+  "http://127.0.0.1:4151/pub?topic=rollout_backlog" >/dev/null
+[[ "$(kubectl -n "$NAMESPACE" exec "$QUEUE-2" -c broker -- \
+  curl -fsS -H "Authorization: Bearer $REGISTRY_TOKEN" http://127.0.0.1:4151/v1/drain | jq -r '.stored_messages > 0')" == "true" ]] || {
+  echo "failed to establish durable backlog before rollout" >&2
+  exit 1
+}
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p "{\"spec\":{\"image\":\"$BROKER_IMAGE_B\",\"rollout\":{\"requireCanaryApproval\":true,\"approvedRevision\":null}}}" >/dev/null
 
-wait_queue_phase RolloutAwaitingApproval 180
+wait_queue_phase RolloutAwaitingApproval 60
 [[ "$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker -o json | jq --arg image "$BROKER_IMAGE_B" '[.items[].spec.containers[] | select(.name == "broker" and .image == $image)] | length')" == "1" ]] || {
   echo "rollout did not stop after exactly one canary Broker" >&2
+  exit 1
+}
+[[ "$(kubectl -n "$NAMESPACE" exec "$QUEUE-2" -c broker -- \
+  curl -fsS 'http://127.0.0.1:4151/v1/stats?topic=rollout_backlog' | jq -r '.topics[0].message_count > 0')" == "true" ]] || {
+  echo "canary replacement did not preserve its durable backlog" >&2
   exit 1
 }
 leader=$(kubectl -n "$NAMESPACE" get lease rustqueue-operator-leader -o jsonpath='{.spec.holderIdentity}')
@@ -476,7 +548,10 @@ wait_queue_ready 3 120
 }
 
 probe_metric broker-metrics "http://$QUEUE-0.$QUEUE-brokers:4151/metrics" rustqueue_storage_fsync_duration_seconds
+probe_metric broker-delivery-metrics "http://$QUEUE-0.$QUEUE-brokers:4151/metrics" rustqueue_delivery_inflight_bytes
 probe_metric proxy-metrics "http://$QUEUE-proxy:4151/metrics" rustqueue_proxy_backend_duration_seconds
+probe_metric proxy-rotation-metrics "http://$QUEUE-proxy:4151/metrics" rustqueue_proxy_tcp_connection_rotations_total
 probe_metric discovery-metrics "http://$QUEUE-discovery:4161/metrics" rustqueue_discovery_registry_poll_duration_seconds
+probe_metric discovery-timeout-metrics "http://$QUEUE-discovery:4161/metrics" rustqueue_discovery_endpoint_slice_timeouts_total
 
 echo "OrbStack Kubernetes 3-broker rolling operations acceptance passed"

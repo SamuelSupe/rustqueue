@@ -4,6 +4,8 @@ use super::*;
 pub(super) struct DrainRequest {
     #[serde(default = "enabled_by_default")]
     enabled: bool,
+    #[serde(default)]
+    freeze_deliveries: bool,
 }
 
 fn enabled_by_default() -> bool {
@@ -76,7 +78,9 @@ pub(super) async fn registry(
         && storage_ready
         && management_ready
         && state.publish_admission.storage_ready();
-    let consume_ready = management_ready
+    let delivery_ready = state.delivering.load(Ordering::Acquire);
+    let consume_ready = delivery_ready
+        && management_ready
         && storage_ready
         && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0);
     let (binary, storage) = state.broker.capabilities();
@@ -111,6 +115,7 @@ pub(super) async fn registry_head(
         "registry or console",
     )?;
     let process_ready = state.accepting.load(Ordering::Acquire);
+    let delivery_ready = state.delivering.load(Ordering::Acquire);
     let storage_ready = state.broker.storage_healthy();
     let management_ready = state.broker.management_fences_ready();
     let publish_ready = process_ready
@@ -121,9 +126,9 @@ pub(super) async fn registry_head(
         "format": 7,
         "revision": state.broker.registry_revision(),
         "node_id": state.config.node.id,
-        "ready": storage_ready && management_ready,
+        "ready": delivery_ready && storage_ready && management_ready,
         "publish_ready": publish_ready,
-        "consume_ready": storage_ready && management_ready,
+        "consume_ready": delivery_ready && storage_ready && management_ready,
     })))
 }
 
@@ -175,14 +180,30 @@ pub(super) async fn drain_status(
         ],
         "registry or console",
     )?;
-    let stats = state.broker.stats();
+    state.broker.expire_in_flight();
+    let stats = state.broker.metrics_stats(false, 0);
     let (stored_messages, depth, in_flight) = backlog(&stats);
+    let draining = !state.accepting.load(Ordering::Acquire);
+    let delivery_frozen = !state.delivering.load(Ordering::Acquire);
+    let publish_inflight_bytes = state.metrics.publish_inflight_bytes.load(Ordering::Acquire);
+    let delivery_inflight_bytes = stats.delivery_budget.in_flight_bytes;
+    let empty = stored_messages == 0
+        && depth == 0
+        && in_flight == 0
+        && publish_inflight_bytes == 0
+        && delivery_inflight_bytes == 0;
     Ok(Json(json!({
-        "draining": !state.accepting.load(Ordering::Acquire),
-        "drained": stored_messages == 0 && depth == 0 && in_flight == 0,
+        "draining": draining,
+        "delivery_frozen": delivery_frozen,
+        "quiesced": draining && delivery_frozen && in_flight == 0
+            && publish_inflight_bytes == 0 && delivery_inflight_bytes == 0,
+        "empty": empty,
+        "drained": empty,
         "stored_messages": stored_messages,
         "depth": depth,
         "in_flight": in_flight,
+        "publish_inflight_bytes": publish_inflight_bytes,
+        "delivery_inflight_bytes": delivery_inflight_bytes,
     })))
 }
 
@@ -193,15 +214,38 @@ pub(super) async fn set_drain(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&headers, state.admin_token.as_deref(), "admin")?;
     state.accepting.store(!request.enabled, Ordering::Release);
-    tracing::info!(enabled = request.enabled, "broker drain state changed");
-    let stats = state.broker.stats();
+    state.delivering.store(
+        !request.enabled || !request.freeze_deliveries,
+        Ordering::Release,
+    );
+    tracing::info!(
+        enabled = request.enabled,
+        freeze_deliveries = request.freeze_deliveries,
+        "broker drain state changed"
+    );
+    state.broker.expire_in_flight();
+    let stats = state.broker.metrics_stats(false, 0);
     let (stored_messages, depth, in_flight) = backlog(&stats);
+    let publish_inflight_bytes = state.metrics.publish_inflight_bytes.load(Ordering::Acquire);
+    let delivery_frozen = !state.delivering.load(Ordering::Acquire);
+    let delivery_inflight_bytes = stats.delivery_budget.in_flight_bytes;
+    let empty = stored_messages == 0
+        && depth == 0
+        && in_flight == 0
+        && publish_inflight_bytes == 0
+        && delivery_inflight_bytes == 0;
     Ok(Json(json!({
         "draining": request.enabled,
-        "drained": stored_messages == 0 && depth == 0 && in_flight == 0,
+        "delivery_frozen": delivery_frozen,
+        "quiesced": request.enabled && delivery_frozen && in_flight == 0
+            && publish_inflight_bytes == 0 && delivery_inflight_bytes == 0,
+        "empty": empty,
+        "drained": empty,
         "stored_messages": stored_messages,
         "depth": depth,
         "in_flight": in_flight,
+        "publish_inflight_bytes": publish_inflight_bytes,
+        "delivery_inflight_bytes": delivery_inflight_bytes,
     })))
 }
 
@@ -228,23 +272,41 @@ pub(super) async fn observe(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&headers, state.console_token.as_deref(), "console")?;
     let stats = state.broker.stats();
-    let (stored_messages, depth, in_flight) = backlog(&stats);
-    let segment_count = stats
-        .topics
-        .iter()
-        .map(|topic| topic.segment_count)
-        .sum::<u64>();
-    let segment_bytes = stats
-        .topics
-        .iter()
-        .map(|topic| topic.segment_bytes)
-        .sum::<u64>();
+    let segment_count = stats.aggregate.segment_count;
+    let segment_bytes = stats.aggregate.segment_bytes;
+    let mut value = observation_head(&state);
+    let object = value
+        .as_object_mut()
+        .expect("observation head is an object");
+    object.insert(
+        "storage".into(),
+        json!({"segment_count": segment_count, "segment_bytes": segment_bytes}),
+    );
+    object.insert("catalog_collected_at_ms".into(), json!(now_ms()));
+    object.insert(
+        "queue".into(),
+        serde_json::to_value(stats).expect("stats serialize"),
+    );
+    Ok(Json(value))
+}
+
+pub(super) async fn observe_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&headers, state.console_token.as_deref(), "console")?;
+    Ok(Json(observation_head(&state)))
+}
+
+fn observation_head(state: &AppState) -> Value {
     let process_ready = state.accepting.load(Ordering::Acquire);
+    let delivery_ready = state.delivering.load(Ordering::Acquire);
     let storage_healthy = state.broker.storage_healthy();
     let disk_ready = state.publish_admission.storage_ready();
+    let management_ready = state.broker.management_fences_ready();
     let (binary, storage) = state.broker.capabilities();
     let runtime = state.metrics.snapshot();
-    Ok(Json(json!({
+    json!({
         "schema_version": 1,
         "registry_revision": state.broker.registry_revision(),
         "collected_at_ms": now_ms(),
@@ -259,10 +321,10 @@ pub(super) async fn observe(
             "process_ready": process_ready,
             "storage_healthy": storage_healthy,
             "disk_ready": disk_ready,
-            "publish_ready": process_ready && storage_healthy && disk_ready && state.broker.management_fences_ready(),
-            "consume_ready": state.broker.management_fences_ready() && storage_healthy && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0),
+            "publish_ready": process_ready && storage_healthy && disk_ready && management_ready,
+            "consume_ready": delivery_ready && storage_healthy && management_ready,
             "draining": !process_ready,
-            "management_fences_ready": state.broker.management_fences_ready(),
+            "management_fences_ready": management_ready,
         },
         "disk": {
             "total_bytes": runtime.disk_total_bytes,
@@ -274,15 +336,14 @@ pub(super) async fn observe(
             "min_free_bytes": state.config.storage.min_free_bytes,
             "protective_eviction_enabled": state.config.storage.protective_eviction_enabled,
         },
-        "storage": {"segment_count": segment_count, "segment_bytes": segment_bytes},
         "runtime": runtime,
-        "queue": stats,
+        "delivery_budget": state.broker.delivery_budget_stats(),
         "limits": {
             "max_message_bytes": state.config.queue.max_message_bytes,
             "message_index_cache_bytes": state.config.storage.message_index_cache_bytes,
             "max_connections": state.config.limits.max_connections,
         },
-    })))
+    })
 }
 
 pub(super) async fn scrub(

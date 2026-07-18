@@ -27,7 +27,7 @@ use rustqueue_protocol::{
     encode_frame, encode_message_header, parse_mpub_bytes, Command, CommandError, FrameType,
     IdentifyRequest, IdentifyResponse, CLOSE_WAIT, HEARTBEAT, MAGIC_V2, OK,
 };
-use rustqueue_queue::{Broker, BrokerError};
+use rustqueue_queue::{Broker, BrokerError, DeliveryGuard};
 use serde_json::json;
 use std::collections::HashMap;
 use std::future::Future;
@@ -68,7 +68,6 @@ struct Subscription {
 type EphemeralConsumers = Arc<SyncMutex<HashMap<(String, String), usize>>>;
 
 const MAX_FETCH_MESSAGES: u16 = 64;
-const MAX_FETCH_BYTES: u32 = 32 * 1024 * 1024;
 const DEFAULT_FETCH_WAIT_MS: u32 = 100;
 
 #[derive(Clone, Debug)]
@@ -81,9 +80,9 @@ struct FetchRequest {
     wait_ms: u32,
 }
 
-#[derive(Clone, Debug)]
 struct FetchResponse {
     deliveries: Vec<RemoteDelivery>,
+    delivery_guard: DeliveryGuard,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +127,7 @@ pub async fn serve(
     broker: Arc<Broker>,
     metrics: Arc<Metrics>,
     accepting: Arc<AtomicBool>,
+    delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.network.tcp_address).await?;
@@ -155,6 +155,7 @@ pub async fn serve(
         let authenticator = authenticator.clone();
         let ephemeral_consumers = Arc::clone(&ephemeral_consumers);
         let accepting = Arc::clone(&accepting);
+        let delivering = Arc::clone(&delivering);
         let publish_admission = Arc::clone(&publish_admission);
         tokio::spawn(async move {
             let _permit = permit;
@@ -169,6 +170,7 @@ pub async fn serve(
                 authenticator,
                 ephemeral_consumers,
                 accepting,
+                delivering,
                 publish_admission,
             )
             .await
@@ -191,6 +193,7 @@ async fn handle_connection(
     authenticator: Option<Arc<Authenticator>>,
     ephemeral_consumers: EphemeralConsumers,
     accepting: Arc<AtomicBool>,
+    delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
@@ -330,6 +333,7 @@ async fn handle_connection(
         authenticator,
         ephemeral_consumers,
         accepting,
+        delivering,
         publish_admission,
         connection_budget,
         state,

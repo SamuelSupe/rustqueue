@@ -54,6 +54,7 @@ impl SegmentLog {
             .append(true)
             .open(&self.current_path)?;
         self.current_len = self.current.metadata()?.len();
+        self.refresh_aggregates();
         self.start_index = self.first_index().unwrap_or(from_index);
         self.current.sync_all()?;
         File::open(&self.directory)?.sync_all()?;
@@ -113,6 +114,7 @@ impl SegmentLog {
         }
         self.resident_records
             .retain(|record| record.index > removed_through);
+        self.refresh_aggregates();
         self.start_index = self
             .first_index()
             .unwrap_or_else(|| through_index.saturating_add(1));

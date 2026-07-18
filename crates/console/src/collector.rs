@@ -4,8 +4,8 @@ use crate::managed_view;
 use crate::model::*;
 use crate::resources::{self, ManagedResources};
 use crate::state::LiveState;
+mod observe;
 use anyhow::{Context, Result};
-use futures::{stream, StreamExt};
 use k8s_openapi::api::core::v1::{Event, PersistentVolumeClaim, Pod};
 use kube::api::{Api, ListParams};
 use kube::ResourceExt;
@@ -21,6 +21,7 @@ pub struct Collector {
     http: reqwest::Client,
     state: Arc<LiveState>,
     mutation_lock: Arc<Mutex<()>>,
+    observation_cache: Arc<Mutex<observe::ObservationCache>>,
 }
 
 impl Collector {
@@ -37,6 +38,7 @@ impl Collector {
             http,
             state,
             mutation_lock,
+            observation_cache: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -55,11 +57,6 @@ impl Collector {
     }
 
     async fn collect(&self) -> Result<(Snapshot, RawCounters)> {
-        let _catalog_guard = if self.config.management_enabled {
-            Some(self.mutation_lock.lock().await)
-        } else {
-            None
-        };
         let cluster = Api::<RustQueue>::namespaced(self.client.clone(), &self.config.namespace)
             .get(&self.config.queue_name)
             .await
@@ -100,10 +97,12 @@ impl Collector {
         let brokers = self.observe_brokers(brokers, &managed).await?;
         let (mut snapshot, counters) = build_snapshot(&cluster, brokers, events);
         if self.config.management_enabled {
+            let _catalog_guard = self.mutation_lock.lock().await;
             let managed = resources::reconcile(&self.client, &cluster, &snapshot.topics).await?;
             managed_view::merge(&mut snapshot.topics, &managed);
             snapshot.management.enabled = true;
             snapshot.management.crd_fresh = true;
+            drop(_catalog_guard);
             snapshot.management.registry_available = self.registry_available().await;
             if !snapshot.management.registry_available {
                 snapshot.complete = false;
@@ -111,69 +110,6 @@ impl Collector {
             }
         }
         Ok((snapshot, counters))
-    }
-
-    async fn observe_brokers(
-        &self,
-        brokers: Vec<BrokerView>,
-        managed: &ManagedResources,
-    ) -> Result<Vec<BrokerView>> {
-        let token = tokio::fs::read_to_string(&self.config.console_token_file)
-            .await
-            .with_context(|| {
-                format!(
-                    "read console token {}",
-                    self.config.console_token_file.display()
-                )
-            })?;
-        let token = Arc::<str>::from(token.trim());
-        if token.is_empty() {
-            anyhow::bail!("console token is empty");
-        }
-        let port = self.config.broker_http_port;
-        let http = self.http.clone();
-        let management_enabled = self.config.management_enabled;
-        let fences = managed.fences();
-        let mut observed = stream::iter(brokers)
-            .map(|mut broker| {
-                let http = http.clone();
-                let token = Arc::clone(&token);
-                let fences = fences.clone();
-                async move {
-                    if broker.pod_ip.is_empty() {
-                        broker.error = Some("Pod has no IP address".into());
-                        return broker;
-                    }
-                    let url = format!("http://{}:{port}/v1/observe", broker.pod_ip);
-                    let result = async {
-                        if management_enabled {
-                            http.post(format!(
-                                "http://{}:{port}/v1/manage/fences/sync",
-                                broker.pod_ip
-                            ))
-                            .bearer_auth(token.as_ref())
-                            .json(&fences)
-                            .send()
-                            .await?
-                            .error_for_status()?;
-                        }
-                        let response = http.get(url).bearer_auth(token.as_ref()).send().await?;
-                        let response = response.error_for_status()?;
-                        response.json::<BrokerObservation>().await
-                    }
-                    .await;
-                    match result {
-                        Ok(observation) => broker.observation = Some(observation),
-                        Err(error) => broker.error = Some(error.to_string()),
-                    }
-                    broker
-                }
-            })
-            .buffer_unordered(256)
-            .collect::<Vec<_>>()
-            .await;
-        observed.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(observed)
     }
 
     async fn registry_available(&self) -> bool {

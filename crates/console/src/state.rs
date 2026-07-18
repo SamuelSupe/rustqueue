@@ -1,10 +1,12 @@
 use crate::model::{RawCounters, Snapshot, TrendSample};
 use std::collections::VecDeque;
 use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 pub struct LiveState {
     latest: RwLock<Option<Snapshot>>,
     history: Mutex<History>,
+    last_success: Mutex<Option<Instant>>,
 }
 
 struct History {
@@ -17,6 +19,7 @@ impl LiveState {
     pub fn new(capacity: usize) -> Self {
         Self {
             latest: RwLock::new(None),
+            last_success: Mutex::new(None),
             history: Mutex::new(History {
                 capacity: capacity.max(1),
                 samples: VecDeque::with_capacity(capacity.max(1)),
@@ -64,6 +67,7 @@ impl LiveState {
         }
         snapshot.history = history.samples.iter().cloned().collect();
         *self.latest.write().expect("snapshot lock poisoned") = Some(snapshot);
+        *self.last_success.lock().expect("freshness lock poisoned") = Some(Instant::now());
     }
 
     pub fn snapshot(&self) -> Option<Snapshot> {
@@ -80,6 +84,13 @@ impl LiveState {
             snapshot.complete = false;
             snapshot.errors = vec![detail];
         }
+    }
+
+    pub fn is_fresh(&self, max_age: Duration) -> bool {
+        self.last_success
+            .lock()
+            .expect("freshness lock poisoned")
+            .is_some_and(|instant| instant.elapsed() <= max_age)
     }
 }
 
@@ -104,5 +115,6 @@ mod tests {
         let snapshot = state.snapshot().unwrap();
         assert_eq!(snapshot.history.len(), 2);
         assert_eq!(snapshot.summary.publish_per_second, 10.0);
+        assert!(state.is_fresh(Duration::from_secs(1)));
     }
 }

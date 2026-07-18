@@ -1,5 +1,7 @@
 #[path = "broker/channel_commit.rs"]
 mod channel_commit;
+#[path = "broker/delivery.rs"]
+mod delivery;
 #[path = "broker/group_commit.rs"]
 mod group_commit;
 #[path = "broker/io.rs"]
@@ -13,10 +15,11 @@ mod metadata_budget;
 #[path = "broker/topics.rs"]
 mod topics;
 
+use crate::delivery_budget::DeliveryBudget;
 use crate::management::FenceCatalog;
 use crate::management_ops::OperationCatalog;
 use crate::metadata::{load_optional, load_topic_manifest, store_atomic, BrokerMeta};
-use crate::model::BrokerStats;
+use crate::model::{BrokerStats, QueueAggregateStats};
 use crate::payload_reader::PayloadReader;
 use crate::telemetry::QueueMetrics;
 use crate::topic::index::MessageIndexCache;
@@ -29,7 +32,7 @@ use rustqueue_storage::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -50,6 +53,7 @@ pub struct BrokerConfig {
     pub message_index_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
+    pub delivery_inflight_bytes: usize,
     pub scrub_bytes_per_second: u64,
     pub storage_feature_level: u32,
     pub require_management_fence_sync: bool,
@@ -63,7 +67,7 @@ impl Default for BrokerConfig {
             max_segment_bytes: 100 * 1024 * 1024,
             max_message_bytes: 20 * 1024 * 1024,
             message_timeout: Duration::from_secs(60),
-            bootstrap_retention: Duration::from_secs(30),
+            bootstrap_retention: Duration::from_secs(90),
             max_ack_gap: 65_536,
             max_topics: 10_000,
             max_publish_workers: 1_024,
@@ -72,6 +76,7 @@ impl Default for BrokerConfig {
             message_index_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
+            delivery_inflight_bytes: 512 * 1024 * 1024,
             scrub_bytes_per_second: 64 * 1024 * 1024,
             storage_feature_level: BASE_STORAGE_FEATURE_LEVEL,
             require_management_fence_sync: false,
@@ -142,6 +147,7 @@ struct BrokerInner {
     topics: RwLock<HashMap<String, Arc<TopicHandle>>>,
     retired_topics: Mutex<HashMap<String, Arc<TopicHandle>>>,
     payload_reader: Arc<PayloadReader>,
+    delivery_budget: DeliveryBudget,
     message_index_cache: Arc<MessageIndexCache>,
     metadata_spill: Mutex<()>,
     fences_path: PathBuf,
@@ -151,6 +157,7 @@ struct BrokerInner {
     management_fences_ready: AtomicBool,
     registry_revision: AtomicU64,
     storage_healthy: AtomicBool,
+    gc_cursor: AtomicUsize,
     publish_groups: group_commit::PublishGroups,
     channel_groups: channel_commit::ChannelGroups,
     metrics: QueueMetrics,
@@ -177,13 +184,25 @@ impl Broker {
                 "topic and publish worker limits must be greater than zero".into(),
             ));
         }
+        if config
+            .max_message_bytes
+            .checked_mul(2)
+            .is_none_or(|minimum| config.delivery_inflight_bytes < minimum)
+            || config.delivery_inflight_bytes > u32::MAX as usize
+        {
+            return Err(BrokerError::InvalidRecord(
+                "delivery byte budget must fit u32 and the payload read working set".into(),
+            ));
+        }
         ensure_data_format(&config.data_path)
             .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
         let compatibility = prepare_compatibility(&config.data_path, config.storage_feature_level)
             .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
         let topics_root = config.data_path.join("topics");
         std::fs::create_dir_all(&topics_root)?;
-        std::fs::create_dir_all(config.data_path.join("dlq-outbox"))?;
+        let outbox_path = config.data_path.join("dlq-outbox");
+        std::fs::create_dir_all(&outbox_path)?;
+        crate::outbox::cleanup_temporary(&outbox_path)?;
         std::fs::create_dir_all(config.data_path.join("audit"))?;
         let meta_path = config.data_path.join("broker.meta");
         let meta = match load_optional::<BrokerMeta>(&meta_path)? {
@@ -258,6 +277,7 @@ impl Broker {
             config.max_publish_workers,
             config.publish_worker_idle,
         );
+        let delivery_budget = DeliveryBudget::new(config.delivery_inflight_bytes);
         let broker = Self {
             inner: Arc::new(BrokerInner {
                 config,
@@ -272,6 +292,7 @@ impl Broker {
                 topics: RwLock::new(topics),
                 retired_topics: Mutex::new(HashMap::new()),
                 payload_reader,
+                delivery_budget,
                 message_index_cache,
                 metadata_spill: Mutex::new(()),
                 fences_path,
@@ -281,6 +302,7 @@ impl Broker {
                 management_fences_ready: AtomicBool::new(true),
                 registry_revision: AtomicU64::new(revision),
                 storage_healthy: AtomicBool::new(true),
+                gc_cursor: AtomicUsize::new(0),
                 publish_groups,
                 channel_groups,
                 metrics,
@@ -316,8 +338,9 @@ impl Broker {
         let name = name.to_owned();
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
-            broker.delete_topic_locked(&name)?;
-            broker.bump_registry()?;
+            if broker.delete_topic_locked(&name)? {
+                broker.bump_registry()?;
+            }
             Ok(())
         })
         .await
@@ -425,16 +448,53 @@ impl Broker {
             .map(|topic| topic.state.lock().stats())
             .collect();
         topics.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut aggregate = QueueAggregateStats::default();
+        for topic in &topics {
+            aggregate.add_topic(topic);
+        }
         BrokerStats {
             publish_group_commit: self.inner.publish_groups.stats(),
             channel_group_commit: self.inner.channel_groups.stats(),
             latency: self.inner.metrics.snapshot(),
+            delivery_budget: self.inner.delivery_budget.snapshot(),
+            aggregate,
+            topics,
+        }
+    }
+
+    pub fn metrics_stats(&self, detailed: bool, max_series: usize) -> BrokerStats {
+        let mut aggregate = QueueAggregateStats::default();
+        let mut topics = Vec::new();
+        let mut remaining = max_series;
+        for handle in self.inner.topics.read().values() {
+            let topic = handle.state.lock();
+            topic.add_aggregate_stats(&mut aggregate);
+            if detailed && remaining > 0 {
+                let mut stats = topic.stats();
+                remaining = remaining.saturating_sub(1);
+                let channel_limit = remaining / 4;
+                stats.channels.truncate(channel_limit);
+                remaining = remaining.saturating_sub(stats.channels.len().saturating_mul(4));
+                topics.push(stats);
+            }
+        }
+        topics.sort_by(|left, right| left.name.cmp(&right.name));
+        BrokerStats {
+            publish_group_commit: self.inner.publish_groups.stats(),
+            channel_group_commit: self.inner.channel_groups.stats(),
+            latency: self.inner.metrics.snapshot(),
+            delivery_budget: self.inner.delivery_budget.snapshot(),
+            aggregate,
             topics,
         }
     }
 
     pub fn registry_revision(&self) -> u64 {
         self.inner.registry_revision.load(Ordering::Acquire)
+    }
+
+    pub fn delivery_budget_stats(&self) -> crate::model::DeliveryBudgetStats {
+        self.inner.delivery_budget.snapshot()
     }
 
     pub fn storage_healthy(&self) -> bool {
@@ -474,14 +534,18 @@ impl Broker {
     }
 
     fn bump_registry(&self) -> Result<(), BrokerError> {
-        let revision = self
-            .inner
-            .registry_revision
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
         let mut meta = self.inner.meta.lock();
-        meta.registry_revision = revision;
-        store_atomic(&self.inner.meta_path, &*meta)?;
+        let revision = meta
+            .registry_revision
+            .max(self.inner.registry_revision.load(Ordering::Acquire))
+            .saturating_add(1);
+        let mut durable = meta.clone();
+        durable.registry_revision = revision;
+        store_atomic(&self.inner.meta_path, &durable)?;
+        *meta = durable;
+        self.inner
+            .registry_revision
+            .store(revision, Ordering::Release);
         Ok(())
     }
 }
@@ -493,9 +557,9 @@ fn validate_channel(channel: &str) -> Result<(), BrokerError> {
 async fn blocking<T: Send + 'static>(
     task: impl FnOnce() -> Result<T, BrokerError> + Send + 'static,
 ) -> Result<T, BrokerError> {
-    tokio::task::spawn_blocking(task).await.map_err(|error| {
-        BrokerError::InvalidRecord(format!("blocking storage task failed: {error}"))
-    })?
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|_| BrokerError::StorageUnavailable)?
 }
 
 fn now_ms() -> i64 {

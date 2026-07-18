@@ -15,6 +15,16 @@ impl Config {
         {
             bail!("publish inflight limits must fit the encoded working set and satisfy connection <= node");
         }
+        if self.limits.connection_delivery_inflight_bytes < self.queue.max_message_bytes
+            || self
+                .limits
+                .connection_delivery_inflight_bytes
+                .checked_mul(2)
+                .is_none_or(|minimum| self.limits.node_delivery_inflight_bytes < minimum)
+            || self.limits.node_delivery_inflight_bytes > u32::MAX as usize
+        {
+            bail!("delivery inflight limits must fit one message plus the payload-read working set and fit u32");
+        }
         if self.limits.client_handshake_timeout_ms == 0 || self.limits.auth_cache_max_entries == 0 {
             bail!("limits handshake timeout and auth cache size must be greater than zero");
         }

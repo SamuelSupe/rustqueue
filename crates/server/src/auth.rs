@@ -170,6 +170,7 @@ impl AuthCache {
         let session = self.values.get(key)?.clone();
         if session.is_expired() {
             self.values.remove(key);
+            self.order.retain(|candidate| candidate != key);
             return None;
         }
         Some(session)
@@ -179,9 +180,8 @@ impl AuthCache {
         if session.is_expired() {
             return;
         }
-        if self.values.insert(key, session).is_some() {
-            return;
-        }
+        self.values.insert(key, session);
+        self.order.retain(|candidate| candidate != &key);
         self.order.push_back(key);
         while self.values.len() > self.max_entries {
             if let Some(oldest) = self.order.pop_front() {
@@ -335,5 +335,31 @@ mod tests {
         expired.expires_at = Instant::now();
         cache.insert([3; 32], expired);
         assert!(cache.get(&[3; 32]).is_none());
+        assert_eq!(cache.order.len(), cache.values.len());
+    }
+
+    #[test]
+    fn expired_auth_cache_churn_does_not_leak_fifo_entries() {
+        let mut cache = AuthCache {
+            values: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: 2,
+        };
+        for ordinal in 0..1_000u16 {
+            let key = [(ordinal % 251) as u8; 32];
+            let session = AuthSession {
+                identity: "worker".into(),
+                identity_url: String::new(),
+                expires_at: Instant::now() + Duration::from_millis(1),
+                grants: Vec::new(),
+            };
+            cache.insert(key, session);
+            if let Some(value) = cache.values.get_mut(&key) {
+                value.expires_at = Instant::now();
+            }
+            assert!(cache.get(&key).is_none());
+        }
+        assert!(cache.order.is_empty());
+        assert!(cache.values.is_empty());
     }
 }

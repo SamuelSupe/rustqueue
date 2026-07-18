@@ -187,4 +187,22 @@ mod tests {
         assert_eq!(nodes.len(), 8);
         assert_eq!(pool.lease().unwrap().node_id, 1);
     }
+
+    #[test]
+    fn sequential_reconnections_rotate_equal_backends() {
+        let pool = BackendPool::default();
+        pool.replace(
+            (1..=3)
+                .map(|node_id| Backend {
+                    broadcast_address: format!("broker-{node_id}"),
+                    tcp_port: 4150,
+                    http_port: 4151,
+                    node_id,
+                })
+                .collect(),
+        );
+        let first = pool.lease().unwrap().node_id;
+        let second = pool.lease().unwrap().node_id;
+        assert_ne!(first, second);
+    }
 }

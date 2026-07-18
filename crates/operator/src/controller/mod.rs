@@ -35,7 +35,7 @@ pub struct ReconcileError(#[from] anyhow::Error);
 pub async fn run(leader: Arc<AtomicBool>) -> anyhow::Result<()> {
     let client = Client::try_default().await?;
     let namespace = watch_namespace();
-    leadership::start(client.clone(), namespace.clone(), Arc::clone(&leader));
+    let mut leadership = leadership::start(client.clone(), namespace.clone(), Arc::clone(&leader));
     let context = Arc::new(ContextData {
         client: client.clone(),
         http: reqwest::Client::builder()
@@ -48,7 +48,7 @@ pub async fn run(leader: Arc<AtomicBool>) -> anyhow::Result<()> {
     let clusters = Api::<RustQueue>::namespaced(client.clone(), &namespace);
     let stateful_sets = Api::<StatefulSet>::namespaced(client, &namespace);
     tracing::info!(%namespace, "share-nothing RustQueue Operator started");
-    Controller::new(clusters, watcher::Config::default())
+    let controller = Controller::new(clusters, watcher::Config::default())
         .owns(stateful_sets, watcher::Config::default())
         .run(reconcile, error_policy, context)
         .for_each(|result| async move {
@@ -56,9 +56,16 @@ pub async fn run(leader: Arc<AtomicBool>) -> anyhow::Result<()> {
                 Ok((reference, _)) => tracing::debug!(object = %reference.name, "reconciled"),
                 Err(error) => tracing::warn!(%error, "controller stream error"),
             }
-        })
-        .await;
-    Ok(())
+        });
+    tokio::select! {
+        result = &mut leadership => {
+            bail!("operator leader election task stopped unexpectedly: {result:?}")
+        }
+        _ = controller => {
+            leadership.abort();
+            bail!("operator controller stream stopped unexpectedly")
+        }
+    }
 }
 
 async fn reconcile(
@@ -402,6 +409,13 @@ fn validate(cluster: &RustQueue) -> anyhow::Result<()> {
         || cluster.spec.max_message_bytes == 0
         || cluster.spec.max_message_bytes > 32 * 1024 * 1024
         || cluster.spec.message_index_cache_bytes == 0
+        || cluster.spec.connection_delivery_inflight_bytes < cluster.spec.max_message_bytes
+        || cluster
+            .spec
+            .connection_delivery_inflight_bytes
+            .checked_mul(2)
+            .is_none_or(|minimum| cluster.spec.node_delivery_inflight_bytes < minimum)
+        || cluster.spec.node_delivery_inflight_bytes > u32::MAX as usize
         || cluster.spec.max_topics == 0
         || cluster.spec.max_publish_workers == 0
         || cluster.spec.publish_worker_idle_seconds == 0

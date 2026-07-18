@@ -3,6 +3,7 @@ use crate::model::ChannelStats;
 use crate::BrokerError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) enum ChannelCommand {
@@ -42,7 +43,7 @@ pub(crate) struct ChannelCheckpoint {
 }
 
 struct InFlight {
-    deadline_ms: i64,
+    deadline: Instant,
     token: u64,
 }
 
@@ -195,15 +196,7 @@ impl ChannelState {
         if self.paused {
             return NextCandidate::None;
         }
-        let expired: Vec<_> = self
-            .in_flight
-            .iter()
-            .filter_map(|(position, flight)| (flight.deadline_ms <= now_ms).then_some(*position))
-            .collect();
-        for position in expired {
-            self.remove_in_flight(position);
-            self.redelivery.insert(position);
-        }
+        self.expire_in_flight();
         let mut absent = Vec::new();
         let redelivery: Vec<_> = self.redelivery.iter().copied().collect();
         for position in redelivery {
@@ -266,7 +259,7 @@ impl ChannelState {
         NextCandidate::None
     }
 
-    pub fn reserve(&mut self, position: u64, id: u64, timeout_ms: i64) -> (u64, u16) {
+    pub fn reserve(&mut self, position: u64, id: u64, timeout: Duration) -> (u64, u16) {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
         let attempts = self.attempts.entry(position).or_insert(0);
@@ -274,7 +267,7 @@ impl ChannelState {
         self.in_flight.insert(
             position,
             InFlight {
-                deadline_ms: now_ms().saturating_add(timeout_ms),
+                deadline: Instant::now() + timeout,
                 token,
             },
         );
@@ -290,6 +283,12 @@ impl ChannelState {
         {
             self.remove_in_flight(position);
             self.redelivery.insert(position);
+            if let Some(attempts) = self.attempts.get_mut(&position) {
+                *attempts = attempts.saturating_sub(1);
+                if *attempts == 0 {
+                    self.attempts.remove(&position);
+                }
+            }
         }
     }
 
@@ -305,11 +304,11 @@ impl ChannelState {
         self.attempts.get(&position).copied().unwrap_or_default()
     }
 
-    pub fn touch(&mut self, position: u64, timeout_ms: i64) -> bool {
+    pub fn touch(&mut self, position: u64, timeout: Duration) -> bool {
         let Some(flight) = self.in_flight.get_mut(&position) else {
             return false;
         };
-        flight.deadline_ms = now_ms().saturating_add(timeout_ms);
+        flight.deadline = Instant::now() + timeout;
         true
     }
 
@@ -329,22 +328,47 @@ impl ChannelState {
         count
     }
 
+    pub fn expire_in_flight(&mut self) -> usize {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .in_flight
+            .iter()
+            .filter_map(|(position, flight)| (flight.deadline <= now).then_some(*position))
+            .collect();
+        let count = expired.len();
+        for position in expired {
+            self.remove_in_flight(position);
+            self.redelivery.insert(position);
+        }
+        count
+    }
+
     pub fn first_in_flight_position(&self) -> Option<u64> {
         self.in_flight.keys().copied().min()
     }
 
     pub fn stats(&self, last_position: u64) -> ChannelStats {
-        let total = last_position.saturating_sub(self.ack_floor_position);
+        let (depth, in_flight_count, deferred_count, ack_gap) = self.metric_counts(last_position);
         ChannelStats {
             name: self.name.clone(),
-            depth: total.saturating_sub(self.acknowledged.len() as u64),
-            in_flight_count: self.in_flight.len() as u64,
-            deferred_count: self.requeued_until.len() as u64,
+            depth,
+            in_flight_count,
+            deferred_count,
             paused: self.paused,
             ephemeral: self.ephemeral,
             ack_cursor: self.ack_floor_position,
-            ack_gap: self.acknowledged.len() as u64,
+            ack_gap,
         }
+    }
+
+    pub fn metric_counts(&self, last_position: u64) -> (u64, u64, u64, u64) {
+        let total = last_position.saturating_sub(self.ack_floor_position);
+        (
+            total.saturating_sub(self.acknowledged.len() as u64),
+            self.in_flight.len() as u64,
+            self.requeued_until.len() as u64,
+            self.acknowledged.len() as u64,
+        )
     }
 
     fn acknowledge(&mut self, position: u64) {
@@ -374,10 +398,27 @@ impl ChannelState {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_an_unhanded_delivery_restores_attempt_count() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 16);
+        let (token, attempts) = channel.reserve(1, 10, Duration::from_secs(30));
+        assert_eq!(attempts, 1);
+        channel.cancel(1, token);
+        assert_eq!(channel.delivery_attempts(1), 0);
+
+        let (_, attempts) = channel.reserve(1, 10, Duration::from_secs(30));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn in_flight_expiry_uses_a_monotonic_deadline() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 16);
+        channel.reserve(1, 10, Duration::ZERO);
+        assert_eq!(channel.expire_in_flight(), 1);
+        assert_eq!(channel.in_flight_position(10), None);
+    }
 }

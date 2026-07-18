@@ -29,12 +29,15 @@ queue:
   storageSize: 100Gi
   storageFeatureLevel: 1
   messageIndexCacheBytes: 67108864
+  maintenanceStartupDelaySeconds: 30
+  nodeDeliveryInflightBytes: 536870912
+  connectionDeliveryInflightBytes: 33554432
   minFreeBytes: 10737418240
   diskHighWatermarkPercent: 85
   diskLowWatermarkPercent: 75
   protectiveEvictionEnabled: true
   diskPressureGraceSeconds: 60
-  bootstrapRetentionSeconds: 30
+  bootstrapRetentionSeconds: 90
   maxMessageBytes: 20971520
   maxTopics: 10000
   maxPublishWorkers: 1024
@@ -45,6 +48,9 @@ queue:
   clientTlsSecretName: ""
   discoveryReplicas: 2
   proxyNodeSelector: {}
+  # Rotate opaque TCP tunnels so a small producer pool is redistributed as the
+  # Broker fleet changes. Set to 0 to keep connections pinned indefinitely.
+  proxyTcpMaxConnectionAgeSeconds: 300
   rollout:
     paused: false
     requireCanaryApproval: false
@@ -67,6 +73,7 @@ console:
   image: ""
   imagePullPolicy: ""
   pollIntervalSeconds: 2
+  catalogRefreshIntervalSeconds: 30
   historyMinutes: 15
   management:
     enabled: false

@@ -59,14 +59,14 @@ There is no broker-to-broker message path and no cluster consensus path.
 
 ### 2.3 Bootstrap retention
 
-Every broker retains each topic message for at least 30 seconds even when no
+Every broker retains each topic message for at least 90 seconds even when no
 channel exists. When a local channel is created, its initial cursor starts at
 the oldest message still inside this bootstrap window.
 
 This deliberately prefers duplicates over misses during the normal discovery
 window. The guarantee is bounded:
 
-- If discovery and `SUB` complete within 30 seconds, messages accepted by a new
+- If discovery and `SUB` complete within 90 seconds, messages accepted by a new
   fallback owner remain consumable by the newly created local channel.
 - A newly created channel may receive a small amount of data published before
   its `SUB`.
@@ -78,7 +78,8 @@ window. The guarantee is bounded:
 - Producers connect to a node-local proxy DaemonSet.
 - The proxy chooses a least-active publish-ready broker for each new TCP
   connection and a randomized ready broker for each HTTP request.
-- A persistent TCP connection stays on one broker until it closes.
+- A TCP connection stays on one broker until it closes or reaches the
+  configured jittered maximum age (300 seconds by default, zero disables it).
 - Ambiguous failures may cause a producer retry to create a duplicate on a
   different broker.
 - Popular topics may spread to every broker. Consumers connecting to every
@@ -86,8 +87,9 @@ window. The guarantee is bounded:
 - Consumers bypass the producer proxy and use discovery plus direct broker
   connections.
 - The number of Brokers used concurrently by TCP publishing cannot exceed the
-  producer connection count. Least-active placement removes avoidable random
-  collisions, but it cannot turn 16 streams into 500-way concurrent disk I/O.
+  producer connection count. Rotation spreads a small long-lived pool across
+  the fleet over time, but it cannot turn 16 streams into 500-way concurrent
+  disk I/O.
 
 ### 2.5 Ordering and identity
 
@@ -123,7 +125,7 @@ The broker exposes a small authenticated discovery endpoint containing:
 `rustqueue-discovery` is a stateless deployment with two independent replicas.
 Each replica:
 
-1. watches the broker Kubernetes EndpointSlice;
+1. lists the broker Kubernetes EndpointSlice with a 1.5-second request deadline;
 2. polls a small broker revision/readiness head every 2 seconds and downloads
    the full registry only for a new Broker or changed registry revision;
 3. expires stale broker observations after 5 seconds;
@@ -134,7 +136,8 @@ Each replica:
 Discovery state is derived and is never authoritative message metadata. A
 restart reconstructs the complete index from ready brokers. Replicas do not
 coordinate and clients may union their answers exactly as with multiple
-`nsqlookupd` instances.
+`nsqlookupd` instances. A timed-out EndpointSlice request is canceled, counted,
+and followed by the normal 5-second stale-observation fail-closed behavior.
 
 ### 3.3 Producer proxy
 
@@ -142,8 +145,10 @@ coordinate and clients may union their answers exactly as with multiple
 versions do not need `PreferSameNode` support.
 
 - TCP is a bounded L4 pass-through. It chooses the ready backend with the fewest
-  active proxy connections, keeps a lease until disconnect, and does not parse
-  or replay commands.
+  active proxy connections and does not parse or replay commands. A jittered
+  maximum tunnel age periodically reconnects official producers so connection
+  placement adapts to Broker fleet changes; the boundary remains an ambiguous
+  failure and therefore may produce an at-least-once duplicate on retry.
 - HTTP is a bounded reverse proxy. Node-level connection and in-flight body
   budgets reject excess load instead of allowing proxy memory to grow without
   limit. It may retry only before receiving a backend response; an ambiguous
@@ -177,13 +182,19 @@ persisted in RustQueue status, but reconciliation still checks live Pod, drain,
 PVC and capability state before advancing. This makes restart continuation
 idempotent without treating status as an execution log.
 
-Drain has two readiness dimensions:
+Drain has two completion levels:
 
-1. stop accepting new publishes so proxies exclude the broker;
-2. remain visible to lookup consumers until all durable channel depth is zero.
+1. `quiesced`: stop accepting new publishes and wait for in-flight leases to
+   reach zero; rolling replacement may now restart the same ordinal and PVC;
+2. `empty`: additionally wait for stored messages and durable channel depth to
+   reach zero; scale-down and targeted maintenance require this level.
 
-If drain times out, scale-down remains blocked. Forced discard is a separate,
-audited administrative action.
+Rolling replacement preserves backlog on the reattached PVC and therefore does
+not wait for it to drain. If empty drain times out, scale-down and maintenance
+remain blocked. Older v7 Brokers that do not report the delivery-freeze state
+must reach their legacy full-empty drain before replacement; the Operator does
+not synthesize a quiesced result from an unstable in-flight sample. Forced
+discard is a separate, audited administrative action.
 
 ## 4. Format v7 storage
 
@@ -226,7 +237,9 @@ audited administrative action.
   message count; disk high-watermark and minimum-free-space policy controls
   publish rejection.
 - The active tail is always fully scanned. Cold indexed payload corruption is
-  detected and isolated on payload read or by the immediate background scrub.
+  detected and isolated on payload read or by background scrub. Automatic scrub
+  and normal GC wait for the configured startup quiet period (30 seconds by
+  default), while disk-pressure admission remains active immediately.
   Scrub pins an immutable file list while holding the Topic lock, then releases
   that lock and verifies the files sequentially with a configurable bandwidth
   ceiling (`scrub_bytes_per_second`, 64 MiB/s by default).
@@ -248,13 +261,18 @@ audited administrative action.
   fsync before the covered WAL can be removed.
 - In-flight leases are not checkpointed. Recovery makes their messages
   immediately eligible for redelivery.
+- Payload bodies retained for network delivery consume a node-wide working-set
+  budget before disk read and keep that reservation through the socket write.
+  Cache misses conservatively charge both the read buffer and delivered body.
+  A per-connection fetch cap prevents one slow consumer from monopolizing the
+  node budget; cancellation returns both the memory permit and queue lease.
 
 ### 4.3 GC and disk pressure
 
 A complete segment may be deleted only when it is older than:
 
 - every durable local channel retention cursor;
-- the 30-second bootstrap floor;
+- the 90-second bootstrap floor;
 - every active reader reference;
 - every pending DLQ outbox reference.
 
@@ -272,6 +290,12 @@ position, and log-index summaries plus the bounded active tail. It does not
 linearly walk a multi-million-message backlog on every five-second pass.
 Physical deletion remains a contiguous immutable-segment prefix, and cached
 metadata pages are invalidated with actual reclamation.
+
+A normal GC tick examines at most 128 Topics using a rotating cursor. It does
+not fsync a manifest or seal a segment until a reclaimable immutable prefix
+exists; an active tail is sealed only when every message in that tail is below
+the retention boundary. Consequently an abandoned channel cannot create a new
+segment and sidecar pair every five seconds.
 
 ### 4.4 DLQ
 
@@ -365,8 +389,9 @@ The implementation is complete only when all of the following pass:
    GC delete boundaries reopen successfully without losing acknowledged live
    records.
 3. Tail corruption truncates safely; middle corruption isolates the topic.
-4. A new fallback owner is discovered and subscribed within 5 seconds, and the
-   30-second bootstrap ledger has `missing=0` with duplicates reported.
+4. Discovery indexes a new fallback owner within 5 seconds. An official Go
+   consumer using the unchanged 60-second poll and 30% jitter then subscribes
+   before the 90-second bootstrap floor expires; its ledger has `missing=0`.
 5. Official Go and Python NSQ clients pass direct, lookup, compression, TLS,
    AUTH, MPUB, DPUB, REQ, TOUCH, fan-out, sampling, and ephemeral cases.
 6. Broker restart reattaches its PVC and resumes its local backlog.

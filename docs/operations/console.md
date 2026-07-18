@@ -43,20 +43,23 @@ browser. Chinese and English are supported.
 
 ## Live trends
 
-The backend polls every two seconds by default and retains 15 minutes of samples
-in a bounded in-memory buffer. There is no Prometheus dependency. The buffer
-resets on Console Pod restart and rate calculation resets whenever the observed
-broker membership changes.
+The backend polls a lightweight runtime/revision head every two seconds and
+retains 15 minutes of samples in a bounded in-memory buffer. The full
+Topic/Channel catalog is cached and refreshed on revision, Pod or management
+fence changes, plus a 30-second fallback. There is no Prometheus dependency.
+The buffer resets on Console Pod restart and rate calculation resets whenever
+the observed broker membership changes.
 
 ```yaml
 console:
   enabled: true
   pollIntervalSeconds: 2
+  catalogRefreshIntervalSeconds: 30
   historyMinutes: 15
 ```
 
-The poll interval must be 1 to 5 seconds. The history window must be 1 to 60
-minutes.
+The poll interval must be 1 to 5 seconds. Catalog refresh must be between the
+poll interval and 300 seconds. The history window must be 1 to 60 minutes.
 
 ## Topic and Channel management
 

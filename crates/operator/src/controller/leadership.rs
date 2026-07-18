@@ -8,24 +8,47 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const LEASE_NAME: &str = "rustqueue-operator-leader";
 const LEASE_SECONDS: u64 = 20;
 const RENEW_INTERVAL: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RENEWED_AT: &str = "rustqueue.io/renewed-at-unix";
 
-pub(super) fn start(client: kube::Client, namespace: String, leader: Arc<AtomicBool>) {
+pub(super) fn start(
+    client: kube::Client,
+    namespace: String,
+    leader: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
     let identity = std::env::var("POD_NAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| format!("operator-{}", std::process::id()));
     tokio::spawn(async move {
+        let _reset = LeaderReset(Arc::clone(&leader));
         loop {
-            match acquire_or_renew(&client, &namespace, &identity).await {
-                Ok(acquired) => leader.store(acquired, Ordering::Release),
-                Err(error) => {
+            match tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                acquire_or_renew(&client, &namespace, &identity),
+            )
+            .await
+            {
+                Ok(Ok(acquired)) => leader.store(acquired, Ordering::Release),
+                Ok(Err(error)) => {
                     leader.store(false, Ordering::Release);
                     tracing::warn!(%error, "operator leader lease renewal failed");
+                }
+                Err(_) => {
+                    leader.store(false, Ordering::Release);
+                    tracing::warn!("operator leader lease renewal timed out");
                 }
             }
             tokio::time::sleep(RENEW_INTERVAL).await;
         }
-    });
+    })
+}
+
+struct LeaderReset(Arc<AtomicBool>);
+
+impl Drop for LeaderReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 async fn acquire_or_renew(

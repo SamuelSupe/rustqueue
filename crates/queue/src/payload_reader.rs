@@ -48,6 +48,7 @@ struct FileCache {
 
 pub(crate) struct PayloadReader {
     cache: Mutex<PayloadCache>,
+    files: Arc<Mutex<FileCache>>,
     sender: SyncSender<ReadJob>,
     active_paths: Arc<Mutex<HashMap<std::path::PathBuf, usize>>>,
     latency: Arc<LatencyHistogram>,
@@ -91,6 +92,7 @@ impl PayloadReader {
                 bytes: 0,
                 max_bytes: cache_bytes.max(1),
             }),
+            files,
             sender,
             active_paths,
             latency,
@@ -200,6 +202,36 @@ impl PayloadReader {
             .lock()
             .keys()
             .any(|path| path.starts_with(directory))
+    }
+
+    pub fn prune_deleted_files(&self) {
+        let mut files = self.files.lock();
+        files.values.retain(|path, _| path.exists());
+        let live: BTreeSet<_> = files.values.keys().cloned().collect();
+        files.order.retain(|path| live.contains(path));
+    }
+
+    pub fn invalidate_under(&self, directory: &Path) {
+        let mut cache = self.cache.lock();
+        let removed: Vec<_> = cache
+            .values
+            .keys()
+            .filter(|payload| payload.path.starts_with(directory))
+            .cloned()
+            .collect();
+        for payload in removed {
+            if let Some(body) = cache.values.remove(&payload) {
+                cache.bytes = cache.bytes.saturating_sub(body.len());
+            }
+        }
+        cache
+            .order
+            .retain(|payload| !payload.path.starts_with(directory));
+        drop(cache);
+
+        let mut files = self.files.lock();
+        files.values.retain(|path, _| !path.starts_with(directory));
+        files.order.retain(|path| !path.starts_with(directory));
     }
 }
 
@@ -433,5 +465,31 @@ mod tests {
                 .unwrap()[0],
             b"payload"
         );
+    }
+
+    #[tokio::test]
+    async fn invalidation_drops_stale_payloads_and_file_descriptors() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("payload");
+        std::fs::write(&path, b"old").unwrap();
+        let old = PayloadRef {
+            path: Arc::new(path.clone()),
+            offset: 0,
+            len: 3,
+            crc32c: crc32c::crc32c(b"old"),
+        };
+        let reader = PayloadReader::new(1024, 1, 4, Arc::new(LatencyHistogram::default()));
+        assert_eq!(&*reader.read_many(&[old]).await.unwrap()[0], b"old");
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"new").unwrap();
+        reader.invalidate_under(root.path());
+        let new = PayloadRef {
+            path: Arc::new(path),
+            offset: 0,
+            len: 3,
+            crc32c: crc32c::crc32c(b"new"),
+        };
+        assert_eq!(&*reader.read_many(&[new]).await.unwrap()[0], b"new");
     }
 }

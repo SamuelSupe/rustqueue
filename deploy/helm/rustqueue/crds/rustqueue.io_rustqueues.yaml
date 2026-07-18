@@ -40,12 +40,15 @@ spec:
                 storageSize: {type: string, default: 100Gi}
                 storageFeatureLevel: {type: integer, format: int32, minimum: 1, default: 1}
                 messageIndexCacheBytes: {type: integer, format: int64, minimum: 1, default: 67108864}
+                maintenanceStartupDelaySeconds: {type: integer, format: int64, minimum: 0, maximum: 3600, default: 30}
+                nodeDeliveryInflightBytes: {type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 536870912}
+                connectionDeliveryInflightBytes: {type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 33554432}
                 minFreeBytes: {type: integer, format: int64, minimum: 0, default: 10737418240}
                 diskHighWatermarkPercent: {type: integer, format: int32, minimum: 1, maximum: 100, default: 85}
                 diskLowWatermarkPercent: {type: integer, format: int32, minimum: 0, maximum: 99, default: 75}
                 protectiveEvictionEnabled: {type: boolean, default: true}
                 diskPressureGraceSeconds: {type: integer, format: int64, minimum: 0, default: 60}
-                bootstrapRetentionSeconds: {type: integer, format: int64, minimum: 1, default: 30}
+                bootstrapRetentionSeconds: {type: integer, format: int64, minimum: 1, default: 90}
                 maxMessageBytes: {type: integer, format: int64, minimum: 1, maximum: 33554432, default: 20971520}
                 maxTopics: {type: integer, format: int64, minimum: 1, default: 10000}
                 maxPublishWorkers: {type: integer, format: int64, minimum: 1, default: 1024}
@@ -59,6 +62,7 @@ spec:
                   type: object
                   additionalProperties: {type: string}
                   default: {}
+                proxyTcpMaxConnectionAgeSeconds: {type: integer, format: int64, minimum: 0, default: 300}
                 discoveryReplicas: {type: integer, format: int32, minimum: 2, default: 2}
                 maintenance:
                   type: object

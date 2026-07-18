@@ -59,9 +59,14 @@ maintenance request exists per RustQueue, which prevents conflicting drains.
 ## Rolling an image
 
 Set the image through Helm or patch the RustQueue. The Operator performs target
-image capability preflight, validates every current Broker and then drains and
-replaces one highest outdated ordinal at a time. It will not touch the next Pod
-until the replacement is Ready.
+image capability preflight, validates every current Broker, quiesces publishing
+and freezes new delivery, waits for already-issued leases and delivery buffers
+to reach a stable zero boundary, then replaces one highest outdated ordinal at
+a time. The durable backlog stays on that ordinal's PVC and does not block
+rollout. The Operator will not touch the next Pod until the replacement is
+Ready. A Broker that predates the delivery-freeze response contract is handled
+fail-safe: its first upgrade waits for the legacy full-empty drain instead of
+assuming that a momentary zero in-flight count is a stable barrier.
 
 Canary approval is optional:
 
@@ -110,7 +115,8 @@ next pass.
 Scale-down always drains the highest ordinal and retains its PVC. Retained
 claims appear in `status.orphanedPvcs`; RustQueue never deletes them
 automatically. Deleting one is an explicit irreversible acknowledgement that
-its remaining messages are no longer required.
+its remaining messages are no longer required. Unlike rolling replacement,
+scale-down requires the Broker to be fully empty.
 
 ## Alerts and failure response
 

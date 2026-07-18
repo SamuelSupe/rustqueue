@@ -59,11 +59,7 @@ impl Topic {
                 channel.state.defer_candidate(position);
                 break;
             }
-            let (token, attempts) = channel.state.reserve(
-                position,
-                message.id,
-                timeout.as_millis().min(i64::MAX as u128) as i64,
-            );
+            let (token, attempts) = channel.state.reserve(position, message.id, timeout);
             bytes = bytes.saturating_add(next_bytes);
             reserved.push(ReservedDelivery {
                 position,
@@ -170,10 +166,7 @@ impl Topic {
             .state
             .in_flight_position(id)
             .ok_or(BrokerError::MessageNotInFlight)?;
-        if channel
-            .state
-            .touch(position, timeout.as_millis().min(i64::MAX as u128) as i64)
-        {
+        if channel.state.touch(position, timeout) {
             Ok(())
         } else {
             Err(BrokerError::MessageNotInFlight)

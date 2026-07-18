@@ -12,6 +12,36 @@ use serde_json::json;
 struct DrainStatus {
     draining: bool,
     drained: bool,
+    #[serde(default)]
+    quiesced: Option<bool>,
+    #[serde(default)]
+    delivery_frozen: Option<bool>,
+    #[serde(default)]
+    empty: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum DrainGoal {
+    Quiesced,
+    Empty,
+}
+
+impl DrainStatus {
+    fn satisfies(&self, goal: DrainGoal) -> bool {
+        match goal {
+            DrainGoal::Quiesced => match (self.delivery_frozen, self.quiesced) {
+                (Some(true), Some(quiesced)) => quiesced,
+                (Some(false), _) => false,
+                // A broker predating the delivery-freeze contract can keep a
+                // fetch active after reporting zero in-flight messages. Its
+                // legacy `drained` flag is safe because it also requires the
+                // local backlog to be empty; accepting a synthetic quiesce is
+                // not.
+                _ => self.drained,
+            },
+            DrainGoal::Empty => self.empty.unwrap_or(self.drained),
+        }
+    }
 }
 
 pub(super) struct Progress {
@@ -46,7 +76,7 @@ pub(super) async fn resume_current(
             continue;
         };
         if current && drain_status(context, ip, auth).await?.draining {
-            set_drain(context, ip, auth, false).await?;
+            set_drain(context, ip, auth, false, false).await?;
         }
     }
     Ok(())
@@ -61,7 +91,7 @@ pub(super) async fn scale_down_one(
 ) -> anyhow::Result<Progress> {
     let next = current - 1;
     let pod_name = format!("{}-{next}", cluster.name_any());
-    if drain_pod(context, namespace, &pod_name, auth).await? {
+    if drain_pod(context, namespace, &pod_name, DrainGoal::Empty, auth).await? {
         Api::<StatefulSet>::namespaced(context.client.clone(), namespace)
             .patch(
                 &cluster.name_any(),
@@ -123,7 +153,7 @@ pub(super) async fn rollout_one(
             message,
         }),
         Decision::Replace(name) => {
-            if drain_pod(context, namespace, &name, auth).await? {
+            if drain_pod(context, namespace, &name, DrainGoal::Quiesced, auth).await? {
                 api.delete(&name, &DeleteParams::default()).await?;
                 Ok(Progress {
                     target: Some(name.clone()),
@@ -165,7 +195,7 @@ pub(super) async fn maintenance(
         .as_ref()
         .and_then(|status| status.pod_ip.as_deref())
         .ok_or_else(|| anyhow::anyhow!("maintenance target {broker} has no Pod IP"))?;
-    set_drain(context, ip, auth, enabled).await?;
+    set_drain(context, ip, auth, enabled, false).await?;
     let status = drain_status(context, ip, auth).await?;
     let (phase, message) = if enabled && status.drained {
         (
@@ -267,6 +297,7 @@ async fn drain_pod(
     context: &ContextData,
     namespace: &str,
     pod_name: &str,
+    goal: DrainGoal,
     auth: &AuthSecret,
 ) -> anyhow::Result<bool> {
     let api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
@@ -280,8 +311,8 @@ async fn drain_pod(
     else {
         return Ok(false);
     };
-    set_drain(context, ip, auth, true).await?;
-    Ok(drain_status(context, ip, auth).await?.drained)
+    set_drain(context, ip, auth, true, matches!(goal, DrainGoal::Quiesced)).await?;
+    Ok(drain_status(context, ip, auth).await?.satisfies(goal))
 }
 
 async fn set_drain(
@@ -289,12 +320,16 @@ async fn set_drain(
     ip: &str,
     auth: &AuthSecret,
     enabled: bool,
+    freeze_deliveries: bool,
 ) -> anyhow::Result<()> {
     context
         .http
         .post(format!("{}/v1/drain", origin(ip)))
         .bearer_auth(&auth.admin_token)
-        .json(&json!({"enabled": enabled}))
+        .json(&json!({
+            "enabled": enabled,
+            "freeze_deliveries": freeze_deliveries,
+        }))
         .send()
         .await?
         .error_for_status()?;
@@ -452,5 +487,53 @@ mod tests {
     fn formats_ipv4_and_ipv6_origins() {
         assert_eq!(origin("10.0.0.1"), "http://10.0.0.1:4151");
         assert_eq!(origin("fd00::1"), "http://[fd00::1]:4151");
+    }
+
+    #[test]
+    fn rollout_accepts_quiesced_backlog_but_scale_down_does_not() {
+        let status: DrainStatus = serde_json::from_value(json!({
+            "draining": true,
+            "drained": false,
+            "quiesced": true,
+            "delivery_frozen": true,
+            "empty": false,
+            "in_flight": 0
+        }))
+        .unwrap();
+        assert!(status.satisfies(DrainGoal::Quiesced));
+        assert!(!status.satisfies(DrainGoal::Empty));
+    }
+
+    #[test]
+    fn rollout_requires_an_older_v7_broker_to_be_fully_drained() {
+        let status: DrainStatus = serde_json::from_value(json!({
+            "draining": true,
+            "drained": false,
+            "in_flight": 0
+        }))
+        .unwrap();
+        assert!(!status.satisfies(DrainGoal::Quiesced));
+        assert!(!status.satisfies(DrainGoal::Empty));
+
+        let status: DrainStatus = serde_json::from_value(json!({
+            "draining": true,
+            "drained": true,
+            "in_flight": 0
+        }))
+        .unwrap();
+        assert!(status.satisfies(DrainGoal::Quiesced));
+    }
+
+    #[test]
+    fn rollout_rejects_a_new_broker_without_a_delivery_freeze() {
+        let status: DrainStatus = serde_json::from_value(json!({
+            "draining": true,
+            "drained": false,
+            "quiesced": true,
+            "delivery_frozen": false,
+            "in_flight": 0
+        }))
+        .unwrap();
+        assert!(!status.satisfies(DrainGoal::Quiesced));
     }
 }

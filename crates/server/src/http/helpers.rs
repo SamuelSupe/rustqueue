@@ -204,14 +204,9 @@ pub(super) fn validate_defer(defer: u64, config: &Config) -> Result<(), ApiError
 }
 
 pub(super) fn backlog(stats: &BrokerStats) -> (u64, u64, u64) {
-    let stored = stats.topics.iter().map(|topic| topic.message_count).sum();
-    let mut depth = 0u64;
-    let mut in_flight = 0u64;
-    for topic in &stats.topics {
-        for channel in &topic.channels {
-            depth = depth.saturating_add(channel.depth);
-            in_flight = in_flight.saturating_add(channel.in_flight_count);
-        }
-    }
-    (stored, depth, in_flight)
+    (
+        stats.aggregate.message_count,
+        stats.aggregate.channel_depth,
+        stats.aggregate.channel_in_flight,
+    )
 }

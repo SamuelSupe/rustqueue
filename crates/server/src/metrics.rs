@@ -63,41 +63,13 @@ pub struct RuntimeMetricsSnapshot {
 }
 
 pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
-    let topic_count = stats.topics.len() as u64;
-    let message_count = stats
-        .topics
-        .iter()
-        .map(|topic| topic.message_count)
-        .sum::<u64>();
-    let channel_count = stats
-        .topics
-        .iter()
-        .map(|topic| topic.channels.len() as u64)
-        .sum::<u64>();
-    let channel_depth = stats
-        .topics
-        .iter()
-        .flat_map(|topic| &topic.channels)
-        .map(|channel| channel.depth)
-        .sum::<u64>();
-    let channel_in_flight = stats
-        .topics
-        .iter()
-        .flat_map(|topic| &topic.channels)
-        .map(|channel| channel.in_flight_count)
-        .sum::<u64>();
-    let channel_deferred = stats
-        .topics
-        .iter()
-        .flat_map(|topic| &topic.channels)
-        .map(|channel| channel.deferred_count)
-        .sum::<u64>();
-    let channel_ack_gap = stats
-        .topics
-        .iter()
-        .flat_map(|topic| &topic.channels)
-        .map(|channel| channel.ack_gap)
-        .sum::<u64>();
+    let topic_count = stats.aggregate.topic_count;
+    let message_count = stats.aggregate.message_count;
+    let channel_count = stats.aggregate.channel_count;
+    let channel_depth = stats.aggregate.channel_depth;
+    let channel_in_flight = stats.aggregate.channel_in_flight;
+    let channel_deferred = stats.aggregate.channel_deferred;
+    let channel_ack_gap = stats.aggregate.channel_ack_gap;
     let mut output = format!(
         "# TYPE rustqueue_publish_group_commits_total counter\n\
          rustqueue_publish_group_commits_total {}\n\
@@ -136,7 +108,13 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
          # TYPE rustqueue_channel_deferred_total gauge\n\
          rustqueue_channel_deferred_total {channel_deferred}\n\
          # TYPE rustqueue_channel_ack_gap_total gauge\n\
-         rustqueue_channel_ack_gap_total {channel_ack_gap}\n",
+         rustqueue_channel_ack_gap_total {channel_ack_gap}\n\
+         # TYPE rustqueue_delivery_inflight_bytes gauge\n\
+         rustqueue_delivery_inflight_bytes {}\n\
+         # TYPE rustqueue_delivery_budget_waiters gauge\n\
+         rustqueue_delivery_budget_waiters {}\n\
+         # TYPE rustqueue_delivery_budget_waits_total counter\n\
+         rustqueue_delivery_budget_waits_total {}\n",
         stats.publish_group_commit.commits,
         stats.publish_group_commit.requests,
         stats.publish_group_commit.max_batch_requests,
@@ -149,6 +127,9 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
         stats.channel_group_commit.active_workers,
         stats.channel_group_commit.retired_workers,
         stats.channel_group_commit.rejected_workers,
+        stats.delivery_budget.in_flight_bytes,
+        stats.delivery_budget.waiters,
+        stats.delivery_budget.waits_total,
     );
     render_detailed_queue_metrics(&mut output, stats, config);
     for (name, help, snapshot) in [
@@ -204,12 +185,13 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
 }
 
 fn render_detailed_queue_metrics(output: &mut String, stats: &BrokerStats, config: &MetricsConfig) {
-    let desired = stats.topics.len()
-        + stats
-            .topics
-            .iter()
-            .map(|topic| topic.channels.len().saturating_mul(4))
-            .sum::<usize>();
+    let desired = usize::try_from(stats.aggregate.topic_count)
+        .unwrap_or(usize::MAX)
+        .saturating_add(
+            usize::try_from(stats.aggregate.channel_count)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(4),
+        );
     let mut emitted = 0usize;
     if config.detailed_queue_metrics {
         output.push_str(
@@ -381,10 +363,21 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustqueue_queue::{ChannelStats, TopicStats};
+    use rustqueue_queue::{ChannelStats, QueueAggregateStats, TopicStats};
 
     fn broker_stats() -> BrokerStats {
         BrokerStats {
+            aggregate: QueueAggregateStats {
+                topic_count: 1,
+                message_count: 7,
+                segment_count: 1,
+                segment_bytes: 100,
+                channel_count: 1,
+                channel_depth: 3,
+                channel_in_flight: 2,
+                channel_deferred: 1,
+                channel_ack_gap: 2,
+            },
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,

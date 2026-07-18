@@ -43,6 +43,10 @@ impl Config {
             &mut self.storage.message_index_cache_bytes,
         )?;
         set_from_env(
+            "RUSTQUEUE_MAINTENANCE_STARTUP_DELAY_SECONDS",
+            &mut self.storage.maintenance_startup_delay_seconds,
+        )?;
+        set_from_env(
             "RUSTQUEUE_MAX_MESSAGE_BYTES",
             &mut self.queue.max_message_bytes,
         )?;
@@ -67,6 +71,14 @@ impl Config {
         set_from_env(
             "RUSTQUEUE_CONNECTION_PUBLISH_INFLIGHT_BYTES",
             &mut self.limits.connection_publish_inflight_bytes,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_NODE_DELIVERY_INFLIGHT_BYTES",
+            &mut self.limits.node_delivery_inflight_bytes,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_CONNECTION_DELIVERY_INFLIGHT_BYTES",
+            &mut self.limits.connection_delivery_inflight_bytes,
         )?;
         set_from_env(
             "RUSTQUEUE_PROTECTIVE_EVICTION_ENABLED",

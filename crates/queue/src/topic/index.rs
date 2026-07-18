@@ -198,6 +198,10 @@ impl MessageIndex {
         self.active.len()
     }
 
+    pub(crate) fn active_last_position(&self) -> Option<u64> {
+        self.active.back().map(|message| message.position)
+    }
+
     #[cfg(test)]
     pub(crate) fn sealed_count(&self) -> usize {
         self.sealed.len()
@@ -265,6 +269,13 @@ impl MessageIndex {
             .take_while(|segment| segment.last_position < retain_from)
             .last()
             .map(|segment| segment.last_log_index)
+    }
+
+    pub(crate) fn first_purge_path(&self, retain_from: u64) -> Option<&Path> {
+        self.sealed
+            .front()
+            .filter(|segment| segment.last_position < retain_from)
+            .map(|segment| segment.metadata.segment_path())
     }
 
     pub(crate) fn eviction_range(&self, through_index: u64) -> Option<(u64, u64, u64)> {
@@ -380,6 +391,9 @@ impl MessageIndex {
 
 impl Drop for MessageIndex {
     fn drop(&mut self) {
+        for segment in &self.sealed {
+            self.cache.invalidate(segment.metadata.segment_path());
+        }
         self.cache.release_active(self.active.len());
     }
 }

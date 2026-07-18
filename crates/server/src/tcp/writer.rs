@@ -40,6 +40,48 @@ impl ClientWriter {
     }
 }
 
+pub(super) fn delivery_write_timeout(heartbeat: Option<Duration>) -> Duration {
+    heartbeat
+        .unwrap_or(Duration::from_secs(30))
+        .saturating_mul(2)
+        .max(Duration::from_secs(1))
+}
+
+pub(super) fn connection_progress_timeout(heartbeat: Option<Duration>) -> Duration {
+    heartbeat
+        .map(|interval| interval.saturating_mul(2))
+        .unwrap_or(Duration::from_secs(60))
+        .max(Duration::from_secs(5))
+}
+
+pub(super) async fn write_error_timed(
+    writer: &mut ClientWriter,
+    heartbeat: Option<Duration>,
+    code: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        connection_progress_timeout(heartbeat),
+        write_error(writer, code, detail),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("client error write timed out"))??;
+    Ok(())
+}
+
+pub(super) async fn flush_timed(
+    writer: &mut ClientWriter,
+    heartbeat: Option<Duration>,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        connection_progress_timeout(heartbeat),
+        writer.flush_pending(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("client output flush timed out"))??;
+    Ok(())
+}
+
 impl AsyncWrite for ClientWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -125,5 +167,19 @@ mod tests {
         let mut received = [0; 8];
         peer.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"headbody");
+    }
+
+    #[test]
+    fn client_write_timeouts_are_bounded_when_heartbeats_are_disabled() {
+        assert_eq!(delivery_write_timeout(None), Duration::from_secs(60));
+        assert_eq!(
+            delivery_write_timeout(Some(Duration::from_millis(100))),
+            Duration::from_secs(1)
+        );
+        assert_eq!(connection_progress_timeout(None), Duration::from_secs(60));
+        assert_eq!(
+            connection_progress_timeout(Some(Duration::from_millis(100))),
+            Duration::from_secs(5)
+        );
     }
 }

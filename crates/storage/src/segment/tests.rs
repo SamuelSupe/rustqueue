@@ -72,6 +72,19 @@ fn sealed_segments_recover_from_the_sidecar_index() {
 }
 
 #[test]
+fn storage_usage_includes_recovery_sidecars() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    log.append(record(0, &[1; 20]), true).unwrap();
+    log.append(record(0, &[2; 20]), true).unwrap();
+    let sealed = log.segment_paths().unwrap()[0].clone();
+    let before = log.storage_usage().1;
+    log.persist_recovery_index(&sealed, vec![0x5a; 4096])
+        .unwrap();
+    assert!(log.storage_usage().1 >= before.saturating_add(4096));
+}
+
+#[test]
 fn corrupt_sidecar_falls_back_to_a_full_segment_scan() {
     let directory = tempdir().unwrap();
     let mut log = SegmentLog::open(directory.path(), 100).unwrap();
@@ -232,11 +245,32 @@ fn purges_only_complete_inactive_segments() {
         log.append(record(0, &[value; 20]), true).unwrap();
     }
     assert_eq!(log.segment_paths().unwrap().len(), 4);
+    let bytes_before = log.storage_usage().1;
     assert_eq!(log.purge_prefix(2).unwrap(), 2);
     assert_eq!(log.first_index(), Some(3));
     assert_eq!(log.segment_paths().unwrap().len(), 2);
+    assert!(log.storage_usage().1 < bytes_before);
     assert!(log.read(2).unwrap().is_none());
     assert_eq!(log.read(3).unwrap().unwrap().payload, vec![3; 20]);
+}
+
+#[test]
+fn cached_log_bounds_survive_empty_reopen_and_truncation() {
+    let directory = tempdir().unwrap();
+    let log = SegmentLog::open_with_start_index(directory.path(), 1024, 17).unwrap();
+    assert_eq!(log.first_index(), None);
+    assert_eq!(log.last_index(), None);
+    assert_eq!(log.next_index(), 17);
+    drop(log);
+
+    let mut log = SegmentLog::open_with_start_index(directory.path(), 1024, 17).unwrap();
+    assert_eq!(log.last_index(), None);
+    log.append(record(0, b"one"), true).unwrap();
+    log.append(record(0, b"two"), true).unwrap();
+    assert_eq!((log.first_index(), log.last_index()), (Some(17), Some(18)));
+    log.truncate_suffix(18).unwrap();
+    assert_eq!((log.first_index(), log.last_index()), (Some(17), Some(17)));
+    assert_eq!(log.next_index(), 18);
 }
 
 #[test]

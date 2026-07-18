@@ -3,11 +3,14 @@ use rustqueue_queue::BrokerStats;
 use rustqueue_telemetry::HistogramSnapshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BrokerObservation {
     pub schema_version: u32,
     pub collected_at_ms: u64,
+    #[serde(default)]
+    pub catalog_collected_at_ms: u64,
     #[serde(default)]
     pub registry_revision: u64,
     pub node: ObserverNode,
@@ -15,8 +18,39 @@ pub struct BrokerObservation {
     pub disk: ObserverDisk,
     pub storage: ObserverStorage,
     pub runtime: RuntimeCounters,
-    pub queue: BrokerStats,
+    #[serde(default)]
+    pub delivery_budget: rustqueue_queue::DeliveryBudgetStats,
+    pub queue: Arc<BrokerStats>,
     pub limits: ObserverLimits,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct BrokerObservationHead {
+    pub schema_version: u32,
+    pub collected_at_ms: u64,
+    #[serde(default)]
+    pub registry_revision: u64,
+    pub node: ObserverNode,
+    pub readiness: ObserverReadiness,
+    pub disk: ObserverDisk,
+    pub runtime: RuntimeCounters,
+    #[serde(default)]
+    pub delivery_budget: rustqueue_queue::DeliveryBudgetStats,
+    pub limits: ObserverLimits,
+}
+
+impl BrokerObservationHead {
+    pub fn merge_into(self, observation: &mut BrokerObservation) {
+        observation.schema_version = self.schema_version;
+        observation.collected_at_ms = self.collected_at_ms;
+        observation.registry_revision = self.registry_revision;
+        observation.node = self.node;
+        observation.readiness = self.readiness;
+        observation.disk = self.disk;
+        observation.runtime = self.runtime;
+        observation.delivery_budget = self.delivery_budget;
+        observation.limits = self.limits;
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -147,6 +181,8 @@ pub struct SummaryView {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BrokerView {
+    #[serde(skip_serializing)]
+    pub uid: String,
     pub name: String,
     pub node_name: String,
     pub pod_ip: String,
@@ -265,4 +301,39 @@ pub struct RawCounters {
     pub delivered_messages: u64,
     pub finished_messages: u64,
     pub publish_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn head_merge_keeps_the_catalog_and_updates_runtime_state() {
+        let mut observation = BrokerObservation {
+            catalog_collected_at_ms: 10,
+            ..Default::default()
+        };
+        Arc::make_mut(&mut observation.queue)
+            .topics
+            .push(rustqueue_queue::TopicStats {
+                name: "events".into(),
+                paused: false,
+                message_count: 1,
+                segment_count: 1,
+                segment_bytes: 128,
+                channels: Vec::new(),
+            });
+        let mut head = BrokerObservationHead {
+            collected_at_ms: 20,
+            registry_revision: 7,
+            ..Default::default()
+        };
+        head.runtime.publish_messages = 3;
+        head.merge_into(&mut observation);
+
+        assert_eq!(observation.collected_at_ms, 20);
+        assert_eq!(observation.catalog_collected_at_ms, 10);
+        assert_eq!(observation.queue.topics[0].name, "events");
+        assert_eq!(observation.runtime.publish_messages, 3);
+    }
 }

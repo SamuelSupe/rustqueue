@@ -3,6 +3,8 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct BrokerMeta {
     pub format: u8,
@@ -23,7 +25,7 @@ pub(crate) struct TopicManifest {
 }
 
 pub(crate) fn load_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
-    match fs::read(path) {
+    match read_bounded(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(io::Error::other),
@@ -33,7 +35,7 @@ pub(crate) fn load_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Opti
 }
 
 pub(crate) fn load_topic_manifest(path: &Path) -> io::Result<Option<TopicManifest>> {
-    match fs::read(path) {
+    match read_bounded(path) {
         Ok(bytes) => parse_topic_manifest(&bytes).map(Some),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -61,6 +63,12 @@ pub(crate) fn store_bytes_atomic_with_failpoint(
     bytes: &[u8],
     failpoint: Option<&str>,
 ) -> io::Result<()> {
+    if bytes.len() as u64 > MAX_METADATA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata file exceeds the maximum size",
+        ));
+    }
     let parent = path.parent().expect("metadata path has parent");
     fs::create_dir_all(parent)?;
     let temporary = temporary_path(path);
@@ -72,6 +80,16 @@ pub(crate) fn store_bytes_atomic_with_failpoint(
     }
     fs::rename(&temporary, path)?;
     File::open(parent)?.sync_all()
+}
+
+fn read_bounded(path: &Path) -> io::Result<Vec<u8>> {
+    if fs::metadata(path)?.len() > MAX_METADATA_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata file exceeds the maximum size",
+        ));
+    }
+    fs::read(path)
 }
 
 pub(crate) fn topic_directory(root: &Path, topic: &str) -> PathBuf {

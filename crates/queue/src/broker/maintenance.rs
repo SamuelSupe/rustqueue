@@ -4,6 +4,14 @@ use std::collections::{BTreeSet, HashMap};
 
 impl Broker {
     pub async fn compact(&self) -> Result<usize, BrokerError> {
+        self.compact_limit(None).await
+    }
+
+    pub async fn compact_some(&self, max_topics: usize) -> Result<usize, BrokerError> {
+        self.compact_limit(Some(max_topics.max(1))).await
+    }
+
+    async fn compact_limit(&self, limit: Option<usize>) -> Result<usize, BrokerError> {
         let _timer = self.inner.metrics.gc.timer();
         let broker = self.clone();
         self.storage_task(move || {
@@ -16,8 +24,27 @@ impl Broker {
                     .or_default()
                     .insert(entry.message_id);
             }
+            let mut topics: Vec<_> = broker
+                .inner
+                .topics
+                .read()
+                .iter()
+                .map(|(name, topic)| (name.clone(), Arc::clone(topic)))
+                .collect();
+            topics.sort_by(|left, right| left.0.cmp(&right.0));
+            let selected = limit.map_or(topics.len(), |value| value.min(topics.len()));
+            let start = if topics.is_empty() {
+                0
+            } else {
+                broker
+                    .inner
+                    .gc_cursor
+                    .fetch_add(selected, Ordering::Relaxed)
+                    % topics.len()
+            };
             let mut removed = 0;
-            for topic in broker.inner.topics.read().values() {
+            for offset in 0..selected {
+                let (_, topic) = &topics[(start + offset) % topics.len()];
                 let mut topic = topic.state.lock();
                 let retained = broker.inner.payload_reader.retained_paths();
                 let name = topic.name.clone();
@@ -25,6 +52,7 @@ impl Broker {
                 removed +=
                     topic.compact(broker.inner.config.bootstrap_retention, &retained, &ids)?;
             }
+            broker.inner.payload_reader.prune_deleted_files();
             Ok(removed)
         })
         .await
@@ -47,7 +75,10 @@ impl Broker {
             };
             let mut topic = topic.state.lock();
             let retained = broker.inner.payload_reader.retained_paths();
-            topic.protective_evict_oldest(&broker.inner.config.data_path.join("audit"), &retained)
+            let result = topic
+                .protective_evict_oldest(&broker.inner.config.data_path.join("audit"), &retained)?;
+            broker.inner.payload_reader.prune_deleted_files();
+            Ok(result)
         })
         .await
     }
@@ -86,6 +117,15 @@ impl Broker {
             .read()
             .values()
             .map(|topic| topic.state.lock().release_all())
+            .sum()
+    }
+
+    pub fn expire_in_flight(&self) -> usize {
+        self.inner
+            .topics
+            .read()
+            .values()
+            .map(|topic| topic.state.lock().expire_in_flight())
             .sum()
     }
 

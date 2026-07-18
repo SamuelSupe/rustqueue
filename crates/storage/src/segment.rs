@@ -71,6 +71,9 @@ pub struct SegmentLog {
     current_len: u64,
     recovery: RecoveryReport,
     start_index: u64,
+    first_index: Option<u64>,
+    last_index: Option<u64>,
+    storage_bytes: u64,
     checksums: BTreeMap<PathBuf, (u64, u32)>,
     isolated: AtomicBool,
     active_writer_feature_level: u32,
@@ -115,6 +118,8 @@ impl SegmentLog {
         let mut recovery = RecoveryReport::default();
         let last_path = paths.last().cloned().expect("at least one segment");
         let mut expected = None;
+        let mut first_index = None;
+        let mut storage_bytes = 0u64;
 
         for path in &paths {
             let is_last = path == &last_path;
@@ -154,10 +159,12 @@ impl SegmentLog {
                 (first, last, count, scanned.1, scanned.2, scanned.3)
             };
             checksums.insert(path.clone(), (bytes, crc32c));
+            storage_bytes = storage_bytes.saturating_add(bytes);
             recovery.truncated_bytes += truncated;
             if count > 0 {
                 let first = first.expect("non-empty segment has first index");
                 let last = last.expect("non-empty segment has last index");
+                first_index.get_or_insert(first);
                 if let Some(expected_index) = expected {
                     if first != expected_index {
                         return Err(StorageError::NonContiguous {
@@ -192,6 +199,7 @@ impl SegmentLog {
             .append(true)
             .open(&current_path)?;
         let current_len = current.metadata()?.len();
+        let last_index = (recovery.records > 0).then_some(recovery.last_index);
         Ok(Self {
             directory,
             max_segment_bytes: max_segment_bytes.max(HEADER_LEN as u64 + 1),
@@ -203,6 +211,9 @@ impl SegmentLog {
             current_len,
             recovery,
             start_index: expected.unwrap_or(start_index),
+            first_index,
+            last_index,
+            storage_bytes,
             checksums,
             isolated: AtomicBool::new(false),
             active_writer_feature_level,
@@ -214,21 +225,11 @@ impl SegmentLog {
     }
 
     pub fn first_index(&self) -> Option<u64> {
-        self.sealed_indexes
-            .values()
-            .filter(|index| index.location_count > 0)
-            .map(|index| index.first_index)
-            .chain(self.resident_records.iter().map(|record| record.index))
-            .min()
+        self.first_index
     }
 
     pub fn last_index(&self) -> Option<u64> {
-        self.sealed_indexes
-            .values()
-            .filter(|index| index.location_count > 0)
-            .map(|index| index.last_index)
-            .chain(self.resident_records.iter().map(|record| record.index))
-            .max()
+        self.last_index
     }
 
     pub fn next_index(&self) -> u64 {
@@ -237,14 +238,17 @@ impl SegmentLog {
     }
 
     /// Returns the current on-disk footprint using the checksums maintained by
-    /// append, recovery, rotation and purge. This does not touch the filesystem.
+    /// append, recovery, rotation and purge, including recovery sidecars. This
+    /// does not touch the filesystem.
     pub fn storage_usage(&self) -> (u64, u64) {
+        let sidecar_bytes = self
+            .sealed_indexes
+            .values()
+            .map(|index| index.metadata_offset.saturating_add(index.metadata_len))
+            .fold(0u64, u64::saturating_add);
         (
             self.checksums.len() as u64,
-            self.checksums
-                .values()
-                .map(|(bytes, _)| *bytes)
-                .fold(0u64, u64::saturating_add),
+            self.storage_bytes.saturating_add(sidecar_bytes),
         )
     }
 
@@ -330,6 +334,7 @@ impl SegmentLog {
             self.current.sync_data()?;
         }
         self.current_len += encoded_len;
+        self.storage_bytes = self.storage_bytes.saturating_add(encoded_len);
         let checksum = self
             .checksums
             .entry(self.current_path.clone())
@@ -346,6 +351,8 @@ impl SegmentLog {
             encoded_len,
         };
         self.resident_records.push(location.clone());
+        self.first_index.get_or_insert(record.index);
+        self.last_index = Some(record.index);
         Ok(location)
     }
 
@@ -539,6 +546,28 @@ impl SegmentLog {
         self.current_len = 0;
         self.checksums.insert(self.current_path.clone(), (0, 0));
         Ok(())
+    }
+
+    fn refresh_aggregates(&mut self) {
+        self.first_index = self
+            .sealed_indexes
+            .values()
+            .filter(|index| index.location_count > 0)
+            .map(|index| index.first_index)
+            .chain(self.resident_records.iter().map(|record| record.index))
+            .min();
+        self.last_index = self
+            .sealed_indexes
+            .values()
+            .filter(|index| index.location_count > 0)
+            .map(|index| index.last_index)
+            .chain(self.resident_records.iter().map(|record| record.index))
+            .max();
+        self.storage_bytes = self
+            .checksums
+            .values()
+            .map(|(bytes, _)| *bytes)
+            .fold(0u64, u64::saturating_add);
     }
 }
 

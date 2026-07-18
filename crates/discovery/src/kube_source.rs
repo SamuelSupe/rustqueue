@@ -6,9 +6,13 @@ use kube::api::{Api, ListParams};
 use kube::Client;
 use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+const MAX_REGISTRY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct RefreshConfig {
@@ -16,6 +20,7 @@ pub struct RefreshConfig {
     pub service_name: String,
     pub fallback_http_port: u16,
     pub poll_interval: Duration,
+    pub endpoint_slice_timeout: Duration,
     pub stale_after: Duration,
     pub registry_token: Option<String>,
     pub max_parallel_polls: usize,
@@ -38,13 +43,28 @@ pub async fn run_refresh_loop(directory: Directory, config: RefreshConfig) -> an
     loop {
         interval.tick().await;
         let _refresh_timer = directory.metrics().refresh.timer();
-        match api.list(&ListParams::default().labels(&selector)).await {
-            Ok(slices) => {
+        match tokio::time::timeout(
+            config.endpoint_slice_timeout,
+            api.list(&ListParams::default().labels(&selector)),
+        )
+        .await
+        {
+            Ok(Ok(slices)) => {
                 let endpoints = endpoints_from_slices(&slices.items, config.fallback_http_port);
                 directory.replace_endpoints(endpoints);
                 poll_registries(&directory, &http, &config).await;
             }
-            Err(error) => tracing::warn!(%error, "EndpointSlice refresh failed"),
+            Ok(Err(error)) => tracing::warn!(%error, "EndpointSlice refresh failed"),
+            Err(_) => {
+                directory
+                    .metrics()
+                    .endpoint_slice_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    timeout_ms = config.endpoint_slice_timeout.as_millis(),
+                    "EndpointSlice refresh timed out"
+                );
+            }
         }
         directory.expire(config.stale_after);
     }
@@ -109,12 +129,11 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
             let needs_registry = if response.status() == reqwest::StatusCode::NOT_FOUND {
                 true
             } else {
-                let head = response
-                    .error_for_status()
-                    .ok()?
-                    .json::<BrokerRegistryHead>()
-                    .await
-                    .ok()?;
+                let head = read_json_bounded::<BrokerRegistryHead>(
+                    response.error_for_status().ok()?,
+                    MAX_HEAD_BYTES,
+                )
+                .await?;
                 directory.observe_head(&endpoint, &head)
             };
             if !needs_registry {
@@ -124,15 +143,11 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
             if let Some(token) = token.as_deref() {
                 request = request.bearer_auth(token);
             }
-            let registry = request
-                .send()
-                .await
-                .ok()?
-                .error_for_status()
-                .ok()?
-                .json::<BrokerRegistry>()
-                .await
-                .ok()?;
+            let registry = read_json_bounded::<BrokerRegistry>(
+                request.send().await.ok()?.error_for_status().ok()?,
+                MAX_REGISTRY_BYTES,
+            )
+            .await?;
             Some((endpoint, Some(registry)))
         });
     }
@@ -141,6 +156,26 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
             directory.observe(endpoint, registry);
         }
     }
+}
+
+async fn read_json_bounded<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    maximum: usize,
+) -> Option<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[cfg(test)]

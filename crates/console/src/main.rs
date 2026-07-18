@@ -51,10 +51,19 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&live),
         Arc::clone(&mutation_lock),
     );
-    tokio::spawn(Collector::new(config.clone(), client, http, live, mutation_lock).run());
-    if config.management_enabled {
-        tokio::spawn(management::Reconciler::new(state.clone()).run());
-    }
+    let mut collector =
+        tokio::spawn(Collector::new(config.clone(), client, http, live, mutation_lock).run());
+    let management_enabled = config.management_enabled;
+    let mut reconciler = tokio::spawn({
+        let state = state.clone();
+        async move {
+            if management_enabled {
+                management::Reconciler::new(state).run().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+    });
 
     let index = config.static_dir.join("index.html");
     let static_files = ServeDir::new(&config.static_dir).not_found_service(ServeFile::new(index));
@@ -74,10 +83,13 @@ async fn main() -> anyhow::Result<()> {
     let app = app.with_state(state);
     let listener = TcpListener::bind(config.address).await?;
     tracing::info!(address = %config.address, queue = %config.queue_name, namespace = %config.namespace, "RustQueue Console listening");
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
-    Ok(())
+    );
+    tokio::select! {
+        result = server => result.context("console HTTP server stopped"),
+        result = &mut collector => anyhow::bail!("console collector stopped unexpectedly: {result:?}"),
+        result = &mut reconciler => anyhow::bail!("console management reconciler stopped unexpectedly: {result:?}"),
+    }
 }

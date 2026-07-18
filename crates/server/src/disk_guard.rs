@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GC_INTERVAL: Duration = Duration::from_secs(5);
+const GC_TOPICS_PER_TICK: usize = 128;
 
 pub fn initialize(
     config: &Config,
@@ -35,13 +36,19 @@ pub async fn run(
     initially_pressured: bool,
 ) -> anyhow::Result<()> {
     let mut pressure_since = initially_pressured.then(Instant::now);
-    let mut last_gc = Instant::now() - GC_INTERVAL;
+    let started = Instant::now();
+    let gc_not_before = if initially_pressured {
+        started
+    } else {
+        started + Duration::from_secs(config.storage.maintenance_startup_delay_seconds)
+    };
+    let mut last_gc = started;
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     loop {
         tick.tick().await;
-        if last_gc.elapsed() >= GC_INTERVAL {
+        if Instant::now() >= gc_not_before && last_gc.elapsed() >= GC_INTERVAL {
             let removed = broker
-                .compact()
+                .compact_some(GC_TOPICS_PER_TICK)
                 .await
                 .context("compact local queue segments")?;
             if removed > 0 {

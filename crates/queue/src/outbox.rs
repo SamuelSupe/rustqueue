@@ -3,9 +3,12 @@ use bytes::Bytes;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAGIC: &[u8; 4] = b"RQO7";
 const HEADER_LEN: usize = 28;
+const MAX_OUTBOX_BYTES: u64 = 32 * 1024 * 1024 + 3 * u16::MAX as u64 + HEADER_LEN as u64;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 pub(crate) struct OutboxEntry {
@@ -18,8 +21,14 @@ pub(crate) struct OutboxEntry {
 
 pub(crate) fn store(directory: &Path, entry: &OutboxEntry) -> Result<PathBuf, BrokerError> {
     fs::create_dir_all(directory)?;
-    let path = directory.join(format!("{:016x}.outbox", entry.message_id));
-    let temporary = directory.join(format!("{:016x}.tmp", entry.message_id));
+    let source_key = source_key(entry);
+    let stem = format!("{:016x}-{source_key:08x}", entry.message_id);
+    let path = directory.join(format!("{stem}.outbox"));
+    let temporary = directory.join(format!(
+        "{stem}.{}-{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
     let source_topic = entry.source_topic.as_bytes();
     let source_channel = entry.source_channel.as_bytes();
     let target_topic = entry.target_topic.as_bytes();
@@ -71,6 +80,11 @@ pub(crate) fn load_all(directory: &Path) -> Result<Vec<(PathBuf, OutboxEntry)>, 
     paths
         .into_iter()
         .map(|path| {
+            if fs::metadata(&path)?.len() > MAX_OUTBOX_BYTES {
+                return Err(BrokerError::InvalidRecord(
+                    "DLQ outbox file exceeds the maximum record size".into(),
+                ));
+            }
             let bytes = fs::read(&path)?;
             if bytes.len() < HEADER_LEN || &bytes[0..4] != MAGIC {
                 return Err(BrokerError::InvalidRecord(
@@ -116,6 +130,30 @@ pub(crate) fn load_all(directory: &Path) -> Result<Vec<(PathBuf, OutboxEntry)>, 
         .collect()
 }
 
+pub(crate) fn cleanup_temporary(directory: &Path) -> Result<(), BrokerError> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    let mut changed = false;
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "tmp") {
+            fs::remove_file(path)?;
+            changed = true;
+        }
+    }
+    if changed {
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn source_key(entry: &OutboxEntry) -> u32 {
+    let mut checksum = crc32c::crc32c(entry.source_topic.as_bytes());
+    checksum = crc32c::crc32c_append(checksum, &[0]);
+    crc32c::crc32c_append(checksum, entry.source_channel.as_bytes())
+}
+
 fn read_string(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<String, BrokerError> {
     let end = cursor
         .checked_add(len)
@@ -158,5 +196,23 @@ mod tests {
         let loaded = load_all(directory.path()).unwrap().pop().unwrap().1;
         assert_eq!(loaded.message_id, entry.message_id);
         assert_eq!(loaded.body, entry.body);
+    }
+
+    #[test]
+    fn fan_out_channels_with_the_same_message_id_use_distinct_entries() {
+        let directory = tempdir().unwrap();
+        let entry = |channel: &str| OutboxEntry {
+            source_topic: "events".into(),
+            source_channel: channel.into(),
+            message_id: 42,
+            target_topic: format!("events.{channel}.DLQ"),
+            body: Bytes::from_static(b"payload"),
+        };
+        let first = store(directory.path(), &entry("alpha")).unwrap();
+        let second = store(directory.path(), &entry("beta")).unwrap();
+        assert_ne!(first, second);
+        let loaded = load_all(directory.path()).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_ne!(loaded[0].1.source_channel, loaded[1].1.source_channel);
     }
 }
