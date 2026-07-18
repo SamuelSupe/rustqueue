@@ -411,4 +411,4 @@ The implementation is complete only when all of the following pass:
 - online broker data migration;
 - consumer connection fan-out reduction;
 - cross-region replication;
-- management UI.
+- Broker/PVC lifecycle controls in Console.

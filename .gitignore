@@ -18,5 +18,3 @@ benchmarks/results/
 /.pnpm-store/
 .DS_Store
 /.workflow/
-/README 2.md
-* 2.rs

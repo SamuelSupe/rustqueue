@@ -84,7 +84,6 @@ export interface BrokerObservation {
   };
   limits: {
     max_message_bytes: number;
-    max_backlog_messages: number;
     message_index_cache_bytes: number;
     max_connections: number;
   };

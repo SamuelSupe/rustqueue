@@ -337,4 +337,4 @@ non-Kubernetes gate runs in GitHub Actions.
 
 RustQueue 0.7 does not provide message replication, backups, exactly-once
 delivery, a global channel catalog, online data migration, cross-region
-replication, or a management UI.
+replication, or Broker/PVC lifecycle controls in Console.

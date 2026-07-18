@@ -72,8 +72,6 @@ pub struct QueueConfig {
     pub max_message_timeout_ms: u64,
     pub max_defer_ms: u64,
     pub max_ack_gap: usize,
-    /// Accepted for adjacent rolling upgrades only. Backlog admission is disk-based.
-    pub max_backlog_messages: Option<usize>,
     pub max_topics: usize,
     pub max_publish_workers: usize,
     pub publish_worker_idle_seconds: u64,
@@ -208,7 +206,6 @@ impl Default for QueueConfig {
             max_message_timeout_ms: 15 * 60_000,
             max_defer_ms: 60 * 60_000,
             max_ack_gap: 65_536,
-            max_backlog_messages: None,
             max_topics: 10_000,
             max_publish_workers: 1_024,
             publish_worker_idle_seconds: 60,
