@@ -11,37 +11,42 @@ impl SegmentLog {
     }
 
     fn truncate_suffix_inner(&mut self, from_index: u64) -> Result<(), StorageError> {
-        let Some(first_removed) = self
-            .records
-            .iter()
-            .position(|record| record.index >= from_index)
-        else {
+        let Some(location) = self.location(from_index)? else {
             return Ok(());
         };
-        let location = self.records[first_removed].clone();
-        let removed_paths: Vec<PathBuf> = self.records[first_removed..]
+        self.current.sync_all()?;
+        let paths = segment_paths(&self.directory)?;
+        let target = paths
             .iter()
-            .map(|item| item.segment.as_ref().clone())
-            .filter(|path| path != location.segment.as_ref())
-            .collect();
+            .position(|path| path == location.segment.as_ref())
+            .ok_or_else(|| {
+                StorageError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "truncate target segment disappeared",
+                ))
+            })?;
         OpenOptions::new()
             .write(true)
             .open(location.segment.as_ref())?
             .set_len(location.offset)?;
         recovery_index::remove(location.segment.as_ref())?;
-        self.recovery_metadata.remove(location.segment.as_ref());
-        for path in removed_paths {
+        self.sealed_indexes.remove(location.segment.as_ref());
+        for path in paths.into_iter().skip(target + 1) {
             if path.exists() {
                 fs::remove_file(&path)?;
             }
             recovery_index::remove(&path)?;
             self.checksums.remove(&path);
-            self.recovery_metadata.remove(&path);
+            self.sealed_indexes.remove(&path);
         }
-        let (_, _, bytes, crc32c) = scan_segment(location.segment.as_ref(), true)?;
+        self.resident_records
+            .retain(|record| record.index < from_index);
+        let (locations, _, bytes, crc32c) = scan_segment(location.segment.as_ref(), true)?;
+        self.resident_records
+            .retain(|record| record.segment.as_ref() != location.segment.as_ref());
+        self.resident_records.extend(locations);
         self.checksums
             .insert(location.segment.as_ref().clone(), (bytes, crc32c));
-        self.records.truncate(first_removed);
         self.current_path = location.segment.as_ref().clone();
         self.current_segment = location.segment;
         self.current = OpenOptions::new()
@@ -49,6 +54,7 @@ impl SegmentLog {
             .append(true)
             .open(&self.current_path)?;
         self.current_len = self.current.metadata()?.len();
+        self.start_index = self.first_index().unwrap_or(from_index);
         self.current.sync_all()?;
         File::open(&self.directory)?.sync_all()?;
         Ok(())
@@ -95,24 +101,21 @@ impl SegmentLog {
         }
         self.current.sync_all()?;
         crash_failpoint("gc_before_segment_delete");
-        for path in &removable {
-            fs::remove_file(path)?;
-            recovery_index::remove(path)?;
-            self.checksums.remove(path);
-            self.recovery_metadata.remove(path);
-        }
         let removed_through = removable
             .last()
             .and_then(|path| self.record_index_range(path))
             .map_or(through_index, |(_, last)| last);
-        let keep_from = self
-            .records
-            .partition_point(|record| record.index <= removed_through);
-        self.records.drain(..keep_from);
+        for path in &removable {
+            fs::remove_file(path)?;
+            recovery_index::remove(path)?;
+            self.checksums.remove(path);
+            self.sealed_indexes.remove(path);
+        }
+        self.resident_records
+            .retain(|record| record.index > removed_through);
         self.start_index = self
-            .records
-            .first()
-            .map_or_else(|| through_index.saturating_add(1), |record| record.index);
+            .first_index()
+            .unwrap_or_else(|| through_index.saturating_add(1));
         crash_failpoint("gc_after_segment_delete_before_dir_fsync");
         File::open(&self.directory)?.sync_all()?;
         Ok(removable.len())
@@ -135,7 +138,7 @@ impl SegmentLog {
 
     pub fn scrub_targets(&self, include_active: bool) -> Result<Vec<ScrubTarget>, StorageError> {
         self.ensure_available()?;
-        Ok(self
+        let mut targets: Vec<_> = self
             .checksums
             .iter()
             .filter(|(path, _)| include_active || *path != &self.current_path)
@@ -143,8 +146,18 @@ impl SegmentLog {
                 path: path.clone(),
                 expected_len: *expected_len,
                 expected_crc32c: *expected_crc32c,
+                kind: scrub::ScrubKind::Segment,
             })
-            .collect())
+            .collect();
+        targets.extend(self.sealed_indexes.iter().map(|(path, index)| ScrubTarget {
+            path: recovery_index::index_path(path),
+            expected_len: index.metadata_offset.saturating_add(index.metadata_len),
+            expected_crc32c: index.body_crc32c,
+            kind: scrub::ScrubKind::RecoveryIndex {
+                body_offset: recovery_index::HEADER_LEN,
+            },
+        }));
+        Ok(targets)
     }
 
     pub fn scrub_target(

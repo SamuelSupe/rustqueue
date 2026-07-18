@@ -28,6 +28,7 @@ queue:
   storageClassName: local-path
   storageSize: 100Gi
   storageFeatureLevel: 1
+  messageIndexCacheBytes: 67108864
   minFreeBytes: 10737418240
   diskHighWatermarkPercent: 85
   diskLowWatermarkPercent: 75
@@ -35,7 +36,6 @@ queue:
   diskPressureGraceSeconds: 60
   bootstrapRetentionSeconds: 30
   maxMessageBytes: 20971520
-  maxBacklogMessages: 10000000
   maxTopics: 10000
   maxPublishWorkers: 1024
   publishWorkerIdleSeconds: 60

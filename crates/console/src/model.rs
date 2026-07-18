@@ -61,7 +61,10 @@ pub struct ObserverStorage {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ObserverLimits {
     pub max_message_bytes: usize,
+    #[serde(default)]
     pub max_backlog_messages: usize,
+    #[serde(default)]
+    pub message_index_cache_bytes: usize,
     pub max_connections: usize,
 }
 

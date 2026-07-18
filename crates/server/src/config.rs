@@ -54,6 +54,7 @@ pub struct StorageConfig {
     pub scrub_interval_seconds: u64,
     pub scrub_bytes_per_second: u64,
     pub entry_cache_bytes: usize,
+    pub message_index_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
     pub disk_high_watermark_percent: u8,
@@ -71,7 +72,8 @@ pub struct QueueConfig {
     pub max_message_timeout_ms: u64,
     pub max_defer_ms: u64,
     pub max_ack_gap: usize,
-    pub max_backlog_messages: usize,
+    /// Accepted for adjacent rolling upgrades only. Backlog admission is disk-based.
+    pub max_backlog_messages: Option<usize>,
     pub max_topics: usize,
     pub max_publish_workers: usize,
     pub publish_worker_idle_seconds: u64,
@@ -186,6 +188,7 @@ impl Default for StorageConfig {
             scrub_interval_seconds: 3600,
             scrub_bytes_per_second: 64 * 1024 * 1024,
             entry_cache_bytes: 64 * 1024 * 1024,
+            message_index_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
             disk_high_watermark_percent: 85,
@@ -205,7 +208,7 @@ impl Default for QueueConfig {
             max_message_timeout_ms: 15 * 60_000,
             max_defer_ms: 60 * 60_000,
             max_ack_gap: 65_536,
-            max_backlog_messages: 10_000_000,
+            max_backlog_messages: None,
             max_topics: 10_000,
             max_publish_workers: 1_024,
             publish_worker_idle_seconds: 60,
@@ -299,12 +302,14 @@ impl Config {
             bail!("queue.bootstrap_retention_seconds must be greater than zero");
         }
         if self.queue.max_ack_gap == 0
-            || self.queue.max_backlog_messages == 0
             || self.queue.max_topics == 0
             || self.queue.max_publish_workers == 0
             || self.queue.publish_worker_idle_seconds == 0
         {
             bail!("queue limits must be greater than zero");
+        }
+        if self.storage.entry_cache_bytes == 0 || self.storage.message_index_cache_bytes == 0 {
+            bail!("storage caches must be greater than zero");
         }
         if self.queue.max_delivery_attempts == 0 {
             bail!("queue.max_delivery_attempts must be greater than zero");

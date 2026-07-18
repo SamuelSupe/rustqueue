@@ -65,8 +65,11 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
         "{:08x}",
         crc32c::crc32c(
             format!(
-                "{}\0{}\0{}",
-                input.image, config_text, input.mounted_secret_revision
+                "{}\0{}\0{}\0{}",
+                input.image,
+                config_text,
+                input.mounted_secret_revision,
+                cluster.spec.message_index_cache_bytes
             )
             .as_bytes(),
         )
@@ -171,7 +174,8 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                             {"name": "POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
                             {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
                             {"name": "RUSTQUEUE_BROADCAST_ADDRESS", "value": format!("$(POD_NAME).{broker_service_name}.$(POD_NAMESPACE).svc")},
-                            {"name": "RUSTQUEUE_DATA_PATH", "value": "/data"}
+                            {"name": "RUSTQUEUE_DATA_PATH", "value": "/data"},
+                            {"name": "RUSTQUEUE_MESSAGE_INDEX_CACHE_BYTES", "value": cluster.spec.message_index_cache_bytes.to_string()}
                         ],
                         "volumeMounts": broker_mounts,
                         "securityContext": {
@@ -325,7 +329,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
 
 fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
     let mut output = format!(
-        "[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_backlog_messages = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\nconsole_management_enabled = {}\n# secret: {secret_name}\n",
+        "[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\nregistry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\nconsole_management_enabled = {}\n# secret: {secret_name}\n",
         cluster.spec.storage_feature_level,
         cluster.spec.min_free_bytes,
         cluster.spec.disk_high_watermark_percent,
@@ -334,7 +338,6 @@ fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
         cluster.spec.disk_pressure_grace_seconds,
         cluster.spec.bootstrap_retention_seconds,
         cluster.spec.max_message_bytes,
-        cluster.spec.max_backlog_messages,
         cluster.spec.max_topics,
         cluster.spec.max_publish_workers,
         cluster.spec.publish_worker_idle_seconds,
@@ -424,6 +427,7 @@ mod tests {
                 storage_class_name: "ssd".into(),
                 storage_size: "100Gi".into(),
                 storage_feature_level: 1,
+                message_index_cache_bytes: 64 * 1024 * 1024,
                 min_free_bytes: 1024,
                 disk_high_watermark_percent: 85,
                 disk_low_watermark_percent: 75,
@@ -431,7 +435,6 @@ mod tests {
                 disk_pressure_grace_seconds: 60,
                 bootstrap_retention_seconds: 30,
                 max_message_bytes: 20 * 1024 * 1024,
-                max_backlog_messages: 10_000_000,
                 max_topics: 10_000,
                 max_publish_workers: 1_024,
                 publish_worker_idle_seconds: 60,
@@ -471,6 +474,7 @@ mod tests {
                 config.contains("console_token_file")
                     && config.contains("detailed_queue_metrics = false")
                     && config.contains("max_detailed_series = 1000")
+                    && !config.contains("message_index_cache_bytes")
             }));
         let spec = resources.brokers.spec.unwrap();
         assert_eq!(spec.replicas, Some(3));
@@ -484,12 +488,25 @@ mod tests {
         assert_eq!(
             spec.template
                 .spec
+                .as_ref()
                 .unwrap()
                 .security_context
+                .as_ref()
                 .unwrap()
                 .fs_group,
             Some(65532)
         );
+        assert!(spec
+            .template
+            .spec
+            .unwrap()
+            .containers
+            .first()
+            .and_then(|container| container.env.as_ref())
+            .is_some_and(|env| env.iter().any(|variable| {
+                variable.name == "RUSTQUEUE_MESSAGE_INDEX_CACHE_BYTES"
+                    && variable.value.as_deref() == Some("67108864")
+            })));
         assert_eq!(resources.discovery.spec.unwrap().replicas, Some(2));
     }
 }

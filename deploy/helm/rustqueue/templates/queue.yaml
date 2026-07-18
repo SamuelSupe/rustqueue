@@ -15,6 +15,7 @@ spec:
   storageClassName: {{ .Values.queue.storageClassName | quote }}
   storageSize: {{ .Values.queue.storageSize | quote }}
   storageFeatureLevel: {{ .Values.queue.storageFeatureLevel }}
+  messageIndexCacheBytes: {{ .Values.queue.messageIndexCacheBytes | int64 }}
   minFreeBytes: {{ .Values.queue.minFreeBytes | int64 }}
   diskHighWatermarkPercent: {{ .Values.queue.diskHighWatermarkPercent }}
   diskLowWatermarkPercent: {{ .Values.queue.diskLowWatermarkPercent }}
@@ -22,7 +23,6 @@ spec:
   diskPressureGraceSeconds: {{ .Values.queue.diskPressureGraceSeconds }}
   bootstrapRetentionSeconds: {{ .Values.queue.bootstrapRetentionSeconds }}
   maxMessageBytes: {{ .Values.queue.maxMessageBytes | int64 }}
-  maxBacklogMessages: {{ .Values.queue.maxBacklogMessages | int64 }}
   maxTopics: {{ .Values.queue.maxTopics | int64 }}
   maxPublishWorkers: {{ .Values.queue.maxPublishWorkers | int64 }}
   publishWorkerIdleSeconds: {{ .Values.queue.publishWorkerIdleSeconds | int64 }}

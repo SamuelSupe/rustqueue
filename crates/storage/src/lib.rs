@@ -19,4 +19,7 @@ pub use failpoint::crash_failpoint;
 pub use format::{ensure_data_format, read_data_format, DataFormat, DATA_FORMAT_VERSION};
 pub use payload::PayloadRef;
 pub use record::{Record, RecordHeader, RecordKind, HEADER_LEN, MAX_RECORD_BYTES};
-pub use segment::{RecordLocation, RecoveryReport, ScrubTarget, SegmentLog, StorageError};
+pub use segment::{
+    RecordLocation, RecoveryMetadataRef, RecoveryReport, ScrubKind, ScrubTarget, SegmentLog,
+    StorageError,
+};

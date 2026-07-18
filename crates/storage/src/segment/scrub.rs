@@ -12,6 +12,13 @@ pub struct ScrubTarget {
     pub path: PathBuf,
     pub expected_len: u64,
     pub expected_crc32c: u32,
+    pub kind: ScrubKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrubKind {
+    Segment,
+    RecoveryIndex { body_offset: u64 },
 }
 
 pub(super) fn verify(target: &ScrubTarget, bytes_per_second: u64) -> Result<usize, StorageError> {
@@ -26,6 +33,9 @@ pub(super) fn verify(target: &ScrubTarget, bytes_per_second: u64) -> Result<usiz
                 target.expected_len
             ),
         ));
+    }
+    if let ScrubKind::RecoveryIndex { body_offset } = target.kind {
+        return verify_bytes(&mut file, target, body_offset, bytes_per_second);
     }
     file.seek(SeekFrom::Start(0))?;
     let mut limiter = RateLimiter::new(bytes_per_second);
@@ -70,6 +80,33 @@ pub(super) fn verify(target: &ScrubTarget, bytes_per_second: u64) -> Result<usiz
         return Err(corrupt(target, 0, "segment checksum mismatch"));
     }
     Ok(records)
+}
+
+fn verify_bytes(
+    file: &mut File,
+    target: &ScrubTarget,
+    offset: u64,
+    bytes_per_second: u64,
+) -> Result<usize, StorageError> {
+    if offset > target.expected_len {
+        return Err(corrupt(target, 0, "recovery index body offset is invalid"));
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut remaining = target.expected_len - offset;
+    let mut checksum = 0u32;
+    let mut buffer = vec![0u8; BUFFER_BYTES];
+    let mut limiter = RateLimiter::new(bytes_per_second);
+    while remaining > 0 {
+        let wanted = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..wanted])?;
+        checksum = crc32c::crc32c_append(checksum, &buffer[..wanted]);
+        limiter.consume(wanted as u64);
+        remaining -= wanted as u64;
+    }
+    if checksum != target.expected_crc32c {
+        return Err(corrupt(target, offset, "recovery index checksum mismatch"));
+    }
+    Ok(0)
 }
 
 fn corrupt(target: &ScrubTarget, offset: u64, reason: impl Into<String>) -> StorageError {

@@ -169,6 +169,19 @@ impl Broker {
             fail_requests(requests, &error);
             return;
         }
+        let message_count = requests
+            .iter()
+            .map(|request| request.bodies.len())
+            .sum::<usize>();
+        let mut metadata = match self.reserve_message_metadata(message_count) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.observe_storage_result::<()>(Err(copy_error(&error)))
+                    .ok();
+                fail_requests(requests, &error);
+                return;
+            }
+        };
         let handle = match self.get_or_create_topic(topic) {
             Ok(handle) => handle,
             Err(error) => {
@@ -198,7 +211,13 @@ impl Broker {
                 .metrics
                 .group_commit_wait
                 .observe(enqueued_at.elapsed());
-            match self.append_publish_to_topic(&mut topic_state, &bodies, delay, false) {
+            match self.append_publish_to_topic(
+                &mut topic_state,
+                &bodies,
+                delay,
+                false,
+                &mut metadata,
+            ) {
                 Ok(ids) => pending.push(PendingPublish { ids, reply }),
                 Err(error) if is_storage_error(&error) => {
                     self.observe_storage_result::<()>(Err(copy_error(&error)))
@@ -216,6 +235,15 @@ impl Broker {
 
         if pending.is_empty() {
             return;
+        }
+        drop(metadata);
+        if self.inner.message_index_cache.over_budget() {
+            if let Err(error) = topic_state.spill_message_metadata() {
+                self.observe_storage_result::<()>(Err(copy_error(&error)))
+                    .ok();
+                fail_pending(pending);
+                return;
+            }
         }
         rustqueue_storage::crash_failpoint("publish_after_append_before_fsync");
         let sync_result = {
@@ -354,7 +382,6 @@ pub(super) fn copy_error(error: &BrokerError) -> BrokerError {
         BrokerError::MessageNotInFlight => BrokerError::MessageNotInFlight,
         BrokerError::MessageTooLarge => BrokerError::MessageTooLarge,
         BrokerError::BatchTooLarge => BrokerError::BatchTooLarge,
-        BrokerError::BacklogLimit => BrokerError::BacklogLimit,
         BrokerError::TopicLimit => BrokerError::TopicLimit,
         BrokerError::PublishWorkerLimit => BrokerError::PublishWorkerLimit,
         BrokerError::ChannelWorkerLimit => BrokerError::ChannelWorkerLimit,

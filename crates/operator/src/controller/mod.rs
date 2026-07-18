@@ -401,7 +401,7 @@ fn validate(cluster: &RustQueue) -> anyhow::Result<()> {
     if cluster.spec.bootstrap_retention_seconds == 0
         || cluster.spec.max_message_bytes == 0
         || cluster.spec.max_message_bytes > 32 * 1024 * 1024
-        || cluster.spec.max_backlog_messages == 0
+        || cluster.spec.message_index_cache_bytes == 0
         || cluster.spec.max_topics == 0
         || cluster.spec.max_publish_workers == 0
         || cluster.spec.publish_worker_idle_seconds == 0

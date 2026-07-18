@@ -82,7 +82,12 @@ export interface BrokerObservation {
     latency: Record<string, Histogram>;
     topics: TopicStats[];
   };
-  limits: { max_message_bytes: number; max_backlog_messages: number; max_connections: number };
+  limits: {
+    max_message_bytes: number;
+    max_backlog_messages: number;
+    message_index_cache_bytes: number;
+    max_connections: number;
+  };
 }
 
 export interface Pvc {

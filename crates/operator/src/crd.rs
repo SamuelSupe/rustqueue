@@ -29,6 +29,8 @@ pub struct RustQueueSpec {
     pub storage_size: String,
     #[serde(default = "default_storage_feature_level")]
     pub storage_feature_level: u32,
+    #[serde(default = "default_message_index_cache_bytes")]
+    pub message_index_cache_bytes: usize,
     #[serde(default = "default_min_free_bytes")]
     pub min_free_bytes: u64,
     #[serde(default = "default_disk_high_watermark")]
@@ -43,8 +45,6 @@ pub struct RustQueueSpec {
     pub bootstrap_retention_seconds: u64,
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: usize,
-    #[serde(default = "default_max_backlog_messages")]
-    pub max_backlog_messages: usize,
     #[serde(default = "default_max_topics")]
     pub max_topics: usize,
     #[serde(default = "default_max_publish_workers")]
@@ -259,8 +259,8 @@ fn default_bootstrap_retention() -> u64 {
 fn default_max_message_bytes() -> usize {
     20 * 1024 * 1024
 }
-fn default_max_backlog_messages() -> usize {
-    10_000_000
+fn default_message_index_cache_bytes() -> usize {
+    64 * 1024 * 1024
 }
 fn default_max_topics() -> usize {
     10_000

@@ -44,7 +44,7 @@ impl Topic {
         TopicStats {
             name: self.name.clone(),
             paused: self.manifest.paused,
-            message_count: self.messages.len() as u64,
+            message_count: self.messages.total_count(),
             segment_count,
             segment_bytes,
             channels,
@@ -52,7 +52,7 @@ impl Topic {
     }
 
     pub fn oldest_message_timestamp(&self) -> Option<i64> {
-        self.messages.front().map(|message| message.timestamp_ns)
+        self.messages.oldest_timestamp_ns()
     }
 
     pub fn protective_evict_oldest(
@@ -60,7 +60,7 @@ impl Topic {
         audit_directory: &Path,
         retained_paths: &BTreeSet<PathBuf>,
     ) -> Result<Option<ProtectiveEviction>, BrokerError> {
-        if self.messages.is_empty() {
+        if self.messages.total_count() == 0 {
             return Ok(None);
         }
         self.seal_log()?;
@@ -70,20 +70,11 @@ impl Topic {
         else {
             return Ok(None);
         };
-        let mut affected = self
-            .messages
-            .iter()
-            .filter(|message| message.log_index <= through_index);
-        let Some(first) = affected.next() else {
+        let Some((first_position, through_position, messages)) =
+            self.messages.eviction_range(through_index)
+        else {
             return Ok(None);
         };
-        let first_position = first.position;
-        let mut through_position = first.position;
-        let mut messages = 1u64;
-        for message in affected {
-            through_position = message.position;
-            messages = messages.saturating_add(1);
-        }
         let report = ProtectiveEviction {
             topic: self.name.clone(),
             first_position,
@@ -117,15 +108,13 @@ impl Topic {
         retained_paths: &BTreeSet<PathBuf>,
         retained_message_ids: &BTreeSet<u64>,
     ) -> Result<usize, BrokerError> {
+        store_atomic(&self.manifest_path, &self.manifest)?;
+        self.seal_log()?;
         let cutoff =
             now_ns().saturating_sub(bootstrap_retention.as_nanos().min(i64::MAX as u128) as i64);
-        let bootstrap_index = self
-            .messages
-            .partition_point(|message| message.timestamp_ns < cutoff);
         let bootstrap_from = self
             .messages
-            .get(bootstrap_index)
-            .map_or(self.manifest.next_position, |message| message.position);
+            .retain_from_timestamp(cutoff, self.manifest.next_position);
         let channel_from = self
             .channels
             .values()
@@ -139,29 +128,17 @@ impl Topic {
             .filter_map(|channel| channel.state.first_in_flight_position())
             .min()
             .unwrap_or(self.manifest.next_position);
-        let outbox_from = retained_message_ids
-            .iter()
-            .filter_map(|id| {
-                let index = self.messages.partition_point(|message| message.id < *id);
-                self.messages
-                    .get(index)
-                    .filter(|message| message.id == *id)
-                    .map(|message| message.position)
-            })
-            .min()
-            .unwrap_or(self.manifest.next_position);
+        let outbox_from = self
+            .messages
+            .retain_from_ids(retained_message_ids, self.manifest.next_position);
         let retain_from = bootstrap_from
             .min(channel_from)
             .min(in_flight_from)
             .min(outbox_from);
-        let through_index = self
-            .message_before(retain_from)
-            .map(|message| message.log_index);
+        let through_index = self.messages.purge_through_log_index(retain_from);
         let Some(through_index) = through_index else {
             return Ok(0);
         };
-        store_atomic(&self.manifest_path, &self.manifest)?;
-        self.seal_log()?;
         let removed = self
             .log
             .purge_prefix_retaining(through_index, retained_paths)?;
@@ -198,25 +175,7 @@ impl Topic {
 
     fn remove_purged_messages(&mut self) -> Result<(), BrokerError> {
         let existing: BTreeSet<_> = self.log.segment_paths()?.into_iter().collect();
-        while self
-            .messages
-            .front()
-            .is_some_and(|message| !existing.contains(message.payload.path.as_ref()))
-        {
-            self.messages.pop_front();
-        }
+        self.messages.remove_missing_paths(&existing);
         Ok(())
-    }
-
-    fn message_before(&self, position: u64) -> Option<&crate::model::MessageMeta> {
-        let first = self.messages.front()?.position;
-        if position <= first {
-            return None;
-        }
-        let wanted = position
-            .saturating_sub(1)
-            .min(self.messages.back()?.position);
-        let offset = usize::try_from(wanted.saturating_sub(first)).ok()?;
-        self.messages.get(offset)
     }
 }

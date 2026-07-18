@@ -216,9 +216,15 @@ audited administrative action.
 - The payload is stored once per broker regardless of channel count.
 - Tail short writes are truncated during recovery.
 - Each sealed segment has an atomic CRC-protected recovery index containing
-  record locations and fixed-size queue metadata. Startup validates the index
-  and segment length instead of reading every live payload; a missing or bad
-  index safely falls back to a full scan and is rebuilt.
+  record locations and fixed-size, per-entry-CRC queue metadata. Startup reads
+  only the fixed header and first/last entries; pages are loaded on demand into
+  a Broker-wide byte-bounded cache, while background scrub validates the full
+  sidecar checksum. A missing or bad index safely falls back to a full scan and
+  is rebuilt.
+- There is no backlog message-count limit. Sealed segments retain one summary
+  in memory, so cold metadata residency scales with segment count rather than
+  message count; disk high-watermark and minimum-free-space policy controls
+  publish rejection.
 - The active tail is always fully scanned. Cold indexed payload corruption is
   detected and isolated on payload read or by the immediate background scrub.
   Scrub pins an immutable file list while holding the Topic lock, then releases
@@ -261,11 +267,11 @@ Reader references are acquired while holding the topic lock. GC, protective
 eviction, and topic deletion inspect those leases under the same lock order, so
 a segment cannot disappear between delivery reservation and payload read.
 
-The normal GC retention plan uses binary searches over monotonic timestamps,
-message IDs, positions, and log indexes. It does not linearly walk a 10-million
-message backlog on every five-second pass. Physical deletion remains a
-contiguous immutable-segment prefix, and removed message metadata is released
-once, amortized with actual reclamation.
+The normal GC retention plan uses sealed-segment timestamp, message-ID,
+position, and log-index summaries plus the bounded active tail. It does not
+linearly walk a multi-million-message backlog on every five-second pass.
+Physical deletion remains a contiguous immutable-segment prefix, and cached
+metadata pages are invalidated with actual reclamation.
 
 ### 4.4 DLQ
 

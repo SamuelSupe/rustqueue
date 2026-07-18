@@ -4,6 +4,8 @@ mod append;
 mod files;
 #[path = "segment/maintenance.rs"]
 mod maintenance;
+#[path = "segment/metadata.rs"]
+mod metadata;
 #[path = "segment/recovery_index.rs"]
 mod recovery_index;
 #[path = "segment/scrub.rs"]
@@ -20,7 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
-pub use scrub::ScrubTarget;
+pub use metadata::RecoveryMetadataRef;
+pub use scrub::{ScrubKind, ScrubTarget};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -58,7 +61,10 @@ pub struct RecoveryReport {
 pub struct SegmentLog {
     directory: PathBuf,
     max_segment_bytes: u64,
-    records: Vec<RecordLocation>,
+    /// Locations are resident only for the active segment and for a sealed
+    /// segment whose rebuildable sidecar has not yet been persisted.
+    resident_records: Vec<RecordLocation>,
+    sealed_indexes: BTreeMap<PathBuf, recovery_index::RecoveryIndexSummary>,
     current_path: PathBuf,
     current_segment: Arc<PathBuf>,
     current: File,
@@ -66,7 +72,6 @@ pub struct SegmentLog {
     recovery: RecoveryReport,
     start_index: u64,
     checksums: BTreeMap<PathBuf, (u64, u32)>,
-    recovery_metadata: BTreeMap<PathBuf, Vec<u8>>,
     isolated: AtomicBool,
     active_writer_feature_level: u32,
 }
@@ -104,9 +109,9 @@ impl SegmentLog {
             File::open(&directory)?.sync_all()?;
         }
 
-        let mut records = Vec::new();
+        let mut resident_records = Vec::new();
+        let mut sealed_indexes = BTreeMap::new();
         let mut checksums = BTreeMap::new();
-        let mut recovery_metadata = BTreeMap::new();
         let mut recovery = RecoveryReport::default();
         let last_path = paths.last().cloned().expect("at least one segment");
         let mut expected = None;
@@ -116,40 +121,65 @@ impl SegmentLog {
             let indexed = if is_last {
                 None
             } else {
-                recovery_index::load(path).ok().flatten().filter(|index| {
-                    fs::metadata(path)
-                        .map(|metadata| metadata.len() == index.segment_len)
-                        .unwrap_or(false)
-                })
+                recovery_index::load_summary(path)
+                    .ok()
+                    .flatten()
+                    .filter(|index| {
+                        fs::metadata(path)
+                            .map(|metadata| metadata.len() == index.segment_len)
+                            .unwrap_or(false)
+                    })
             };
-            let (locations, truncated, bytes, crc32c) = if let Some(index) = indexed {
-                recovery.indexed_records += index.locations.len();
-                recovery_metadata.insert(path.clone(), index.metadata);
-                (index.locations, 0, index.segment_len, index.segment_crc32c)
+            let (first, last, count, truncated, bytes, crc32c) = if let Some(index) = indexed {
+                let count = usize::try_from(index.location_count).unwrap_or(usize::MAX);
+                recovery.indexed_records = recovery.indexed_records.saturating_add(count);
+                let first = (index.location_count > 0).then_some(index.first_index);
+                let last = (index.location_count > 0).then_some(index.last_index);
+                sealed_indexes.insert(path.clone(), index.clone());
+                (
+                    first,
+                    last,
+                    count,
+                    0,
+                    index.segment_len,
+                    index.segment_crc32c,
+                )
             } else {
                 let scanned = scan_segment(path, is_last)?;
-                recovery.scanned_records += scanned.0.len();
-                scanned
+                let count = scanned.0.len();
+                recovery.scanned_records = recovery.scanned_records.saturating_add(count);
+                let first = scanned.0.first().map(|location| location.index);
+                let last = scanned.0.last().map(|location| location.index);
+                resident_records.extend(scanned.0);
+                (first, last, count, scanned.1, scanned.2, scanned.3)
             };
             checksums.insert(path.clone(), (bytes, crc32c));
             recovery.truncated_bytes += truncated;
-            for location in locations {
+            if count > 0 {
+                let first = first.expect("non-empty segment has first index");
+                let last = last.expect("non-empty segment has last index");
                 if let Some(expected_index) = expected {
-                    if location.index != expected_index {
+                    if first != expected_index {
                         return Err(StorageError::NonContiguous {
                             expected: expected_index,
-                            actual: location.index,
+                            actual: first,
                         });
                     }
                 }
-                expected = Some(location.index + 1);
-                recovery.last_index = location.index;
-                records.push(location);
+                let expected_last = first.saturating_add(count as u64).saturating_sub(1);
+                if last != expected_last {
+                    return Err(StorageError::NonContiguous {
+                        expected: expected_last,
+                        actual: last,
+                    });
+                }
+                expected = Some(last.saturating_add(1));
+                recovery.last_index = last;
             }
+            recovery.records = recovery.records.saturating_add(count);
         }
-        recovery.records = records.len();
 
-        if records.is_empty() {
+        if recovery.records == 0 {
             if let Some(base_index) = segment_base_index(&last_path) {
                 expected = Some(base_index);
             }
@@ -165,7 +195,8 @@ impl SegmentLog {
         Ok(Self {
             directory,
             max_segment_bytes: max_segment_bytes.max(HEADER_LEN as u64 + 1),
-            records,
+            resident_records,
+            sealed_indexes,
             current_path,
             current_segment,
             current,
@@ -173,7 +204,6 @@ impl SegmentLog {
             recovery,
             start_index: expected.unwrap_or(start_index),
             checksums,
-            recovery_metadata,
             isolated: AtomicBool::new(false),
             active_writer_feature_level,
         })
@@ -184,11 +214,21 @@ impl SegmentLog {
     }
 
     pub fn first_index(&self) -> Option<u64> {
-        self.records.first().map(|record| record.index)
+        self.sealed_indexes
+            .values()
+            .filter(|index| index.location_count > 0)
+            .map(|index| index.first_index)
+            .chain(self.resident_records.iter().map(|record| record.index))
+            .min()
     }
 
     pub fn last_index(&self) -> Option<u64> {
-        self.records.last().map(|record| record.index)
+        self.sealed_indexes
+            .values()
+            .filter(|index| index.location_count > 0)
+            .map(|index| index.last_index)
+            .chain(self.resident_records.iter().map(|record| record.index))
+            .max()
     }
 
     pub fn next_index(&self) -> u64 {
@@ -245,7 +285,8 @@ impl SegmentLog {
                 ),
             )));
         }
-        if self.records.is_empty() && self.current_len == 0 && record.index >= self.start_index {
+        if self.last_index().is_none() && self.current_len == 0 && record.index >= self.start_index
+        {
             self.start_index = record.index;
         }
         let expected = self.next_index();
@@ -304,7 +345,7 @@ impl SegmentLog {
             offset,
             encoded_len,
         };
-        self.records.push(location.clone());
+        self.resident_records.push(location.clone());
         Ok(location)
     }
 
@@ -318,60 +359,109 @@ impl SegmentLog {
     }
 
     pub fn read(&self, index: u64) -> Result<Option<Record>, StorageError> {
-        let Some(location) = self.records.iter().find(|location| location.index == index) else {
+        let Some(location) = self.location(index)? else {
             return Ok(None);
         };
-        read_record(location).map(Some)
+        self.read_location(&location).map(Some)
     }
 
     pub fn read_location(&self, location: &RecordLocation) -> Result<Record, StorageError> {
-        self.observe_read(read_record(location))
+        let result = read_record(location).and_then(|record| {
+            if record.index != location.index {
+                return Err(StorageError::Corrupt {
+                    path: location.segment.as_ref().clone(),
+                    offset: location.offset,
+                    reason: "recovery index points at a different record".into(),
+                });
+            }
+            Ok(record)
+        });
+        self.observe_read(result)
     }
 
     pub fn read_all(&self) -> Result<Vec<Record>, StorageError> {
-        self.records.iter().map(read_record).collect()
-    }
-
-    pub fn read_all_with_locations(&self) -> Result<Vec<(RecordLocation, Record)>, StorageError> {
-        self.records
+        self.all_locations()?
             .iter()
-            .map(|location| Ok((location.clone(), read_record(location)?)))
+            .map(|location| self.read_location(location))
             .collect()
     }
 
-    pub fn location(&self, index: u64) -> Option<RecordLocation> {
-        self.records
+    pub fn read_all_with_locations(&self) -> Result<Vec<(RecordLocation, Record)>, StorageError> {
+        self.all_locations()?
+            .into_iter()
+            .map(|location| {
+                let record = self.read_location(&location)?;
+                Ok((location, record))
+            })
+            .collect()
+    }
+
+    pub fn location(&self, index: u64) -> Result<Option<RecordLocation>, StorageError> {
+        if let Some(location) = self
+            .resident_records
             .iter()
             .find(|location| location.index == index)
             .cloned()
+        {
+            return Ok(Some(location));
+        }
+        let Some((path, summary)) = self
+            .sealed_indexes
+            .iter()
+            .find(|(_, summary)| index >= summary.first_index && index <= summary.last_index)
+        else {
+            return Ok(None);
+        };
+        recovery_index::load_location(path, summary, index)
     }
 
-    pub fn locations(&self) -> &[RecordLocation] {
-        &self.records
+    pub fn locations_for_segment(&self, path: &Path) -> Result<Vec<RecordLocation>, StorageError> {
+        if let Some(summary) = self.sealed_indexes.get(path) {
+            return recovery_index::load_locations(path, summary);
+        }
+        Ok(self
+            .resident_records
+            .iter()
+            .filter(|location| location.segment.as_ref() == path)
+            .cloned()
+            .collect())
     }
 
     pub fn current_segment_path(&self) -> &Path {
         &self.current_path
     }
 
-    pub fn recovery_metadata(&self, path: &Path) -> Option<&[u8]> {
-        self.recovery_metadata.get(path).map(Vec::as_slice)
+    pub fn recovery_metadata_ref(&self, path: &Path) -> Option<RecoveryMetadataRef> {
+        let summary = self.sealed_indexes.get(path)?;
+        Some(RecoveryMetadataRef {
+            segment: Arc::new(path.to_path_buf()),
+            index: Arc::new(recovery_index::index_path(path)),
+            offset: summary.metadata_offset,
+            len: summary.metadata_len,
+            segment_len: summary.segment_len,
+        })
+    }
+
+    pub fn load_recovery_metadata(&self, path: &Path) -> Result<Option<Vec<u8>>, StorageError> {
+        self.sealed_indexes
+            .get(path)
+            .map(|summary| recovery_index::load_metadata(path, summary))
+            .transpose()
     }
 
     pub fn record_index_range(&self, path: &Path) -> Option<(u64, u64)> {
-        let first = segment_base_index(path)?;
-        let start = self.records.partition_point(|record| record.index < first);
-        let found = self.records.get(start)?;
-        if found.segment.as_ref() != path {
-            return None;
+        if let Some(index) = self.sealed_indexes.get(path) {
+            return (index.location_count > 0).then_some((index.first_index, index.last_index));
         }
-        let next = self
-            .checksums
-            .keys()
-            .filter_map(|candidate| segment_base_index(candidate))
-            .find(|base| *base > first)
-            .unwrap_or_else(|| self.next_index());
-        Some((first, next.saturating_sub(1)))
+        let mut locations = self
+            .resident_records
+            .iter()
+            .filter(|location| location.segment.as_ref() == path);
+        let first = locations.next()?.index;
+        let last = locations
+            .next_back()
+            .map_or(first, |location| location.index);
+        Some((first, last))
     }
 
     pub fn persist_recovery_index(
@@ -392,15 +482,27 @@ impl SegmentLog {
                 "segment checksum is unavailable",
             ))
         })?;
-        let locations: Vec<_> = self
-            .records
-            .iter()
-            .filter(|location| location.segment.as_ref() == path)
-            .cloned()
-            .collect();
+        let locations = self.locations_for_segment(path)?;
         recovery_index::store(path, segment_len, segment_crc32c, &locations, &metadata)?;
-        self.recovery_metadata.insert(path.to_path_buf(), metadata);
+        let summary = recovery_index::load_summary(path)?.ok_or_else(|| {
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted recovery index disappeared",
+            ))
+        })?;
+        self.sealed_indexes.insert(path.to_path_buf(), summary);
+        self.resident_records
+            .retain(|location| location.segment.as_ref() != path);
         Ok(())
+    }
+
+    fn all_locations(&self) -> Result<Vec<RecordLocation>, StorageError> {
+        let mut output = Vec::with_capacity(self.recovery.records);
+        for path in segment_paths(&self.directory)? {
+            output.extend(self.locations_for_segment(&path)?);
+        }
+        output.sort_by_key(|location| location.index);
+        Ok(output)
     }
 
     fn ensure_available(&self) -> Result<(), StorageError> {

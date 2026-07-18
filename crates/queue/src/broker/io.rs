@@ -1,8 +1,10 @@
 use super::*;
 use crate::batch;
 use crate::metadata::store_atomic;
-use crate::model::Delivery;
+use crate::model::{Delivery, ReservedDelivery};
 use crate::outbox::OutboxEntry;
+use crate::payload_reader::PayloadLease;
+use crate::topic::delivery::ReserveBatch;
 use crate::topic::Topic;
 use bytes::Bytes;
 use rustqueue_storage::MAX_RECORD_BYTES;
@@ -26,44 +28,26 @@ impl Broker {
         let handle = self.topic(topic)?;
         let mut wake = handle.wake.subscribe();
         let timeout = timeout.unwrap_or(self.inner.config.message_timeout);
-        let (mut reservations, mut lease) = {
-            let mut topic = handle.state.lock();
-            let reservations = topic.reserve_batch(
+        let (mut reservations, mut lease) = self
+            .reserve_deliveries(
+                &handle,
                 channel,
                 max_messages.clamp(1, 64),
                 max_bytes.max(1),
                 timeout,
-            )?;
-            let lease = (!reservations.is_empty()).then(|| {
-                self.inner.payload_reader.retain(
-                    reservations
-                        .iter()
-                        .map(|item| item.payload.clone())
-                        .collect(),
-                )
-            });
-            (reservations, lease)
-        };
+            )
+            .await?;
         if reservations.is_empty() && !wait.is_zero() {
             let _ = tokio::time::timeout(wait.min(Duration::from_secs(1)), wake.changed()).await;
-            (reservations, lease) = {
-                let mut topic = handle.state.lock();
-                let reservations = topic.reserve_batch(
+            (reservations, lease) = self
+                .reserve_deliveries(
+                    &handle,
                     channel,
                     max_messages.clamp(1, 64),
                     max_bytes.max(1),
                     timeout,
-                )?;
-                let lease = (!reservations.is_empty()).then(|| {
-                    self.inner.payload_reader.retain(
-                        reservations
-                            .iter()
-                            .map(|item| item.payload.clone())
-                            .collect(),
-                    )
-                });
-                (reservations, lease)
-            };
+                )
+                .await?;
         }
         if reservations.is_empty() {
             return Ok(Vec::new());
@@ -97,6 +81,81 @@ impl Broker {
                 body,
             })
             .collect())
+    }
+
+    async fn reserve_deliveries(
+        &self,
+        handle: &Arc<TopicHandle>,
+        channel: &str,
+        max_messages: usize,
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<(Vec<ReservedDelivery>, Option<PayloadLease>), BrokerError> {
+        let mut accumulated = Vec::with_capacity(max_messages);
+        let mut accumulated_bytes = 0usize;
+        for _ in 0..=max_messages {
+            let remaining_messages = max_messages.saturating_sub(accumulated.len());
+            if remaining_messages == 0 {
+                break;
+            }
+            let action = handle.state.lock().reserve_batch(
+                channel,
+                remaining_messages,
+                max_bytes.saturating_sub(accumulated_bytes).max(1),
+                timeout,
+            )?;
+            match action {
+                ReserveBatch::Ready(reservations) => {
+                    accumulated_bytes = accumulated_bytes.saturating_add(
+                        reservations
+                            .iter()
+                            .map(|item| item.payload.len as usize)
+                            .sum::<usize>(),
+                    );
+                    let done = reservations.is_empty()
+                        || accumulated.len().saturating_add(reservations.len()) >= max_messages
+                        || accumulated_bytes >= max_bytes;
+                    accumulated.extend(reservations);
+                    if done {
+                        break;
+                    }
+                }
+                ReserveBatch::Load { reserved, request } => {
+                    accumulated_bytes = accumulated_bytes.saturating_add(
+                        reserved
+                            .iter()
+                            .map(|item| item.payload.len as usize)
+                            .sum::<usize>(),
+                    );
+                    accumulated.extend(reserved);
+                    if accumulated_bytes >= max_bytes || accumulated.len() >= max_messages {
+                        break;
+                    }
+                    let _lease = self
+                        .inner
+                        .payload_reader
+                        .retain_paths(vec![request.segment_path().to_path_buf()]);
+                    if let Err(error) = self.inner.message_index_cache.load(request).await {
+                        if matches!(&error, BrokerError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
+                        {
+                            handle.state.lock().cancel(channel, &accumulated);
+                            return Ok((Vec::new(), None));
+                        }
+                        handle.state.lock().cancel(channel, &accumulated);
+                        return self.observe_storage_result(Err(error));
+                    }
+                }
+            }
+        }
+        let lease = (!accumulated.is_empty()).then(|| {
+            self.inner.payload_reader.retain(
+                accumulated
+                    .iter()
+                    .map(|item| item.payload.clone())
+                    .collect(),
+            )
+        });
+        Ok((accumulated, lease))
     }
 
     pub async fn next_message(
@@ -243,8 +302,14 @@ impl Broker {
         delay: Duration,
     ) -> Result<Vec<u64>, BrokerError> {
         self.validate_publish_request(topic, bodies)?;
+        let mut metadata = self.reserve_message_metadata(bodies.len())?;
         let handle = self.get_or_create_topic(topic)?;
-        let ids = self.append_publish_to_topic(&mut handle.state.lock(), bodies, delay, true)?;
+        let mut state = handle.state.lock();
+        let ids = self.append_publish_to_topic(&mut state, bodies, delay, true, &mut metadata)?;
+        if self.inner.message_index_cache.over_budget() {
+            state.spill_message_metadata()?;
+        }
+        drop(state);
         handle.signal();
         Ok(ids)
     }
@@ -280,13 +345,14 @@ impl Broker {
         bodies: &[Bytes],
         delay: Duration,
         durable: bool,
+        metadata: &mut crate::topic::index::MetadataReservation,
     ) -> Result<Vec<u64>, BrokerError> {
         let first_position = state.next_position();
         let first_id = self.reserve_ids(bodies.len())?;
         let batch = batch::encode(first_position, first_id, bodies)?;
         let timestamp = now_ns();
         let available = now_ms().saturating_add(delay.as_millis().min(i64::MAX as u128) as i64);
-        state.append_batch(first_id, timestamp, available, batch, durable)
+        state.append_batch(first_id, timestamp, available, batch, durable, metadata)
     }
 
     pub(super) fn reserve_ids(&self, count: usize) -> Result<u64, BrokerError> {

@@ -279,7 +279,8 @@ pub(super) async fn observe(
         "queue": stats,
         "limits": {
             "max_message_bytes": state.config.queue.max_message_bytes,
-            "max_backlog_messages": state.config.queue.max_backlog_messages,
+            "max_backlog_messages": 0,
+            "message_index_cache_bytes": state.config.storage.message_index_cache_bytes,
             "max_connections": state.config.limits.max_connections,
         },
     })))

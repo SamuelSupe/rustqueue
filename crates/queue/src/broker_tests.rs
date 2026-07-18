@@ -317,32 +317,150 @@ async fn broker_rejects_unbounded_durable_topic_creation() {
 }
 
 #[tokio::test]
-async fn a_rejected_request_does_not_fail_other_requests_in_the_group() {
+async fn sealed_backlog_uses_bounded_metadata_residency() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        max_segment_bytes: 512,
+        message_index_cache_bytes: 2 * 1024 * 60,
+        bootstrap_retention: Duration::from_nanos(1),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    for _ in 0..100 {
+        broker
+            .publish("events", vec![vec![0x5a; 64]; 32], Duration::ZERO)
+            .await
+            .unwrap();
+    }
+    broker.create_channel("events", "tail").await.unwrap();
+    broker
+        .publish("events", vec![vec![0x6b; 64]; 64], Duration::ZERO)
+        .await
+        .unwrap();
+    broker.compact().await.unwrap();
+    let handle = broker.topic("events").unwrap();
+    let (active, sealed) = handle.state.lock().index_residency();
+    assert_eq!(broker.stats().topics[0].message_count, 3_264);
+    assert!(sealed >= 101);
+    assert!(
+        active <= 32,
+        "only the active segment may keep per-message metadata"
+    );
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    let handle = broker.topic("events").unwrap();
+    let (active, sealed) = handle.state.lock().index_residency();
+    assert_eq!(broker.stats().topics[0].message_count, 3_264);
+    assert!(sealed >= 101);
+    assert!(active <= 32);
+    let deliveries = broker
+        .fetch_batch("events", "workers", 64, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 64);
+    let tail = broker
+        .fetch_batch("events", "tail", 64, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 64);
+    assert!(tail
+        .iter()
+        .all(|message| message.body.as_ref() == [0x6b; 64]));
+    assert!(broker.inner.message_index_cache.resident_bytes() <= 2 * 1024 * 60);
+}
+
+#[tokio::test]
+async fn broker_metadata_budget_spills_active_tails_across_topics() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        message_index_cache_bytes: 64 * 1024,
+        max_publish_workers: 128,
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("topic-0", "workers").await.unwrap();
+    for ordinal in 0..100 {
+        broker
+            .publish(
+                &format!("topic-{ordinal}"),
+                vec![vec![ordinal as u8; 8]; 32],
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        if ordinal == 1 {
+            let deliveries = broker
+                .fetch_batch("topic-0", "workers", 32, usize::MAX, Duration::ZERO, None)
+                .await
+                .unwrap();
+            assert_eq!(deliveries.len(), 32);
+        }
+    }
+    assert_eq!(
+        broker
+            .stats()
+            .topics
+            .iter()
+            .map(|topic| topic.message_count)
+            .sum::<u64>(),
+        3_200
+    );
+    assert!(broker.inner.message_index_cache.resident_bytes() <= 64 * 1024);
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    assert_eq!(
+        broker
+            .stats()
+            .topics
+            .iter()
+            .map(|topic| topic.message_count)
+            .sum::<u64>(),
+        3_200
+    );
+    assert!(broker.inner.message_index_cache.resident_bytes() <= 64 * 1024);
+}
+
+#[tokio::test]
+async fn concurrent_publishes_wait_for_metadata_spill_instead_of_rejecting() {
     let root = tempdir().unwrap();
     let broker = Broker::open(BrokerConfig {
         data_path: root.path().into(),
-        max_backlog_messages: 1,
+        message_index_cache_bytes: 64 * 1024,
+        max_publish_workers: 64,
         ..BrokerConfig::default()
     })
     .unwrap();
-    let (first, second) = tokio::join!(
-        broker.publish("events", vec![b"first".to_vec()], Duration::ZERO),
-        broker.publish("events", vec![b"second".to_vec()], Duration::ZERO),
-    );
-    let results = [first, second];
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let mut publishes = tokio::task::JoinSet::new();
+    for ordinal in 0..32 {
+        let broker = broker.clone();
+        publishes.spawn(async move {
+            broker
+                .publish(
+                    &format!("concurrent-{ordinal}"),
+                    vec![vec![ordinal as u8; 8]; 1_024],
+                    Duration::ZERO,
+                )
+                .await
+        });
+    }
+    while let Some(result) = publishes.join_next().await {
+        assert_eq!(result.unwrap().unwrap().len(), 1_024);
+    }
     assert_eq!(
-        results
+        broker
+            .stats()
+            .topics
             .iter()
-            .filter(|result| matches!(result, Err(BrokerError::BacklogLimit)))
-            .count(),
-        1
+            .map(|topic| topic.message_count)
+            .sum::<u64>(),
+        32 * 1_024
     );
-    assert!(broker.storage_healthy());
-    let stats = broker.stats();
-    assert_eq!(stats.publish_group_commit.commits, 1);
-    assert_eq!(stats.publish_group_commit.requests, 1);
-    assert_eq!(stats.topics[0].message_count, 1);
+    assert!(broker.inner.message_index_cache.resident_bytes() <= 64 * 1024);
 }
 
 #[tokio::test]

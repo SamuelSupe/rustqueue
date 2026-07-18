@@ -1,5 +1,9 @@
 #[path = "topic/delivery.rs"]
-mod delivery;
+pub(crate) mod delivery;
+#[path = "topic/index.rs"]
+pub(crate) mod index;
+#[path = "topic/index_cache.rs"]
+pub(crate) mod index_cache;
 #[path = "topic/maintenance.rs"]
 mod maintenance;
 #[path = "topic/recovery.rs"]
@@ -9,11 +13,11 @@ use crate::batch::{self, EncodedBatch};
 use crate::channel::{ChannelCommand, ChannelRuntime, ChannelState};
 use crate::channel_store::{checkpoint_paths, ChannelStore};
 use crate::metadata::{load_topic_manifest, store_atomic, TopicManifest};
-use crate::model::MessageMeta;
 use crate::BrokerError;
+use index::{MessageIndex, MessageIndexCache, MetadataReservation};
 use parking_lot::Mutex;
 use rustqueue_storage::{RecordHeader, RecordKind, SegmentLog};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,9 +33,8 @@ pub(crate) struct Topic {
     manifest_path: PathBuf,
     manifest: TopicManifest,
     log: SegmentLog,
-    messages: VecDeque<MessageMeta>,
+    messages: MessageIndex,
     channels: HashMap<String, ChannelRuntime>,
-    max_backlog_messages: usize,
     max_ack_gap: usize,
 }
 
@@ -39,16 +42,16 @@ impl TopicHandle {
     pub fn open(
         directory: &Path,
         max_segment_bytes: u64,
-        max_backlog_messages: usize,
         max_ack_gap: usize,
         storage_feature_level: u32,
+        index_cache: Arc<MessageIndexCache>,
     ) -> Result<Arc<Self>, BrokerError> {
         let mut topic = Topic::open(
             directory,
             max_segment_bytes,
-            max_backlog_messages,
             max_ack_gap,
             storage_feature_level,
+            index_cache,
         )?;
         let (wake, _) = tokio::sync::watch::channel(0);
         topic.recover_channels()?;
@@ -62,9 +65,9 @@ impl TopicHandle {
         directory: &Path,
         name: &str,
         max_segment_bytes: u64,
-        max_backlog_messages: usize,
         max_ack_gap: usize,
         storage_feature_level: u32,
+        index_cache: Arc<MessageIndexCache>,
     ) -> Result<Arc<Self>, BrokerError> {
         std::fs::create_dir_all(directory.join("segments"))?;
         std::fs::create_dir_all(directory.join("channels"))?;
@@ -90,9 +93,8 @@ impl TopicHandle {
                 manifest_path: directory.join("manifest"),
                 manifest,
                 log,
-                messages: VecDeque::new(),
+                messages: MessageIndex::new(index_cache),
                 channels: HashMap::new(),
-                max_backlog_messages,
                 max_ack_gap,
             }),
             wake,
@@ -109,9 +111,9 @@ impl Topic {
     fn open(
         directory: &Path,
         max_segment_bytes: u64,
-        max_backlog_messages: usize,
         max_ack_gap: usize,
         storage_feature_level: u32,
+        index_cache: Arc<MessageIndexCache>,
     ) -> Result<Self, BrokerError> {
         let manifest_path = directory.join("manifest");
         let mut manifest: TopicManifest = load_topic_manifest(&manifest_path)?
@@ -127,52 +129,36 @@ impl Topic {
             1,
             storage_feature_level,
         )?;
-        let mut messages = VecDeque::new();
-        let mut expected_position = None;
+        let mut messages = MessageIndex::new(index_cache);
         for path in log.segment_paths()? {
-            let indexed = log.immutable_file(&path).and_then(|(segment_len, _)| {
-                log.recovery_metadata(&path)
-                    .and_then(|bytes| recovery::decode(&path, segment_len, bytes).ok())
-            });
-            let (path_messages, rebuilt) = if let Some(messages) = indexed {
-                (messages, false)
-            } else {
-                let mut messages = Vec::new();
-                let locations: Vec<_> = log
-                    .locations()
-                    .iter()
-                    .filter(|location| location.segment.as_ref() == &path)
-                    .cloned()
-                    .collect();
-                for location in locations {
-                    let record = log.read_location(&location)?;
-                    if record.kind == RecordKind::PublishBatch {
-                        messages.extend(batch::metas(&record, &location)?);
+            let immutable = log.immutable_file(&path).is_some();
+            if immutable {
+                if let Some(metadata) = log.recovery_metadata_ref(&path) {
+                    if messages.recover_sealed(metadata).is_ok() {
+                        continue;
                     }
                 }
-                (messages, true)
-            };
-            for message in path_messages {
-                if expected_position.is_some_and(|expected| message.position != expected) {
-                    return Err(BrokerError::InvalidRecord(
-                        "topic message positions are not contiguous".into(),
-                    ));
-                }
-                expected_position = Some(message.position.saturating_add(1));
-                messages.push_back(message);
             }
-            if rebuilt && log.immutable_file(&path).is_some() {
-                let metadata = recovery::encode(
-                    messages
-                        .iter()
-                        .filter(|message| message.payload.path.as_ref() == &path),
-                );
-                log.persist_recovery_index(&path, metadata)?;
+            let mut path_messages = Vec::new();
+            for location in log.locations_for_segment(&path)? {
+                let record = log.read_location(&location)?;
+                if record.kind == RecordKind::PublishBatch {
+                    path_messages.extend(batch::metas(&record, &location)?);
+                }
+            }
+            if immutable {
+                log.persist_recovery_index(&path, recovery::encode(path_messages.iter()))?;
+                let metadata = log.recovery_metadata_ref(&path).ok_or_else(|| {
+                    BrokerError::InvalidRecord("sealed topic index was not persisted".into())
+                })?;
+                messages.recover_sealed(metadata)?;
+            } else {
+                messages.recover_active(path_messages)?;
             }
         }
         let recovered_next = messages
-            .back()
-            .map_or(1, |message| message.position.saturating_add(1));
+            .last_position()
+            .map_or(1, |position| position.saturating_add(1));
         if manifest.next_position < recovered_next {
             manifest.next_position = recovered_next;
             store_atomic(&manifest_path, &manifest)?;
@@ -185,7 +171,6 @@ impl Topic {
             log,
             messages,
             channels: HashMap::new(),
-            max_backlog_messages,
             max_ack_gap,
         })
     }
@@ -215,16 +200,15 @@ impl Topic {
         available_at_ms: i64,
         batch: EncodedBatch<'_>,
         durable: bool,
+        reservation: &mut MetadataReservation,
     ) -> Result<Vec<u64>, BrokerError> {
         if self.manifest.deleted {
             return Err(BrokerError::TopicNotFound);
         }
-        if self.messages.len().saturating_add(batch.entries.len()) > self.max_backlog_messages {
-            return Err(BrokerError::BacklogLimit);
-        }
-        let timestamp_ns = self.messages.back().map_or(timestamp_ns, |message| {
-            timestamp_ns.max(message.timestamp_ns)
-        });
+        let timestamp_ns = self
+            .messages
+            .last_timestamp_ns()
+            .map_or(timestamp_ns, |previous| timestamp_ns.max(previous));
         let record = RecordHeader {
             kind: RecordKind::PublishBatch,
             flags: 0,
@@ -240,7 +224,7 @@ impl Topic {
             .append_parts_at_with_location(record, &parts, durable)?;
         let metas = batch::metas_after_append(timestamp_ns, available_at_ms, &location, &batch);
         let ids = metas.iter().map(|message| message.id).collect();
-        self.messages.extend(metas);
+        self.messages.append(metas, reservation)?;
         if previous_segment != self.log.current_segment_path() {
             self.persist_segment_index(&previous_segment)?;
         }
@@ -265,19 +249,29 @@ impl Topic {
         Ok(())
     }
 
+    pub(crate) fn spill_message_metadata(&mut self) -> Result<usize, BrokerError> {
+        let count = self.messages.active_count();
+        if count > 0 {
+            self.seal_log()?;
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn active_metadata_count(&self) -> usize {
+        self.messages.active_count()
+    }
+
     fn persist_segment_index(&mut self, path: &Path) -> Result<(), BrokerError> {
-        let (first_index, last_index) = self
+        let (_first_index, _last_index) = self
             .log
             .record_index_range(path)
             .ok_or_else(|| BrokerError::InvalidRecord("sealed segment has no records".into()))?;
-        let first = self
-            .messages
-            .partition_point(|message| message.log_index < first_index);
-        let end = self
-            .messages
-            .partition_point(|message| message.log_index <= last_index);
-        let metadata = recovery::encode(self.messages.range(first..end));
+        let metadata = recovery::encode(self.messages.active_for_path(path));
         self.log.persist_recovery_index(path, metadata)?;
+        let reference = self.log.recovery_metadata_ref(path).ok_or_else(|| {
+            BrokerError::InvalidRecord("sealed topic index was not persisted".into())
+        })?;
+        self.messages.seal_path(path, reference)?;
         Ok(())
     }
 
@@ -313,17 +307,9 @@ impl Topic {
         } else {
             let cutoff = now_ns()
                 .saturating_sub(bootstrap_retention.as_nanos().min(i64::MAX as u128) as i64);
-            let initial_barrier = self
-                .messages
-                .front()
-                .map_or(self.last_position(), |message| {
-                    message.position.saturating_sub(1)
-                });
             self.messages
-                .iter()
-                .take_while(|message| message.timestamp_ns < cutoff)
-                .last()
-                .map_or(initial_barrier, |message| message.position)
+                .retain_from_timestamp(cutoff, self.manifest.next_position)
+                .saturating_sub(1)
         };
         let state = ChannelState::new(name.into(), barrier, ephemeral, self.max_ack_gap);
         let store = if ephemeral {
@@ -354,6 +340,11 @@ impl Topic {
         let mut names: Vec<_> = self.channels.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_residency(&self) -> (usize, usize) {
+        (self.messages.active_count(), self.messages.sealed_count())
     }
 
     fn persist_channel(

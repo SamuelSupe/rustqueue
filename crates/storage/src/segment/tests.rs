@@ -64,7 +64,10 @@ fn sealed_segments_recover_from_the_sidecar_index() {
     let log = SegmentLog::open(directory.path(), 100).unwrap();
     assert_eq!(log.recovery_report().indexed_records, 1);
     assert_eq!(log.recovery_report().scanned_records, 1);
-    assert_eq!(log.recovery_metadata(&sealed), Some(&b"queue-metadata"[..]));
+    assert_eq!(
+        log.load_recovery_metadata(&sealed).unwrap(),
+        Some(b"queue-metadata".to_vec())
+    );
     assert_eq!(log.read(1).unwrap().unwrap().payload, vec![1; 20]);
 }
 
@@ -83,6 +86,34 @@ fn corrupt_sidecar_falls_back_to_a_full_segment_scan() {
     assert_eq!(log.recovery_report().indexed_records, 0);
     assert_eq!(log.recovery_report().scanned_records, 2);
     assert_eq!(log.read(1).unwrap().unwrap().payload, vec![1; 20]);
+}
+
+#[test]
+fn sidecar_body_is_verified_by_background_scrub_not_startup() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    log.append(record(0, &[1; 20]), true).unwrap();
+    log.append(record(0, &[2; 20]), true).unwrap();
+    let sealed = log.segment_paths().unwrap()[0].clone();
+    log.persist_recovery_index(&sealed, vec![0x5a; 4096])
+        .unwrap();
+    drop(log);
+
+    let sidecar = sealed.with_extension("rqidx");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&sidecar)
+        .unwrap();
+    file.seek(SeekFrom::Start(recovery_index::HEADER_LEN + 24 + 2048))
+        .unwrap();
+    file.write_all(b"X").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let log = SegmentLog::open(directory.path(), 100).unwrap();
+    assert_eq!(log.recovery_report().indexed_records, 1);
+    assert!(matches!(log.scrub(), Err(StorageError::Corrupt { path, .. }) if path == sidecar));
 }
 
 #[test]

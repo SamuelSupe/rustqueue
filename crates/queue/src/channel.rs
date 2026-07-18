@@ -68,6 +68,18 @@ pub(crate) struct ChannelState {
     max_ack_gap: usize,
 }
 
+pub(crate) enum MessageAvailability {
+    Ready(i64),
+    Missing,
+    Absent,
+}
+
+pub(crate) enum NextCandidate {
+    Ready(u64),
+    Load(u64),
+    None,
+}
+
 impl ChannelState {
     pub fn new(name: String, barrier_position: u64, ephemeral: bool, max_ack_gap: usize) -> Self {
         Self {
@@ -178,10 +190,10 @@ impl ChannelState {
         &mut self,
         now_ms: i64,
         last_position: u64,
-        available_at: impl Fn(u64) -> Option<i64>,
-    ) -> Option<u64> {
+        available_at: impl Fn(u64) -> MessageAvailability,
+    ) -> NextCandidate {
         if self.paused {
-            return None;
+            return NextCandidate::None;
         }
         let expired: Vec<_> = self
             .in_flight
@@ -192,18 +204,32 @@ impl ChannelState {
             self.remove_in_flight(position);
             self.redelivery.insert(position);
         }
-        let ready_redelivery = self.redelivery.iter().copied().find(|position| {
-            self.requeued_until
-                .get(position)
+        let mut absent = Vec::new();
+        let redelivery: Vec<_> = self.redelivery.iter().copied().collect();
+        for position in redelivery {
+            if self
+                .requeued_until
+                .get(&position)
                 .copied()
                 .unwrap_or_default()
-                <= now_ms
-                && available_at(*position).is_some_and(|available| available <= now_ms)
-        });
-        if let Some(position) = ready_redelivery {
+                > now_ms
+            {
+                continue;
+            }
+            match available_at(position) {
+                MessageAvailability::Ready(available) if available <= now_ms => {
+                    self.redelivery.remove(&position);
+                    self.requeued_until.remove(&position);
+                    return NextCandidate::Ready(position);
+                }
+                MessageAvailability::Missing => return NextCandidate::Load(position),
+                MessageAvailability::Absent => absent.push(position),
+                MessageAvailability::Ready(_) => {}
+            }
+        }
+        for position in absent {
             self.redelivery.remove(&position);
             self.requeued_until.remove(&position);
-            return Some(position);
         }
         while self.next_position <= last_position {
             if self.next_position
@@ -211,27 +237,33 @@ impl ChannelState {
                     .ack_floor_position
                     .saturating_add(self.max_ack_gap as u64)
             {
-                return None;
+                return NextCandidate::None;
             }
             let position = self.next_position;
-            self.next_position = self.next_position.saturating_add(1);
             if position <= self.ack_floor_position
                 || self.acknowledged.contains(&position)
                 || self.in_flight.contains_key(&position)
             {
+                self.next_position = self.next_position.saturating_add(1);
                 continue;
             }
-            let Some(available) = available_at(position) else {
-                continue;
+            let available = match available_at(position) {
+                MessageAvailability::Ready(available) => available,
+                MessageAvailability::Missing => return NextCandidate::Load(position),
+                MessageAvailability::Absent => {
+                    self.next_position = self.next_position.saturating_add(1);
+                    continue;
+                }
             };
+            self.next_position = self.next_position.saturating_add(1);
             if available > now_ms {
                 self.redelivery.insert(position);
                 self.requeued_until.insert(position, available);
                 continue;
             }
-            return Some(position);
+            return NextCandidate::Ready(position);
         }
-        None
+        NextCandidate::None
     }
 
     pub fn reserve(&mut self, position: u64, id: u64, timeout_ms: i64) -> (u64, u16) {

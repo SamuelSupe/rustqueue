@@ -215,8 +215,7 @@ impl From<BrokerError> for ApiError {
             BrokerError::MessageTooLarge | BrokerError::BatchTooLarge => {
                 (StatusCode::BAD_REQUEST, "E_BAD_MESSAGE")
             }
-            BrokerError::BacklogLimit
-            | BrokerError::TopicLimit
+            BrokerError::TopicLimit
             | BrokerError::PublishWorkerLimit
             | BrokerError::ChannelWorkerLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
             BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {

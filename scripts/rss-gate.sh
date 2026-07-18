@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 messages=${MESSAGES:-10000000}
 message_bytes=${MESSAGE_BYTES:-1024}
-limit=${MAX_BYTES_PER_MESSAGE:-128}
+growth_limit=${MAX_GROWTH_AFTER_WARM_BYTES:-67108864}
 batch_size=${BATCH_SIZE:-64}
 project=rustqueue-rss
 compose="docker compose -p $project -f $root/docker-compose.yml"
@@ -51,14 +51,26 @@ resource_sampler_pid=$!
 rss_sampler_pid=$!
 
 before=$(rss_bytes)
+first_half=$((messages / 2))
+second_half=$((messages - first_half))
 docker exec "$container" /usr/local/bin/rustqueue-bench \
   --address 127.0.0.1:4150 \
   --topic rss-gate \
-  --messages "$messages" \
+  --messages "$first_half" \
   --message-bytes "$message_bytes" \
   --batch-size "$batch_size" \
   --producers 16 \
-  --consumers 0 >/tmp/rustqueue-rss-gate.out
+  --consumers 0 >/tmp/rustqueue-rss-gate-first.out
+sleep 5
+warm=$(rss_bytes)
+docker exec "$container" /usr/local/bin/rustqueue-bench \
+  --address 127.0.0.1:4150 \
+  --topic rss-gate \
+  --messages "$second_half" \
+  --message-bytes "$message_bytes" \
+  --batch-size "$batch_size" \
+  --producers 16 \
+  --consumers 0 >/tmp/rustqueue-rss-gate-second.out
 sleep 5
 after=$(rss_bytes)
 kill "$resource_sampler_pid" "$rss_sampler_pid" >/dev/null 2>&1 || true
@@ -67,8 +79,10 @@ resource_sampler_pid=
 rss_sampler_pid=
 peak=$(awk 'NR > 1 && $2 > max { max=$2 } END { print max + 0 }' "$rss_samples")
 delta=$((after - before))
+growth_after_warm=$((after - warm))
 [ "$delta" -lt 0 ] && delta=0
-per_message=$((delta / messages))
-cat /tmp/rustqueue-rss-gate.out
-printf '%s\n' "{\"messages\":$messages,\"message_bytes\":$message_bytes,\"batch_size\":$batch_size,\"rss_before\":$before,\"rss_after\":$after,\"rss_peak\":$peak,\"rss_delta\":$delta,\"bytes_per_message\":$per_message,\"limit\":$limit,\"resource_samples\":\"$resource_samples\",\"rss_samples\":\"$rss_samples\"}"
-[ "$per_message" -le "$limit" ]
+[ "$growth_after_warm" -lt 0 ] && growth_after_warm=0
+cat /tmp/rustqueue-rss-gate-first.out
+cat /tmp/rustqueue-rss-gate-second.out
+printf '%s\n' "{\"messages\":$messages,\"message_bytes\":$message_bytes,\"batch_size\":$batch_size,\"rss_before\":$before,\"rss_after_warm\":$warm,\"rss_after\":$after,\"rss_peak\":$peak,\"rss_delta\":$delta,\"growth_after_warm\":$growth_after_warm,\"growth_limit\":$growth_limit,\"resource_samples\":\"$resource_samples\",\"rss_samples\":\"$rss_samples\"}"
+[ "$growth_after_warm" -le "$growth_limit" ]

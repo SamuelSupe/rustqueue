@@ -20,6 +20,7 @@ max_segment_bytes = 104857600
 scrub_interval_seconds = 3600
 scrub_bytes_per_second = 67108864
 entry_cache_bytes = 67108864
+message_index_cache_bytes = 67108864
 payload_read_workers = 0
 payload_read_queue = 4096
 disk_high_watermark_percent = 85
@@ -31,11 +32,11 @@ disk_pressure_grace_seconds = 60
 [queue]
 # The stable v7 wire limit is 32 MiB; 20 MiB is the production default.
 max_message_bytes = 20971520
+# Backlog is not capped by message count. Disk watermarks are the publish limit.
 message_timeout_ms = 60000
 max_message_timeout_ms = 900000
 max_defer_ms = 3600000
 max_ack_gap = 65536
-max_backlog_messages = 10000000
 # Durable topics and each per-topic publish/channel group-commit worker class are bounded.
 max_topics = 10000
 max_publish_workers = 1024

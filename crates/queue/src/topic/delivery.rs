@@ -1,5 +1,15 @@
 use super::*;
+use crate::channel::{MessageAvailability, NextCandidate};
 use crate::model::ReservedDelivery;
+use crate::topic::index::{Lookup, PageRequest};
+
+pub(crate) enum ReserveBatch {
+    Ready(Vec<ReservedDelivery>),
+    Load {
+        reserved: Vec<ReservedDelivery>,
+        request: PageRequest,
+    },
+}
 
 impl Topic {
     pub fn reserve_batch(
@@ -8,18 +18,14 @@ impl Topic {
         max_messages: usize,
         max_bytes: usize,
         timeout: Duration,
-    ) -> Result<Vec<ReservedDelivery>, BrokerError> {
+    ) -> Result<ReserveBatch, BrokerError> {
         if self.manifest.deleted {
             return Err(BrokerError::TopicNotFound);
         }
         if self.manifest.paused {
-            return Ok(Vec::new());
+            return Ok(ReserveBatch::Ready(Vec::new()));
         }
         let last = self.last_position();
-        let base = self
-            .messages
-            .front()
-            .map_or(self.manifest.next_position, |message| message.position);
         let messages = &self.messages;
         let channel = self
             .channels
@@ -28,12 +34,24 @@ impl Topic {
         let mut reserved = Vec::with_capacity(max_messages);
         let mut bytes = 0usize;
         for _ in 0..max_messages {
-            let Some(position) = channel.state.next_candidate(now_ms(), last, |position| {
-                message_at(messages, base, position).map(|message| message.available_at_ms)
-            }) else {
-                break;
+            let candidate = channel
+                .state
+                .next_candidate(now_ms(), last, |position| match messages.lookup(position) {
+                    Lookup::Found(message) => MessageAvailability::Ready(message.available_at_ms),
+                    Lookup::Load(_) => MessageAvailability::Missing,
+                    Lookup::Absent => MessageAvailability::Absent,
+                });
+            let position = match candidate {
+                NextCandidate::Ready(position) => position,
+                NextCandidate::Load(position) => match messages.lookup(position) {
+                    Lookup::Load(request) => {
+                        return Ok(ReserveBatch::Load { reserved, request });
+                    }
+                    Lookup::Found(_) | Lookup::Absent => continue,
+                },
+                NextCandidate::None => break,
             };
-            let Some(message) = message_at(messages, base, position) else {
+            let Lookup::Found(message) = messages.lookup(position) else {
                 continue;
             };
             let next_bytes = message.payload.len as usize;
@@ -56,7 +74,7 @@ impl Topic {
                 payload: message.payload.clone(),
             });
         }
-        Ok(reserved)
+        Ok(ReserveBatch::Ready(reserved))
     }
 
     pub fn cancel(&mut self, channel: &str, reservations: &[ReservedDelivery]) {
@@ -101,7 +119,7 @@ impl Topic {
                 .and_then(|channel| channel.state.in_flight_position(id))
                 .ok_or(BrokerError::MessageNotInFlight)?
         } else {
-            self.position_by_id(id)
+            self.position_by_id(id)?
                 .ok_or(BrokerError::MessageNotFound)?
         };
         Ok(ChannelCommand::Finish {
@@ -180,17 +198,7 @@ impl Topic {
             .sum()
     }
 
-    fn position_by_id(&self, id: u64) -> Option<u64> {
-        self.messages
-            .iter()
-            .find(|message| message.id == id)
-            .map(|message| message.position)
+    fn position_by_id(&self, id: u64) -> Result<Option<u64>, BrokerError> {
+        self.messages.position_by_id(id)
     }
-}
-
-fn message_at(messages: &VecDeque<MessageMeta>, base: u64, position: u64) -> Option<&MessageMeta> {
-    let index = position.checked_sub(base)? as usize;
-    messages
-        .get(index)
-        .filter(|message| message.position == position)
 }

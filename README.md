@@ -42,6 +42,10 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 - Publish bodies are written to the segment with vectored header/metadata/body
   I/O. The durable path does not build a second batch body or a full record
   buffer, and admission charges the input plus bounded encoding metadata.
+- Backlog has no message-count ceiling. Sealed segments keep only constant-size
+  summaries in RAM; fixed-size message metadata is paged through one bounded
+  Broker cache. Publish admission is therefore governed by the configured PVC
+  watermarks, not by an arbitrary number of messages.
 - GC locates retention boundaries by monotonic indexes instead of rescanning a
   full backlog every five seconds. Scrub snapshots immutable files under the
   Topic lock, then verifies them lock-free with a default 64 MiB/s I/O limit.
@@ -302,8 +306,11 @@ The on-disk layout is:
 ```
 
 Tail short writes are truncated during startup. Sealed segments reopen from an
-atomic CRC-protected recovery index, so startup reads only index metadata plus
-the active tail. Missing or invalid indexes fall back to a full segment scan.
+atomic recovery index by reading its CRC-protected fixed header and first/last
+queue entries; individual metadata entries carry their own CRC and are paged on
+demand. Full sidecar checksums run in background scrub, so startup is O(segment
+count), not O(message count). Missing or invalid indexes fall back to a full
+segment scan.
 Cold payload corruption is isolated by payload-read CRC or the immediate
 background scrub; active-tail corruption, invalid channel WAL and identity
 mismatch fail startup closed.

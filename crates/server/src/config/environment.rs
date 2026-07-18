@@ -39,6 +39,10 @@ impl Config {
             &mut self.storage.scrub_bytes_per_second,
         )?;
         set_from_env(
+            "RUSTQUEUE_MESSAGE_INDEX_CACHE_BYTES",
+            &mut self.storage.message_index_cache_bytes,
+        )?;
+        set_from_env(
             "RUSTQUEUE_MAX_MESSAGE_BYTES",
             &mut self.queue.max_message_bytes,
         )?;

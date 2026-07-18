@@ -8,15 +8,18 @@ mod io;
 mod maintenance;
 #[path = "broker/management.rs"]
 mod management;
+#[path = "broker/metadata_budget.rs"]
+mod metadata_budget;
+#[path = "broker/topics.rs"]
+mod topics;
 
 use crate::management::FenceCatalog;
 use crate::management_ops::OperationCatalog;
-use crate::metadata::{
-    load_optional, load_topic_manifest, store_atomic, topic_directory, BrokerMeta,
-};
+use crate::metadata::{load_optional, load_topic_manifest, store_atomic, BrokerMeta};
 use crate::model::BrokerStats;
 use crate::payload_reader::PayloadReader;
 use crate::telemetry::QueueMetrics;
+use crate::topic::index::MessageIndexCache;
 use crate::topic::TopicHandle;
 use parking_lot::{Mutex, RwLock};
 use rustqueue_protocol::validate_name;
@@ -40,11 +43,11 @@ pub struct BrokerConfig {
     pub message_timeout: Duration,
     pub bootstrap_retention: Duration,
     pub max_ack_gap: usize,
-    pub max_backlog_messages: usize,
     pub max_topics: usize,
     pub max_publish_workers: usize,
     pub publish_worker_idle: Duration,
     pub entry_cache_bytes: usize,
+    pub message_index_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
     pub scrub_bytes_per_second: u64,
@@ -62,11 +65,11 @@ impl Default for BrokerConfig {
             message_timeout: Duration::from_secs(60),
             bootstrap_retention: Duration::from_secs(30),
             max_ack_gap: 65_536,
-            max_backlog_messages: 10_000_000,
             max_topics: 10_000,
             max_publish_workers: 1_024,
             publish_worker_idle: Duration::from_secs(60),
             entry_cache_bytes: 64 * 1024 * 1024,
+            message_index_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
             scrub_bytes_per_second: 64 * 1024 * 1024,
@@ -106,8 +109,6 @@ pub enum BrokerError {
     MessageTooLarge,
     #[error("publish batch is invalid or too large")]
     BatchTooLarge,
-    #[error("topic backlog limit reached")]
-    BacklogLimit,
     #[error("broker topic limit reached")]
     TopicLimit,
     #[error("active topic publish worker limit reached")]
@@ -141,6 +142,8 @@ struct BrokerInner {
     topics: RwLock<HashMap<String, Arc<TopicHandle>>>,
     retired_topics: Mutex<HashMap<String, Arc<TopicHandle>>>,
     payload_reader: Arc<PayloadReader>,
+    message_index_cache: Arc<MessageIndexCache>,
+    metadata_spill: Mutex<()>,
     fences_path: PathBuf,
     fences: Mutex<FenceCatalog>,
     management_ops_path: PathBuf,
@@ -211,6 +214,11 @@ impl Broker {
             config.payload_read_queue,
             Arc::clone(&metrics.payload_read),
         );
+        let message_index_cache = MessageIndexCache::new(
+            config.message_index_cache_bytes,
+            config.payload_read_workers,
+            config.payload_read_queue,
+        );
         let mut topics = HashMap::new();
         for entry in std::fs::read_dir(&topics_root)? {
             let entry = entry?;
@@ -226,9 +234,9 @@ impl Broker {
             let handle = TopicHandle::open(
                 &entry.path(),
                 config.max_segment_bytes,
-                config.max_backlog_messages,
                 config.max_ack_gap,
                 compatibility.active_writer_feature_level,
+                Arc::clone(&message_index_cache),
             )?;
             let name = handle.state.lock().name.clone();
             topics.insert(name, handle);
@@ -264,6 +272,8 @@ impl Broker {
                 topics: RwLock::new(topics),
                 retired_topics: Mutex::new(HashMap::new()),
                 payload_reader,
+                message_index_cache,
+                metadata_spill: Mutex::new(()),
                 fences_path,
                 fences: Mutex::new(fences),
                 management_ops_path,
@@ -277,6 +287,7 @@ impl Broker {
                 compatibility,
             }),
         };
+        broker.reserve_message_metadata(0)?;
         broker.recover_outbox()?;
         if require_fence_sync {
             broker
@@ -460,92 +471,6 @@ impl Broker {
         self.ensure_storage_healthy()?;
         let result = blocking(task).await;
         self.observe_storage_result(result)
-    }
-
-    fn get_or_create_topic(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
-        validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
-        self.ensure_management_access(name, None)?;
-        if let Some(topic) = self.inner.topics.read().get(name).cloned() {
-            return Ok(topic);
-        }
-        let _lifecycle = self.inner.topic_lifecycle.lock();
-        self.get_or_create_topic_locked(name)
-    }
-
-    fn get_or_create_topic_locked(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
-        self.cleanup_retired_topic(name)?;
-        let mut topics = self.inner.topics.write();
-        if let Some(topic) = topics.get(name).cloned() {
-            return Ok(topic);
-        }
-        if topics.len() >= self.inner.config.max_topics {
-            return Err(BrokerError::TopicLimit);
-        }
-        let directory = topic_directory(&self.inner.config.data_path, name);
-        let topic = TopicHandle::create(
-            &directory,
-            name,
-            self.inner.config.max_segment_bytes,
-            self.inner.config.max_backlog_messages,
-            self.inner.config.max_ack_gap,
-            self.inner.compatibility.active_writer_feature_level,
-        )?;
-        topics.insert(name.into(), Arc::clone(&topic));
-        drop(topics);
-        self.bump_registry()?;
-        Ok(topic)
-    }
-
-    fn cleanup_retired_topic(&self, name: &str) -> Result<(), BrokerError> {
-        let mut retired = self.inner.retired_topics.lock();
-        let Some(handle) = retired.get(name) else {
-            return Ok(());
-        };
-        if Arc::strong_count(handle) > 1 {
-            return Err(BrokerError::TopicRetiring);
-        }
-        let directory = topic_directory(&self.inner.config.data_path, name);
-        if self.inner.payload_reader.has_active_under(&directory) {
-            return Err(BrokerError::TopicRetiring);
-        }
-        let handle = retired.remove(name).expect("retired topic still exists");
-        drop(handle);
-        if directory.exists() {
-            std::fs::remove_dir_all(directory)?;
-        }
-        std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
-        Ok(())
-    }
-
-    fn delete_topic_locked(&self, name: &str) -> Result<bool, BrokerError> {
-        let Some(handle) = self.inner.topics.read().get(name).cloned() else {
-            return Ok(false);
-        };
-        handle.state.lock().mark_deleted()?;
-        self.inner.topics.write().remove(name);
-        let directory = topic_directory(&self.inner.config.data_path, name);
-        if Arc::strong_count(&handle) == 1
-            && !self.inner.payload_reader.has_active_under(&directory)
-        {
-            std::fs::remove_dir_all(directory)?;
-            std::fs::File::open(&self.inner.topics_root)?.sync_all()?;
-        } else {
-            self.inner
-                .retired_topics
-                .lock()
-                .insert(name.to_owned(), handle);
-        }
-        Ok(true)
-    }
-
-    fn topic(&self, name: &str) -> Result<Arc<TopicHandle>, BrokerError> {
-        validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
-        self.inner
-            .topics
-            .read()
-            .get(name)
-            .cloned()
-            .ok_or(BrokerError::TopicNotFound)
     }
 
     fn bump_registry(&self) -> Result<(), BrokerError> {
