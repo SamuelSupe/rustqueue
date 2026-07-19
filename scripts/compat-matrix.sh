@@ -9,6 +9,13 @@ cleanup() {
   status=$?
   trap - EXIT INT TERM
   if [ "$status" -ne 0 ]; then
+    docker compose -p "$project" -f "$compose" ps --all >&2 || true
+    for service in rustqueue-plain rustqueue-1; do
+      container=$(docker compose -p "$project" -f "$compose" ps -q "$service" 2>/dev/null || true)
+      if [ -n "$container" ]; then
+        docker inspect --format '{{json .State.Health}}' "$container" >&2 || true
+      fi
+    done
     docker compose -p "$project" -f "$compose" logs --no-color >&2 || true
   fi
   docker compose -p "$project" -f "$compose" down -v --remove-orphans >/dev/null 2>&1 || true

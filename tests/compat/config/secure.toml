@@ -12,7 +12,9 @@ advertised_http_port = 4151
 
 [storage]
 data_path = "/data"
-min_free_bytes = 67108864
+disk_high_watermark_percent = 100
+disk_low_watermark_percent = 99
+min_free_bytes = 1
 
 [security]
 auth_http_addresses = ["http://auth:4181"]
