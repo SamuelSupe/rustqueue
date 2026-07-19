@@ -1,4 +1,4 @@
-.PHONY: test check fmt clippy release-bin image image-from-dist operator-release-bin operator-image console-ui-build console-ui-check \
+.PHONY: test check fmt clippy rustfmt-component clippy-component release-bin image image-from-dist operator-release-bin operator-image console-ui-build console-ui-check \
 	helm-lint helm-template k8s-acceptance k8s-console-management-acceptance k8s-multi-acceptance up down compat compat-go compat-python \
 	fuzz-smoke benchmark release-gate
 
@@ -24,10 +24,16 @@ test:
 check:
 	$(RUN) cargo check --locked --workspace --all-features
 
-fmt:
+rustfmt-component:
+	$(RUN) rustup component add rustfmt
+
+clippy-component:
+	$(RUN) rustup component add clippy
+
+fmt: rustfmt-component
 	$(RUN) cargo fmt --all -- --check
 
-clippy:
+clippy: clippy-component
 	$(RUN) cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 release-bin:
