@@ -1,12 +1,36 @@
-# RustQueue 0.7
+# RustQueue
 
-RustQueue is an NSQ V2 compatible, Kubernetes-native, share-nothing message
-queue written in Rust. Each broker owns one RWO PVC and persists messages and
-channel acknowledgements locally. There is no Raft, broker-to-broker message
-replication, leader routing, or global topic catalog.
+[![CI](https://github.com/SamuelSupe/rustqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelSupe/rustqueue/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Kubernetes](https://img.shields.io/badge/kubernetes-1.28%2B-326CE5.svg)](https://kubernetes.io/)
+
+RustQueue 0.7 is a Kubernetes-native, NSQ V2-compatible message queue for
+trusted internal networks. It is written in Rust and uses a deliberately
+simple share-nothing model: each Broker owns one durable RWO PVC, while
+Kubernetes provides scheduling, rollout and discovery.
+
+> Status: production candidate for workloads that accept single-PVC durability
+> and at-least-once delivery. This project does not replicate messages between
+> Brokers and is not an HA replacement for a replicated log.
 
 The complete architecture and reliability contract is documented in
 [`docs/architecture/share-nothing-v7.md`](docs/architecture/share-nothing-v7.md).
+
+## At a glance
+
+| Area | Contract |
+| --- | --- |
+| Durability | `PUB`/`MPUB`/`DPUB` return only after local segment `fsync`; `FIN`/`REQ` use a durable channel WAL |
+| Delivery | At least once; a restart may redeliver a message without a durable `FIN` |
+| Compatibility | NSQ V2 core commands, lookup, TLS/mTLS, AUTH, Snappy, Deflate, fan-out and ephemeral channels |
+| Deployment | Kubernetes 1.28+, SSD-backed RWO PVCs, StatefulSet Broker ordinals, retained claims |
+| Scaling | Add Brokers without a central queue coordinator; consumers connect to every owner of a Topic |
+| Data model | Local Topic/Channel state; no cross-Broker ordering or global channel catalog |
+
+The single-copy model is intentional. If a PVC is permanently lost, the
+messages stored on that Broker are lost. Configure disk pressure protection,
+monitor the exported metrics, and choose PVC/storage failure policies that fit
+your workload before deploying to production.
 
 ## Architecture
 
