@@ -69,6 +69,10 @@ impl Config {
             &mut self.limits.http_body_timeout_ms,
         )?;
         set_from_env(
+            "RUSTQUEUE_TCP_COMMAND_TIMEOUT_MS",
+            &mut self.limits.tcp_command_timeout_ms,
+        )?;
+        set_from_env(
             "RUSTQUEUE_NODE_PUBLISH_INFLIGHT_BYTES",
             &mut self.limits.node_publish_inflight_bytes,
         )?;

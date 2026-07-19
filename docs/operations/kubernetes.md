@@ -73,7 +73,7 @@ Canary approval is optional:
 ```sh
 helm upgrade rustqueue deploy/helm/rustqueue \
   --namespace rustqueue \
-  --set queue.image=registry.example/rustqueue:0.7.1 \
+  --set queue.image=registry.example/rustqueue:0.7.2 \
   --set queue.rollout.requireCanaryApproval=true
 
 rustqueuectl -n rustqueue rollout approve
@@ -85,7 +85,7 @@ Useful controls:
 rustqueuectl -n rustqueue rollout pause
 rustqueuectl -n rustqueue rollout resume
 rustqueuectl -n rustqueue rollout retry
-rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.7.1
+rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.7.2
 rustqueuectl -n rustqueue rollout forward
 ```
 

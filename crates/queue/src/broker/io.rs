@@ -6,7 +6,6 @@ use crate::topic::Topic;
 use bytes::Bytes;
 use rustqueue_storage::MAX_RECORD_BYTES;
 
-const MAX_BATCH_MESSAGES: usize = 10_000;
 const MAX_SEQUENCE: u64 = (1u64 << 48) - 1;
 pub(super) const SEQUENCE_RESERVATION: u64 = 1 << 20;
 
@@ -162,7 +161,7 @@ impl Broker {
     ) -> Result<usize, BrokerError> {
         validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
         self.ensure_management_access(topic, None)?;
-        if bodies.is_empty() || bodies.len() > MAX_BATCH_MESSAGES {
+        if bodies.is_empty() || bodies.len() > batch::MAX_MESSAGES {
             return Err(BrokerError::BatchTooLarge);
         }
         if bodies
@@ -219,9 +218,8 @@ impl Broker {
     }
 
     pub(super) fn recover_outbox(&self) -> Result<(), BrokerError> {
-        for (path, entry) in
-            crate::outbox::load_all(&self.inner.config.data_path.join("dlq-outbox"))?
-        {
+        for path in crate::outbox::paths(&self.inner.config.data_path.join("dlq-outbox"))? {
+            let entry = crate::outbox::load(&path)?;
             self.publish_sync(&entry.target_topic, &[entry.body], Duration::ZERO)?;
             let finish = self.topic(&entry.source_topic).and_then(|topic| {
                 topic

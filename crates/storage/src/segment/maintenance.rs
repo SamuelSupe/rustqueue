@@ -198,7 +198,11 @@ impl SegmentLog {
     ) -> Result<Option<(PathBuf, u64)>, StorageError> {
         for path in segment_paths(&self.directory)? {
             if path == self.current_path || retained.contains(&path) {
-                continue;
+                // Eviction and purge may only remove a contiguous prefix. If
+                // the oldest segment is still leased, choosing a later one
+                // would advance channel gaps without being able to delete the
+                // corresponding prefix.
+                break;
             }
             if let Some((_, last_index)) = self.record_index_range(&path) {
                 return Ok(Some((path, last_index)));

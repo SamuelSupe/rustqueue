@@ -2,6 +2,7 @@ mod authorization;
 mod codec;
 mod commands;
 mod dead_letter;
+mod ephemeral;
 mod session;
 mod time;
 mod writer;
@@ -10,6 +11,7 @@ use authorization::*;
 use codec::*;
 use commands::*;
 use dead_letter::*;
+use ephemeral::*;
 use session::*;
 use time::*;
 use writer::*;
@@ -22,7 +24,6 @@ use crate::metrics::Metrics;
 use crate::tls;
 use anyhow::Context;
 use bytes::Bytes;
-use parking_lot::Mutex as SyncMutex;
 use rustqueue_protocol::{
     encode_frame, encode_message_header, parse_mpub_bytes, Command, CommandError, FrameType,
     IdentifyRequest, IdentifyResponse, CLOSE_WAIT, HEARTBEAT, MAGIC_V2, OK,
@@ -38,8 +39,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf,
-    WriteHalf,
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -51,7 +51,7 @@ use tracing::{debug, info, warn};
 struct ParsedCommand {
     command: Command,
     body: Option<Bytes>,
-    _publish_reservation: Option<PublishReservation>,
+    publish_reservation: Option<PublishReservation>,
 }
 
 #[derive(Clone, Copy)]
@@ -64,8 +64,6 @@ struct Subscription {
     topic: String,
     channel: String,
 }
-
-type EphemeralConsumers = Arc<SyncMutex<HashMap<(String, String), usize>>>;
 
 const MAX_FETCH_MESSAGES: u16 = 64;
 const DEFAULT_FETCH_WAIT_MS: u32 = 100;
@@ -136,7 +134,7 @@ pub async fn serve(
         .map_err(anyhow::Error::msg)?
         .map(Arc::new);
     let permits = Arc::new(Semaphore::new(config.limits.max_connections));
-    let ephemeral_consumers: EphemeralConsumers = Arc::new(SyncMutex::new(HashMap::new()));
+    let ephemeral_consumers = EphemeralConsumers::default();
     info!(address = %config.network.tcp_address, "NSQ TCP listener ready");
 
     loop {
@@ -153,7 +151,7 @@ pub async fn serve(
         let metrics = Arc::clone(&metrics);
         let tls_acceptor = tls_acceptor.clone();
         let authenticator = authenticator.clone();
-        let ephemeral_consumers = Arc::clone(&ephemeral_consumers);
+        let ephemeral_consumers = ephemeral_consumers.clone();
         let accepting = Arc::clone(&accepting);
         let delivering = Arc::clone(&delivering);
         let publish_admission = Arc::clone(&publish_admission);

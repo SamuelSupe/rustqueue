@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -51,7 +51,7 @@ tokio-rustls = "0.26.1"
 tokio-snappy = "0.2.0"
 toml = "0.8.19"
 tower = "0.5.2"
-tower-http = { version = "0.6.2", features = ["fs", "trace"] }
+tower-http = { version = "0.6.2", features = ["fs", "timeout", "trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 rustqueue-telemetry = { path = "crates/telemetry" }

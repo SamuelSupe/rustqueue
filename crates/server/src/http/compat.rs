@@ -25,7 +25,7 @@ pub(super) async fn publish(
 ) -> Result<&'static str, ApiError> {
     authorize(&headers, state.publish_token.as_deref(), "publish")?;
     validate_defer(query.defer, &state.config)?;
-    let (body, _reservation) = read_publish_body(
+    let (body, reservation) = read_publish_body(
         &state,
         request,
         state.config.queue.max_message_bytes,
@@ -36,7 +36,7 @@ pub(super) async fn publish(
         return Err(ApiError::bad_request("E_BAD_MESSAGE", "message is empty"));
     }
     let bytes = body.len();
-    let ids = publish_write(&state, &query.topic, vec![body], query.defer).await?;
+    let ids = publish_write(&state, &query.topic, vec![body], query.defer, reservation).await?;
     state
         .metrics
         .publish_messages
@@ -56,7 +56,7 @@ pub(super) async fn multi_publish(
 ) -> Result<&'static str, ApiError> {
     authorize(&headers, state.publish_token.as_deref(), "publish")?;
     validate_defer(query.defer, &state.config)?;
-    let (body, _reservation) = read_publish_body(
+    let (body, reservation) = read_publish_body(
         &state,
         request,
         state.config.limits.max_body_bytes,
@@ -75,7 +75,7 @@ pub(super) async fn multi_publish(
         ));
     }
     let bytes = messages.iter().map(Bytes::len).sum::<usize>();
-    let ids = publish_write(&state, &query.topic, messages, query.defer).await?;
+    let ids = publish_write(&state, &query.topic, messages, query.defer, reservation).await?;
     state
         .metrics
         .publish_messages

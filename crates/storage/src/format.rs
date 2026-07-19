@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const DATA_FORMAT_VERSION: u32 = 7;
 const FORMAT_FILE: &str = "FORMAT";
+const MAX_MARKER_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DataFormat {
@@ -14,7 +15,7 @@ pub struct DataFormat {
 pub fn ensure_data_format(root: &Path) -> io::Result<DataFormat> {
     fs::create_dir_all(root)?;
     let path = root.join(FORMAT_FILE);
-    match fs::read(&path) {
+    match read_marker(&path) {
         Ok(bytes) => {
             let format: DataFormat = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
             if format.version != DATA_FORMAT_VERSION {
@@ -44,7 +45,7 @@ pub fn ensure_data_format(root: &Path) -> io::Result<DataFormat> {
 
 pub fn read_data_format(root: &Path) -> io::Result<Option<DataFormat>> {
     let path = root.join(FORMAT_FILE);
-    match fs::read(path) {
+    match read_marker(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(io::Error::other),
@@ -83,6 +84,20 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
+pub(crate) fn read_marker(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "storage marker exceeds the maximum size",
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +131,15 @@ mod tests {
         let error = ensure_data_format(directory.path()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("expected 7"));
+    }
+
+    #[test]
+    fn refuses_an_oversized_format_marker_without_reading_it_all() {
+        let directory = tempdir().unwrap();
+        let file = File::create(directory.path().join(FORMAT_FILE)).unwrap();
+        file.set_len(MAX_MARKER_BYTES + 1).unwrap();
+        let error = ensure_data_format(directory.path()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("maximum size"));
     }
 }

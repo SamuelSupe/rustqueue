@@ -88,17 +88,23 @@ fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> StorageError 
 }
 
 pub(super) fn segment_paths(directory: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(SEGMENT_PREFIX) && name.ends_with(SEGMENT_SUFFIX)
-                })
-        })
-        .collect();
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(SEGMENT_PREFIX) || !name.ends_with(SEGMENT_SUFFIX) {
+            continue;
+        }
+        if segment_base_index(&path).is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid segment filename {name}"),
+            ));
+        }
+        paths.push(path);
+    }
     paths.sort();
     Ok(paths)
 }
@@ -109,8 +115,11 @@ pub(super) fn segment_path(directory: &Path, base_index: u64) -> PathBuf {
 
 pub(super) fn segment_base_index(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix(SEGMENT_PREFIX)?
-        .strip_suffix(SEGMENT_SUFFIX)?
-        .parse()
-        .ok()
+    let index = name
+        .strip_prefix(SEGMENT_PREFIX)?
+        .strip_suffix(SEGMENT_SUFFIX)?;
+    if index.len() != 20 || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    index.parse().ok()
 }

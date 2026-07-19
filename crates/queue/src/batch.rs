@@ -5,6 +5,7 @@ use rustqueue_storage::{PayloadRef, Record, RecordLocation, HEADER_LEN};
 use std::sync::Arc;
 
 const ITEM_HEADER: usize = 20;
+pub(crate) const MAX_MESSAGES: usize = 10_000;
 
 pub(crate) struct EncodedBatch<'a> {
     count: [u8; 4],
@@ -76,11 +77,15 @@ pub(crate) fn metas(
         ));
     }
     let count = u32::from_be_bytes(record.payload[0..4].try_into().unwrap()) as usize;
-    if count == 0 {
-        return Err(BrokerError::InvalidRecord("publish batch is empty".into()));
+    let maximum_count = record.payload.len().saturating_sub(4) / ITEM_HEADER;
+    if count == 0 || count > MAX_MESSAGES || count > maximum_count {
+        return Err(BrokerError::InvalidRecord(
+            "publish batch count is invalid".into(),
+        ));
     }
     let mut cursor = 4usize;
     let mut output = Vec::with_capacity(count);
+    let mut first_position = None;
     for ordinal in 0..count {
         if cursor.saturating_add(ITEM_HEADER) > record.payload.len() {
             return Err(BrokerError::InvalidRecord(
@@ -99,9 +104,19 @@ pub(crate) fn metas(
                 "publish batch body is truncated".into(),
             ));
         }
-        if ordinal == 0 && id != record.message_id {
+        let base_position = *first_position.get_or_insert(position);
+        let expected_position = base_position
+            .checked_add(ordinal as u64)
+            .ok_or_else(|| BrokerError::InvalidRecord("publish batch position overflow".into()))?;
+        let expected_id = record
+            .message_id
+            .checked_add(ordinal as u64)
+            .ok_or_else(|| {
+                BrokerError::InvalidRecord("publish batch message ID overflow".into())
+            })?;
+        if position != expected_position || id != expected_id {
             return Err(BrokerError::InvalidRecord(
-                "publish batch first ID mismatch".into(),
+                "publish batch positions or message IDs are not contiguous".into(),
             ));
         }
         let body = &record.payload[cursor..end];
@@ -156,6 +171,8 @@ pub(crate) fn metas_after_append(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustqueue_storage::RecordKind;
+    use std::path::PathBuf;
 
     #[test]
     fn encoded_batch_borrows_message_bodies() {
@@ -165,5 +182,59 @@ mod tests {
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[2].as_ptr(), body.as_ptr());
         assert_eq!(parts[2].len(), body.len());
+    }
+
+    #[test]
+    fn recovery_rejects_unbounded_batch_count_before_allocating() {
+        let record = Record {
+            kind: RecordKind::PublishBatch,
+            flags: 0,
+            index: 1,
+            message_id: 1,
+            timestamp_ns: 0,
+            available_at_ms: 0,
+            payload: u32::MAX.to_be_bytes().to_vec(),
+        };
+        let location = RecordLocation {
+            index: 1,
+            segment: Arc::new(PathBuf::from("segment.log")),
+            offset: 0,
+            encoded_len: HEADER_LEN as u64 + 4,
+        };
+
+        let error = metas(&record, &location).unwrap_err();
+        assert!(matches!(error, BrokerError::InvalidRecord(_)));
+    }
+
+    #[test]
+    fn recovery_rejects_non_contiguous_batch_identity() {
+        let location = RecordLocation {
+            index: 1,
+            segment: Arc::new(PathBuf::from("segment.log")),
+            offset: 0,
+            encoded_len: 0,
+        };
+        for (second_position, second_id) in [(3u64, 11u64), (2, 12)] {
+            let mut payload = 2u32.to_be_bytes().to_vec();
+            for (position, id) in [(1u64, 10u64), (second_position, second_id)] {
+                payload.extend_from_slice(&position.to_be_bytes());
+                payload.extend_from_slice(&id.to_be_bytes());
+                payload.extend_from_slice(&1u32.to_be_bytes());
+                payload.push(b'x');
+            }
+            let record = Record {
+                kind: RecordKind::PublishBatch,
+                flags: 0,
+                index: 1,
+                message_id: 10,
+                timestamp_ns: 0,
+                available_at_ms: 0,
+                payload,
+            };
+            assert!(matches!(
+                metas(&record, &location),
+                Err(BrokerError::InvalidRecord(_))
+            ));
+        }
     }
 }

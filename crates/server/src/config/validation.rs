@@ -26,6 +26,7 @@ impl Config {
             bail!("delivery inflight limits must fit one message plus the payload-read working set and fit u32");
         }
         if self.limits.client_handshake_timeout_ms == 0
+            || self.limits.tcp_command_timeout_ms == 0
             || self.limits.auth_cache_max_entries == 0
             || self.limits.max_connections == 0
             || self.limits.max_rdy_count == 0
@@ -33,7 +34,7 @@ impl Config {
             || self.limits.auth_timeout_ms == 0
             || self.limits.http_body_timeout_ms == 0
         {
-            bail!("limits connection, RDY, auth and HTTP timeouts/sizes must be greater than zero");
+            bail!("limits connection, RDY, auth, TCP and HTTP timeouts/sizes must be greater than zero");
         }
         if self.limits.heartbeat_interval_ms < 1_000
             || self.limits.heartbeat_interval_ms > self.limits.max_heartbeat_interval_ms

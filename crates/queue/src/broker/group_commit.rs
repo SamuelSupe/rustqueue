@@ -14,6 +14,7 @@ const MAX_GROUP_BYTES: usize = 8 * 1024 * 1024;
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 type PublishResult = Result<Vec<u64>, BrokerError>;
+type PublishGuard = Box<dyn Send + 'static>;
 
 pub(super) struct PublishGroups {
     senders: Mutex<HashMap<String, WorkerEntry>>,
@@ -38,11 +39,13 @@ struct PublishRequest {
     encoded_bytes: usize,
     enqueued_at: Instant,
     reply: oneshot::Sender<PublishResult>,
+    guard: Option<PublishGuard>,
 }
 
 struct PendingPublish {
     ids: Vec<u64>,
     reply: oneshot::Sender<PublishResult>,
+    _guard: Option<PublishGuard>,
 }
 
 impl PublishGroups {
@@ -139,6 +142,37 @@ impl Broker {
     where
         B: Into<Bytes> + Send + 'static,
     {
+        self.publish_inner(topic, bodies, delay, None).await
+    }
+
+    /// Keeps `guard` alive until the queued body has either been rejected or
+    /// crossed the durable publish boundary. This makes caller-side admission
+    /// accounting cancellation-safe after a request enters group commit.
+    pub async fn publish_guarded<B, G>(
+        &self,
+        topic: &str,
+        bodies: Vec<B>,
+        delay: Duration,
+        guard: G,
+    ) -> Result<Vec<u64>, BrokerError>
+    where
+        B: Into<Bytes> + Send + 'static,
+        G: Send + 'static,
+    {
+        self.publish_inner(topic, bodies, delay, Some(Box::new(guard)))
+            .await
+    }
+
+    async fn publish_inner<B>(
+        &self,
+        topic: &str,
+        bodies: Vec<B>,
+        delay: Duration,
+        guard: Option<PublishGuard>,
+    ) -> Result<Vec<u64>, BrokerError>
+    where
+        B: Into<Bytes> + Send + 'static,
+    {
         let _ack_timer = self.inner.metrics.publish_ack.timer();
         self.ensure_storage_healthy()?;
         let bodies: Vec<Bytes> = bodies.into_iter().map(Into::into).collect();
@@ -152,6 +186,7 @@ impl Broker {
                 encoded_bytes,
                 enqueued_at: Instant::now(),
                 reply,
+                guard,
             })
             .await
             .map_err(|_| BrokerError::StorageUnavailable)?;
@@ -205,6 +240,7 @@ impl Broker {
                 delay,
                 enqueued_at,
                 reply,
+                guard,
                 ..
             } = request;
             self.inner
@@ -218,7 +254,11 @@ impl Broker {
                 false,
                 &mut metadata,
             ) {
-                Ok(ids) => pending.push(PendingPublish { ids, reply }),
+                Ok(ids) => pending.push(PendingPublish {
+                    ids,
+                    reply,
+                    _guard: guard,
+                }),
                 Err(error) if is_storage_error(&error) => {
                     self.observe_storage_result::<()>(Err(copy_error(&error)))
                         .ok();
@@ -359,7 +399,10 @@ fn fail_requests(requests: impl IntoIterator<Item = PublishRequest>, error: &Bro
 pub(super) fn is_storage_error(error: &BrokerError) -> bool {
     matches!(
         error,
-        BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_)
+        BrokerError::StorageUnavailable
+            | BrokerError::Storage(_)
+            | BrokerError::Io(_)
+            | BrokerError::InvalidRecord(_)
     )
 }
 
@@ -406,6 +449,7 @@ mod tests {
             encoded_bytes,
             enqueued_at: Instant::now(),
             reply,
+            guard: None,
         }
     }
 

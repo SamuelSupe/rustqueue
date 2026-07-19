@@ -4,7 +4,75 @@ use crate::outbox::OutboxEntry;
 use crate::{ManagementFenceSnapshot, TopicManagementAction};
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tempfile::tempdir;
+
+struct DropProbe(Arc<AtomicBool>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_publish_keeps_admission_guard_until_commit_finishes() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("events").await.unwrap();
+
+    let topic = broker.topic("events").unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_thread = std::thread::spawn(move || {
+        let _lock = topic.state.lock();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let publish = {
+        let broker = broker.clone();
+        let dropped = Arc::clone(&dropped);
+        tokio::spawn(async move {
+            broker
+                .publish_guarded(
+                    "events",
+                    vec![bytes::Bytes::from_static(b"body")],
+                    Duration::ZERO,
+                    DropProbe(dropped),
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while broker.inner.publish_groups.stats().active_workers == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    publish.abort();
+    assert!(publish.await.unwrap_err().is_cancelled());
+    assert!(!dropped.load(Ordering::Acquire));
+
+    release_tx.send(()).unwrap();
+    lock_thread.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !dropped.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
 
 #[tokio::test]
 async fn startup_replays_dlq_outbox_before_finishing_the_source() {
@@ -781,6 +849,47 @@ async fn management_operation_results_are_idempotent_across_restart() {
 }
 
 #[tokio::test]
+async fn expired_pending_tombstone_can_finish_and_unblock_the_topic() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("orders").await.unwrap();
+    let operation_id = "tombstone-orders-0001";
+    let fingerprint =
+        serde_json::to_string(&("topic", "orders", TopicManagementAction::Tombstone)).unwrap();
+    broker
+        .inner
+        .management_ops
+        .lock()
+        .prepare(
+            &broker.inner.management_ops_path,
+            operation_id,
+            fingerprint,
+            "orders".into(),
+        )
+        .unwrap();
+
+    broker
+        .manage_topic(
+            operation_id,
+            "orders",
+            TopicManagementAction::Tombstone,
+            0,
+            Some(now_ms().saturating_sub(1)),
+        )
+        .await
+        .unwrap();
+
+    broker
+        .publish("orders", vec![b"accepted".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_registry_updates_persist_the_latest_revision() {
     let root = tempdir().unwrap();
     let config = BrokerConfig {
@@ -814,4 +923,27 @@ async fn panicked_storage_tasks_fail_the_broker_closed() {
         .await
         .unwrap_err();
     assert!(matches!(error, BrokerError::StorageUnavailable));
+}
+
+#[test]
+fn runtime_integrity_errors_isolate_the_broker() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+
+    let error = broker
+        .observe_storage_result::<()>(Err(BrokerError::InvalidRecord(
+            "corrupt recovery index".into(),
+        )))
+        .unwrap_err();
+
+    assert!(matches!(error, BrokerError::InvalidRecord(_)));
+    assert!(!broker.storage_healthy());
+    assert!(matches!(
+        broker.ensure_storage_healthy(),
+        Err(BrokerError::StorageUnavailable)
+    ));
 }

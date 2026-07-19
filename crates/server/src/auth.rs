@@ -120,48 +120,74 @@ impl Authenticator {
         if let Some(session) = self.cache.lock().get(&cache_key) {
             return Ok(session);
         }
+        let mut last_error = AuthError::Service;
         for endpoint in &self.endpoints {
-            let result = self
-                .client
-                .get(endpoint)
-                .query(&[
-                    ("remote_ip", remote_ip),
-                    ("tls", if tls { "true" } else { "false" }),
-                    ("common_name", common_name),
-                    ("auth_secret", secret),
-                ])
-                .send()
-                .await;
-            let Ok(mut response) = result else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            if response
-                .content_length()
-                .is_some_and(|length| length > self.max_response_bytes as u64)
+            match self
+                .authenticate_endpoint(endpoint, remote_ip, tls, common_name, secret)
+                .await
             {
-                continue;
-            }
-            let mut body = Vec::new();
-            loop {
-                let chunk = response.chunk().await.map_err(|_| AuthError::Service)?;
-                let Some(chunk) = chunk else {
-                    break;
-                };
-                if body.len().saturating_add(chunk.len()) > self.max_response_bytes {
-                    return Err(AuthError::InvalidResponse);
+                Ok(session) => {
+                    self.cache.lock().insert(cache_key, session.clone());
+                    return Ok(session);
                 }
-                body.extend_from_slice(&chunk);
+                Err(AuthError::Unauthorized) => return Err(AuthError::Unauthorized),
+                Err(error) => last_error = error,
             }
-            let response: AuthResponse =
-                serde_json::from_slice(&body).map_err(|_| AuthError::InvalidResponse)?;
-            let session = AuthSession::try_from_response(response, self.max_ttl_seconds)?;
-            self.cache.lock().insert(cache_key, session.clone());
-            return Ok(session);
         }
-        Err(AuthError::Service)
+        Err(last_error)
+    }
+
+    async fn authenticate_endpoint(
+        &self,
+        endpoint: &str,
+        remote_ip: &str,
+        tls: bool,
+        common_name: &str,
+        secret: &str,
+    ) -> Result<AuthSession, AuthError> {
+        let mut response = self
+            .client
+            .get(endpoint)
+            .query(&[
+                ("remote_ip", remote_ip),
+                ("tls", if tls { "true" } else { "false" }),
+                ("common_name", common_name),
+                ("auth_secret", secret),
+            ])
+            .send()
+            .await
+            .map_err(|_| AuthError::Service)?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            // A definitive policy denial must not fall through to another
+            // replica that may have a stale or more permissive policy.
+            return Err(AuthError::Unauthorized);
+        }
+        if !response.status().is_success() {
+            return Err(AuthError::Service);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_response_bytes as u64)
+        {
+            return Err(AuthError::InvalidResponse);
+        }
+        let mut body = Vec::new();
+        loop {
+            let chunk = response.chunk().await.map_err(|_| AuthError::Service)?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if body.len().saturating_add(chunk.len()) > self.max_response_bytes {
+                return Err(AuthError::InvalidResponse);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let response: AuthResponse =
+            serde_json::from_slice(&body).map_err(|_| AuthError::InvalidResponse)?;
+        AuthSession::try_from_response(response, self.max_ttl_seconds)
     }
 }
 
@@ -280,6 +306,9 @@ impl AuthSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::Router;
 
     #[test]
     fn applies_topic_and_channel_permissions() {
@@ -361,5 +390,56 @@ mod tests {
         }
         assert!(cache.order.is_empty());
         assert!(cache.values.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_replica_fails_over_to_the_next_endpoint() {
+        let (invalid, invalid_task) = auth_server(StatusCode::OK, "not-json").await;
+        let valid_body = r#"{"ttl":60,"identity":"worker","authorizations":[{"permissions":["publish"],"topic":"^orders$","channels":[]}]}"#;
+        let (valid, valid_task) = auth_server(StatusCode::OK, valid_body).await;
+        let mut config = Config::default();
+        config.security.auth_http_addresses = vec![invalid, valid];
+        let authenticator = Authenticator::new(&config).unwrap().unwrap();
+
+        let session = authenticator
+            .authenticate("127.0.0.1", false, "", b"secret")
+            .await
+            .unwrap();
+
+        assert!(session.can_publish("orders"));
+        invalid_task.abort();
+        valid_task.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_auth_denial_does_not_fall_through_to_another_replica() {
+        let (denied, denied_task) = auth_server(StatusCode::FORBIDDEN, "denied").await;
+        let valid_body = r#"{"ttl":60,"identity":"worker","authorizations":[{"permissions":["publish"],"topic":".*","channels":[]}]}"#;
+        let (permissive, permissive_task) = auth_server(StatusCode::OK, valid_body).await;
+        let mut config = Config::default();
+        config.security.auth_http_addresses = vec![denied, permissive];
+        let authenticator = Authenticator::new(&config).unwrap().unwrap();
+
+        assert!(matches!(
+            authenticator
+                .authenticate("127.0.0.1", false, "", b"secret")
+                .await,
+            Err(AuthError::Unauthorized)
+        ));
+        denied_task.abort();
+        permissive_task.abort();
+    }
+
+    async fn auth_server(
+        status: StatusCode,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route("/auth", get(move || async move { (status, body) }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{address}"), task)
     }
 }

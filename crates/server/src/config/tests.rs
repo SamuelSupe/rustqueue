@@ -65,6 +65,10 @@ fn rejects_zero_protocol_capacity_and_timeouts() {
 
     let mut config = Config::default();
     config.limits.max_rdy_count = 1;
+    config.limits.tcp_command_timeout_ms = 0;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
     config.limits.http_body_timeout_ms = 0;
     assert!(config.validate().is_err());
 

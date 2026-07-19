@@ -1,6 +1,5 @@
-use crate::format::{write_atomic, DATA_FORMAT_VERSION};
+use crate::format::{read_marker, write_atomic, DATA_FORMAT_VERSION};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -50,7 +49,7 @@ pub fn prepare_compatibility(
 }
 
 pub fn read_compatibility(root: &Path) -> io::Result<Option<CompatibilityState>> {
-    match fs::read(root.join(COMPATIBILITY_FILE)) {
+    match read_marker(&root.join(COMPATIBILITY_FILE)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(io::Error::other),

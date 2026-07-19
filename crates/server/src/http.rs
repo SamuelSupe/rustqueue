@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tower_http::timeout::RequestBodyTimeoutLayer;
 use tracing::info;
 
 #[derive(Clone)]
@@ -154,7 +155,9 @@ pub async fn serve(
             .route("/v1/manage/channels/{action}", post(manage_channel))
             .route("/v1/manage/fences/sync", post(sync_fences));
     }
-    let router = router.with_state(state);
+    let router = router.with_state(state).layer(RequestBodyTimeoutLayer::new(
+        std::time::Duration::from_millis(config.limits.http_body_timeout_ms),
+    ));
     let listener = TcpListener::bind(config.network.http_address).await?;
     info!(address = %config.network.http_address, "HTTP API listening");
     axum::serve(listener, router).await?;

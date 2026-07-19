@@ -60,6 +60,8 @@ connection_delivery_inflight_bytes = 33554432
 max_rdy_count = 2500
 max_connections = 10000
 client_handshake_timeout_ms = 5000
+# Bounds a command from its first byte through its optional body. Idle connections are unaffected.
+tcp_command_timeout_ms = 30000
 heartbeat_interval_ms = 30000
 max_heartbeat_interval_ms = 60000
 output_buffer_size = 16384

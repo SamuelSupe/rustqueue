@@ -12,7 +12,12 @@ pub(super) async fn process_command(
     state: &mut SessionState,
     writer: &mut ClientWriter,
 ) -> anyhow::Result<bool> {
-    match parsed.command {
+    let ParsedCommand {
+        command,
+        body,
+        publish_reservation,
+    } = parsed;
+    match command {
         Command::Identify => {
             write_error(writer, "E_INVALID", "IDENTIFY may only be sent once").await?;
             return Ok(false);
@@ -26,7 +31,7 @@ pub(super) async fn process_command(
                 write_error(writer, "E_AUTH_DISABLED", "AUTH disabled").await?;
                 return Ok(false);
             };
-            let secret = parsed.body.as_deref().unwrap_or_default();
+            let secret = body.as_deref().unwrap_or_default();
             if secret.is_empty() {
                 write_error(writer, "E_BAD_BODY", "AUTH invalid body size 0").await?;
                 return Ok(false);
@@ -86,13 +91,11 @@ pub(super) async fn process_command(
             {
                 return Ok(false);
             }
-            let create_result = broker.create_channel(&topic, &channel).await;
-            if create_result.is_ok() && channel.ends_with("#ephemeral") {
-                *ephemeral_consumers
-                    .lock()
-                    .entry((topic.clone(), channel.clone()))
-                    .or_default() += 1;
-            }
+            let create_result = if channel.ends_with("#ephemeral") {
+                ephemeral_consumers.register(broker, &topic, &channel).await
+            } else {
+                broker.create_channel(&topic, &channel).await
+            };
             match create_result {
                 Ok(()) => {
                     state.subscription = Some(Subscription { topic, channel });
@@ -114,8 +117,9 @@ pub(super) async fn process_command(
                 writer,
                 "E_PUB_FAILED",
                 topic,
-                vec![parsed.body.unwrap_or_default()],
+                vec![body.unwrap_or_default()],
                 Duration::ZERO,
+                publish_reservation,
             )
             .await?
             {
@@ -126,16 +130,14 @@ pub(super) async fn process_command(
             if !authorize_command(authenticator, peer, state, writer, "MPUB", &topic, None).await? {
                 return Ok(false);
             }
-            let messages = match parse_mpub_bytes(
-                parsed.body.unwrap_or_default(),
-                config.queue.max_message_bytes,
-            ) {
-                Ok(messages) => messages,
-                Err(detail) => {
-                    write_error(writer, detail.code(), &detail.to_string()).await?;
-                    return Ok(false);
-                }
-            };
+            let messages =
+                match parse_mpub_bytes(body.unwrap_or_default(), config.queue.max_message_bytes) {
+                    Ok(messages) => messages,
+                    Err(detail) => {
+                        write_error(writer, detail.code(), &detail.to_string()).await?;
+                        return Ok(false);
+                    }
+                };
             if !publish_tcp(
                 broker,
                 metrics,
@@ -144,6 +146,7 @@ pub(super) async fn process_command(
                 topic,
                 messages,
                 Duration::ZERO,
+                publish_reservation,
             )
             .await?
             {
@@ -164,8 +167,9 @@ pub(super) async fn process_command(
                 writer,
                 "E_DPUB_FAILED",
                 topic,
-                vec![parsed.body.unwrap_or_default()],
+                vec![body.unwrap_or_default()],
                 Duration::from_millis(delay_ms),
+                publish_reservation,
             )
             .await?
             {
@@ -275,10 +279,11 @@ async fn publish_tcp(
     topic: String,
     messages: Vec<Bytes>,
     delay: Duration,
+    reservation: Option<PublishReservation>,
 ) -> anyhow::Result<bool> {
     let message_count = messages.len() as u64;
     let byte_count = messages.iter().map(Bytes::len).sum::<usize>() as u64;
-    let publish_result = publish_messages(broker, &topic, messages, delay).await;
+    let publish_result = publish_messages(broker, &topic, messages, delay, reservation).await;
     match publish_result {
         Ok(_) => {
             metrics
@@ -303,8 +308,16 @@ pub(super) async fn publish_messages(
     topic: &str,
     messages: Vec<Bytes>,
     delay: Duration,
+    reservation: Option<PublishReservation>,
 ) -> Result<Vec<u64>, BrokerError> {
-    broker.publish(topic, messages, delay).await
+    match reservation {
+        Some(reservation) => {
+            broker
+                .publish_guarded(topic, messages, delay, reservation)
+                .await
+        }
+        None => broker.publish(topic, messages, delay).await,
+    }
 }
 
 pub(super) async fn finish_message(

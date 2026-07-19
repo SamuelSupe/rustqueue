@@ -331,9 +331,9 @@ require jq
 }
 
 if [[ "$BUILD_IMAGES" == "1" ]]; then
-  BUILD_VERSION=0.7.1-e2e-a MAX_STORAGE_FEATURE_LEVEL=1 make image
+  BUILD_VERSION=0.7.2-e2e-a MAX_STORAGE_FEATURE_LEVEL=1 make image
   docker tag rustqueue:dev "$BROKER_IMAGE_A"
-  BUILD_VERSION=0.7.1-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image-from-dist
+  BUILD_VERSION=0.7.2-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image-from-dist
   docker tag rustqueue:dev "$BROKER_IMAGE_B"
   [[ "$(docker image inspect "$BROKER_IMAGE_A" -f '{{.Id}}')" != \
      "$(docker image inspect "$BROKER_IMAGE_B" -f '{{.Id}}')" ]] || {

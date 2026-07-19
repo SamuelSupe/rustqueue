@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_NODES_BYTES: usize = 4 * 1024 * 1024;
+const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
 struct NodesResponse {
@@ -23,6 +24,7 @@ struct Source {
     revision: u64,
     producers: Vec<Backend>,
     seen_at: Instant,
+    full_at: Instant,
 }
 
 pub async fn run(
@@ -86,9 +88,10 @@ async fn refresh_source(
             return;
         }
     };
+    let now = Instant::now();
     if let (Some(head), Some(source)) = (&head, sources.get_mut(address)) {
-        if source.revision == head.revision {
-            source.seen_at = Instant::now();
+        if source_is_current(source, head.revision, now) {
+            source.seen_at = now;
             return;
         }
     }
@@ -119,9 +122,15 @@ async fn refresh_source(
         Source {
             revision: head.map_or(nodes.revision, |head| head.revision),
             producers: nodes.producers,
-            seen_at: Instant::now(),
+            seen_at: now,
+            full_at: now,
         },
     );
+}
+
+fn source_is_current(source: &Source, revision: u64, now: Instant) -> bool {
+    source.revision == revision
+        && now.saturating_duration_since(source.full_at) < FULL_REFRESH_INTERVAL
 }
 
 async fn read_json_bounded<T: serde::de::DeserializeOwned>(
@@ -142,4 +151,32 @@ async fn read_json_bounded<T: serde::de::DeserializeOwned>(
         bytes.extend_from_slice(&chunk);
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(now: Instant) -> Source {
+        Source {
+            revision: 7,
+            producers: Vec::new(),
+            seen_at: now,
+            full_at: now,
+        }
+    }
+
+    #[test]
+    fn matching_revision_is_periodically_refreshed_in_full() {
+        let now = Instant::now();
+        let source = source(now);
+
+        assert!(source_is_current(
+            &source,
+            7,
+            now + FULL_REFRESH_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(!source_is_current(&source, 7, now + FULL_REFRESH_INTERVAL));
+        assert!(!source_is_current(&source, 8, now));
+    }
 }

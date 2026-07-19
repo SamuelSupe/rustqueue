@@ -277,6 +277,12 @@ fn rollout_decision(pods: &[Pod], options: &RolloutOptions<'_>) -> Decision {
     if outdated.is_empty() {
         return Decision::Completed;
     }
+    if let Some(pod) = outdated.iter().find(|pod| !pod_ready(pod)) {
+        return Decision::Wait(format!(
+            "outdated broker {} is not Ready; refusing to make another broker unavailable",
+            pod.name_any()
+        ));
+    }
     if options.replicas < 2 {
         return Decision::Blocked("rolling replacement needs at least two brokers".into());
     }
@@ -442,6 +448,19 @@ mod tests {
         assert!(matches!(
             rollout_decision(&pods, &options("new")),
             Decision::Wait(_)
+        ));
+    }
+
+    #[test]
+    fn rollout_does_not_compound_an_unready_outdated_broker() {
+        let pods = vec![
+            pod("queue-0", "old", false),
+            pod("queue-1", "old", true),
+            pod("queue-2", "old", true),
+        ];
+        assert!(matches!(
+            rollout_decision(&pods, &options("new")),
+            Decision::Wait(message) if message.contains("refusing")
         ));
     }
 

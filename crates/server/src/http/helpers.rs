@@ -20,6 +20,7 @@ pub(super) async fn publish_write(
     topic: &str,
     messages: Vec<Bytes>,
     defer_ms: u64,
+    reservation: crate::admission::PublishReservation,
 ) -> Result<Vec<u64>, ApiError> {
     if !state.accepting.load(Ordering::Acquire) {
         return Err(ApiError::unavailable("E_DRAINING", "broker is draining"));
@@ -37,7 +38,12 @@ pub(super) async fn publish_write(
     }
     Ok(state
         .broker
-        .publish(topic, messages, Duration::from_millis(defer_ms))
+        .publish_guarded(
+            topic,
+            messages,
+            Duration::from_millis(defer_ms),
+            reservation,
+        )
         .await?)
 }
 

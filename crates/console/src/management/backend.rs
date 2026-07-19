@@ -3,6 +3,7 @@ use crate::app::AppState;
 use crate::model::{BrokerView, Snapshot};
 use crate::resources;
 use futures::{stream, StreamExt, TryStreamExt};
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,17 @@ pub struct OwnerOperation<'a> {
     pub channel: Option<&'a str>,
     pub action: &'a str,
     pub tombstone_until_ms: Option<i64>,
+}
+
+struct BackendError {
+    code: Option<String>,
+    detail: String,
+}
+
+#[derive(Deserialize)]
+struct BackendErrorBody {
+    message: Option<String>,
+    detail: Option<String>,
 }
 
 pub async fn apply_owner(
@@ -134,32 +146,104 @@ async fn post(
         return Ok(());
     }
     let status = response.status();
-    let detail = read_text_bounded(response, 64 * 1024).await;
-    if status.as_u16() == 409 {
+    let error = read_error_bounded(response, 64 * 1024).await;
+    classify_backend_error(status, &broker.name, error)
+}
+
+fn classify_backend_error(
+    status: reqwest::StatusCode,
+    broker: &str,
+    error: BackendError,
+) -> Result<(), ManagementError> {
+    if status == reqwest::StatusCode::CONFLICT
+        && error.code.as_deref() == Some("E_REVISION_CONFLICT")
+    {
+        // The observation snapshot can become stale after another operation
+        // advances this broker. Reconcile again after collection refreshes the
+        // revision instead of permanently failing an otherwise valid action.
+        Err(ManagementError::unavailable(format!(
+            "{broker} observation revision is stale: {}",
+            error.detail
+        )))
+    } else if status == reqwest::StatusCode::CONFLICT {
         Err(ManagementError::conflict(
             "E_BROKER_STATE_DRIFT",
-            format!("{} rejected stale state: {detail}", broker.name),
+            format!("{broker} rejected conflicting state: {}", error.detail),
         ))
     } else if matches!(status.as_u16(), 400 | 404 | 422) {
         Err(ManagementError::conflict(
             "E_BROKER_REJECTED",
-            format!("{} rejected the operation: {detail}", broker.name),
+            format!("{broker} rejected the operation: {}", error.detail),
         ))
     } else {
         Err(ManagementError::unavailable(format!(
-            "{} returned {status}: {detail}",
-            broker.name
+            "{broker} returned {status}: {}",
+            error.detail
         )))
     }
 }
 
-async fn read_text_bounded(mut response: reqwest::Response, maximum: usize) -> String {
+async fn read_error_bounded(mut response: reqwest::Response, maximum: usize) -> BackendError {
     let mut bytes = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                return BackendError {
+                    code: None,
+                    detail: "response body read failed".into(),
+                }
+            }
+        };
         if bytes.len().saturating_add(chunk.len()) > maximum {
-            return "response body exceeded its limit".into();
+            return BackendError {
+                code: None,
+                detail: "response body exceeded its limit".into(),
+            };
         }
         bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8_lossy(&bytes).into_owned()
+    if let Ok(parsed) = serde_json::from_slice::<BackendErrorBody>(&bytes) {
+        return BackendError {
+            code: parsed.message,
+            detail: parsed
+                .detail
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+        };
+    }
+    BackendError {
+        code: None,
+        detail: String::from_utf8_lossy(&bytes).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_conflicts_are_retried_but_operation_conflicts_are_terminal() {
+        let revision = classify_backend_error(
+            reqwest::StatusCode::CONFLICT,
+            "broker-0",
+            BackendError {
+                code: Some("E_REVISION_CONFLICT".into()),
+                detail: "expected 1, actual 2".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(revision.retryable());
+
+        let operation = classify_backend_error(
+            reqwest::StatusCode::CONFLICT,
+            "broker-0",
+            BackendError {
+                code: Some("E_OPERATION_CONFLICT".into()),
+                detail: "operation ID reused".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(!operation.retryable());
+    }
 }

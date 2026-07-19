@@ -301,7 +301,7 @@ mod tests {
 
     fn binary(maximum: u32) -> BinaryCapabilities {
         BinaryCapabilities {
-            binary_version: "0.7.1".into(),
+            binary_version: "0.7.2".into(),
             data_format: 7,
             minimum_reader_feature_level: 1,
             maximum_reader_feature_level: maximum,

@@ -16,6 +16,7 @@ use crate::metadata::{load_topic_manifest, store_atomic, TopicManifest};
 use crate::BrokerError;
 use index::{MessageIndex, MessageIndexCache, MetadataReservation};
 use parking_lot::Mutex;
+use rustqueue_protocol::validate_name;
 use rustqueue_storage::{RecordHeader, RecordKind, SegmentLog};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -132,6 +133,15 @@ impl Topic {
                 "topic manifest is not an active v7 topic".into(),
             ));
         }
+        let expected_directory = hex::encode(manifest.name.as_bytes());
+        if validate_name(&manifest.name).is_err()
+            || directory.file_name().and_then(|name| name.to_str())
+                != Some(expected_directory.as_str())
+        {
+            return Err(BrokerError::InvalidRecord(
+                "topic manifest name does not match its directory".into(),
+            ));
+        }
         let mut log = SegmentLog::open_with_feature_level(
             directory.join("segments"),
             max_segment_bytes,
@@ -191,8 +201,14 @@ impl Topic {
                 store.remove()?;
                 continue;
             }
+            let name = state.name.clone();
+            if self.channels.contains_key(&name) {
+                return Err(BrokerError::InvalidRecord(format!(
+                    "duplicate stored channel identity {name}"
+                )));
+            }
             self.channels.insert(
-                state.name.clone(),
+                name,
                 ChannelRuntime {
                     state,
                     store: Some(store),

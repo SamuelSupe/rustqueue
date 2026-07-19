@@ -260,7 +260,11 @@ impl Broker {
                 Arc::clone(&message_index_cache),
             )?;
             let name = handle.state.lock().name.clone();
-            topics.insert(name, handle);
+            if topics.insert(name.clone(), handle).is_some() {
+                return Err(BrokerError::InvalidRecord(format!(
+                    "duplicate stored topic identity {name}"
+                )));
+            }
         }
         if topics.len() > config.max_topics {
             return Err(BrokerError::InvalidRecord(format!(
@@ -526,7 +530,10 @@ impl Broker {
         if result.as_ref().is_err_and(|error| {
             matches!(
                 error,
-                BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_)
+                BrokerError::StorageUnavailable
+                    | BrokerError::Storage(_)
+                    | BrokerError::Io(_)
+                    | BrokerError::InvalidRecord(_)
             )
         }) {
             self.inner.storage_healthy.store(false, Ordering::Release);

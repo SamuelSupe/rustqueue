@@ -146,7 +146,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.7.1 \
+  --set queue.image=registry.example/rustqueue:0.7.2 \
   --set queue.storageClassName=ssd-rwo
 ```
 

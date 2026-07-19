@@ -61,7 +61,7 @@ pub(super) async fn read_initial_command(
     Ok(ParsedCommand {
         command,
         body,
-        _publish_reservation: reservation,
+        publish_reservation: reservation,
     })
 }
 
@@ -71,18 +71,39 @@ pub(super) async fn read_command(
     admission: &PublishAdmission,
     connection_budget: &ConnectionBudget,
 ) -> Result<ParsedCommand, CommandReadError> {
+    // Waiting for the first byte remains unbounded so an explicitly idle
+    // connection (including one with heartbeats disabled) stays compatible.
+    // Once a command starts, bound both its line and optional body so a
+    // partial publish cannot pin a connection or its byte reservation.
+    let first = reader.read_u8().await?;
+    tokio::time::timeout(
+        Duration::from_millis(config.limits.tcp_command_timeout_ms),
+        read_started_command(reader, first, config, admission, connection_budget),
+    )
+    .await
+    .map_err(|_| CommandReadError::protocol("E_INVALID", "command read timed out"))?
+}
+
+async fn read_started_command<R>(
+    reader: &mut R,
+    first: u8,
+    config: &Config,
+    admission: &PublishAdmission,
+    connection_budget: &ConnectionBudget,
+) -> Result<ParsedCommand, CommandReadError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut line = Vec::with_capacity(64);
-    let read = reader.read_until(b'\n', &mut line).await?;
-    if read == 0 {
-        return Err(
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed").into(),
-        );
-    }
-    if line.len() > 1024 {
-        return Err(CommandReadError::protocol(
-            "E_INVALID",
-            "command line exceeds limit",
-        ));
+    line.push(first);
+    while line.last() != Some(&b'\n') {
+        line.push(reader.read_u8().await?);
+        if line.len() > 1024 {
+            return Err(CommandReadError::protocol(
+                "E_INVALID",
+                "command line exceeds limit",
+            ));
+        }
     }
     let command = parse_command(&line)?;
     let (body, reservation) =
@@ -90,7 +111,7 @@ pub(super) async fn read_command(
     Ok(ParsedCommand {
         command,
         body,
-        _publish_reservation: reservation,
+        publish_reservation: reservation,
     })
 }
 
@@ -421,6 +442,53 @@ mod tests {
             .unwrap_err();
         match error {
             CommandReadError::Protocol { code, .. } => assert_eq!(code, "E_BAD_MESSAGE"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_an_unterminated_command_before_it_can_grow_unbounded() {
+        let (mut peer, server) = tokio::io::duplex(4096);
+        peer.write_all(&vec![b'X'; 1025]).await.unwrap();
+        let io: BoxIo = Box::new(server);
+        let (read, _) = tokio::io::split(io);
+        let mut reader = BufReader::new(read);
+        let config = Config::default();
+        let metrics = Arc::new(Metrics::default());
+        let admission = PublishAdmission::new(config.limits.node_publish_inflight_bytes, metrics);
+        let connection = ConnectionBudget::new(config.limits.connection_publish_inflight_bytes);
+        let error = read_command(&mut reader, &config, &admission, &connection)
+            .await
+            .unwrap_err();
+        match error {
+            CommandReadError::Protocol { code, detail } => {
+                assert_eq!(code, "E_INVALID");
+                assert!(detail.contains("line exceeds limit"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn times_out_a_partial_publish_body_without_requiring_heartbeats() {
+        let (mut peer, server) = tokio::io::duplex(1024);
+        peer.write_all(b"PUB events\n\0\0\0\x04x").await.unwrap();
+        let io: BoxIo = Box::new(server);
+        let (read, _) = tokio::io::split(io);
+        let mut reader = BufReader::new(read);
+        let mut config = Config::default();
+        config.limits.tcp_command_timeout_ms = 10;
+        let metrics = Arc::new(Metrics::default());
+        let admission = PublishAdmission::new(config.limits.node_publish_inflight_bytes, metrics);
+        let connection = ConnectionBudget::new(config.limits.connection_publish_inflight_bytes);
+        let error = read_command(&mut reader, &config, &admission, &connection)
+            .await
+            .unwrap_err();
+        match error {
+            CommandReadError::Protocol { code, detail } => {
+                assert_eq!(code, "E_INVALID");
+                assert!(detail.contains("timed out"));
+            }
             other => panic!("unexpected error: {other}"),
         }
     }

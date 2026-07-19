@@ -22,6 +22,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::timeout::RequestBodyTimeoutLayer;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -80,7 +81,9 @@ async fn main() -> anyhow::Result<()> {
             .route("/api/v1/management/preview", post(management::preview))
             .route("/api/v1/management/apply", post(management::apply));
     }
-    let app = app.with_state(state);
+    let app = app
+        .with_state(state)
+        .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(10)));
     let listener = TcpListener::bind(config.address).await?;
     tracing::info!(address = %config.address, queue = %config.queue_name, namespace = %config.namespace, "RustQueue Console listening");
     let server = axum::serve(

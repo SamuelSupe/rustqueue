@@ -78,7 +78,7 @@ impl Broker {
                     changed = true;
                 }
                 TopicManagementAction::Delete | TopicManagementAction::Tombstone => {
-                    let until = valid_tombstone(tombstone_until_ms)?;
+                    let until = valid_tombstone(tombstone_until_ms, replayed)?;
                     let mut fences = broker.inner.fences.lock();
                     if fences.set_topic(&topic, until) {
                         fences.store(&broker.inner.fences_path)?;
@@ -161,7 +161,7 @@ impl Broker {
                     changed = true;
                 }
                 ChannelManagementAction::Delete | ChannelManagementAction::Tombstone => {
-                    let until = valid_tombstone(tombstone_until_ms)?;
+                    let until = valid_tombstone(tombstone_until_ms, replayed)?;
                     let mut fences = broker.inner.fences.lock();
                     if fences.set_channel(&topic, &channel, until) {
                         fences.store(&broker.inner.fences_path)?;
@@ -277,9 +277,9 @@ enum PreparedOperation {
     Completed(ManagementResult),
 }
 
-fn valid_tombstone(value: Option<i64>) -> Result<i64, BrokerError> {
+fn valid_tombstone(value: Option<i64>, replayed: bool) -> Result<i64, BrokerError> {
     value
-        .filter(|until| *until > now_ms())
+        .filter(|until| replayed || *until > now_ms())
         .ok_or_else(|| BrokerError::InvalidRecord("active tombstone deadline is required".into()))
 }
 

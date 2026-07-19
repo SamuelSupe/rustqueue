@@ -16,13 +16,13 @@ impl Broker {
         let broker = self.clone();
         self.storage_task(move || {
             let mut outbox_ids = HashMap::<String, BTreeSet<u64>>::new();
-            for (_, entry) in
-                crate::outbox::load_all(&broker.inner.config.data_path.join("dlq-outbox"))?
+            for (source_topic, message_id) in
+                crate::outbox::retained_sources(&broker.inner.config.data_path.join("dlq-outbox"))?
             {
                 outbox_ids
-                    .entry(entry.source_topic)
+                    .entry(source_topic)
                     .or_default()
-                    .insert(entry.message_id);
+                    .insert(message_id);
             }
             let mut topics: Vec<_> = broker
                 .inner

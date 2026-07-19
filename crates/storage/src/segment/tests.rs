@@ -282,10 +282,26 @@ fn retained_oldest_segment_blocks_non_contiguous_gc() {
     }
     let paths = log.segment_paths().unwrap();
     let retained = [paths[0].clone()].into_iter().collect();
+    assert!(log
+        .oldest_inactive_boundary_retaining(&retained)
+        .unwrap()
+        .is_none());
     assert_eq!(log.purge_prefix_retaining(3, &retained).unwrap(), 0);
     assert_eq!(log.segment_paths().unwrap().len(), 4);
     assert_eq!(log.purge_prefix(3).unwrap(), 3);
     assert_eq!(log.first_index(), Some(4));
+}
+
+#[test]
+fn malformed_segment_filename_is_rejected() {
+    let directory = tempdir().unwrap();
+    drop(SegmentLog::open(directory.path(), 1024).unwrap());
+    std::fs::write(directory.path().join("segment-invalid.rqlog"), b"").unwrap();
+
+    assert!(matches!(
+        SegmentLog::open(directory.path(), 1024),
+        Err(StorageError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData
+    ));
 }
 
 #[cfg(unix)]

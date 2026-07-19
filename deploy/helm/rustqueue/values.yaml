@@ -5,7 +5,7 @@ operator:
   replicas: 2
   image:
     repository: rustqueue-operator
-    tag: "0.7.1"
+    tag: "0.7.2"
     pullPolicy: IfNotPresent
   log: rustqueue_operator=info
   resources:
@@ -20,7 +20,7 @@ operator:
 queue:
   create: true
   name: rustqueue
-  image: rustqueue:0.7.1
+  image: rustqueue:0.7.2
   imagePullPolicy: IfNotPresent
   minBrokers: 1
   maxBrokers: 500

@@ -336,26 +336,9 @@ pub(super) async fn run_session(
             broker.release(&subscription.topic, &subscription.channel, &ids);
         }
         if subscription.channel.ends_with("#ephemeral") {
-            let key = (subscription.topic.clone(), subscription.channel.clone());
-            let delete = {
-                let mut consumers = ephemeral_consumers.lock();
-                if let Some(count) = consumers.get_mut(&key) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        consumers.remove(&key);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if delete {
-                let _ = broker
-                    .delete_channel(&subscription.topic, &subscription.channel)
-                    .await;
-            }
+            ephemeral_consumers
+                .unregister(broker, &subscription.topic, &subscription.channel)
+                .await;
         }
     }
     session_result

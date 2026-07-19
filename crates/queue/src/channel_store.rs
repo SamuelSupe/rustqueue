@@ -1,6 +1,7 @@
 use crate::channel::{ChannelCheckpoint, ChannelCommand, ChannelState};
 use crate::metadata::store_bytes_atomic_with_failpoint;
 use crate::BrokerError;
+use rustqueue_protocol::validate_name;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,14 +29,19 @@ impl ChannelStore {
         let stem = hex::encode(state.name.as_bytes());
         let checkpoint_path = directory.join(format!("{stem}.checkpoint"));
         let wal_path = directory.join(format!("{stem}.wal"));
-        write_checkpoint(&checkpoint_path, &state.checkpoint())?;
+        // A channel name may be reused after a crash interrupted deletion.
+        // Make the empty WAL durable before publishing the new checkpoint so
+        // stale pause/empty commands can never be replayed into the new life.
         let wal = OpenOptions::new()
             .create(true)
-            .read(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&wal_path)?;
         wal.sync_all()?;
+        drop(wal);
         File::open(directory)?.sync_all()?;
+        write_checkpoint(&checkpoint_path, &state.checkpoint())?;
+        let wal = OpenOptions::new().read(true).append(true).open(&wal_path)?;
         Ok(Self {
             directory: directory.into(),
             checkpoint_path,
@@ -56,6 +62,13 @@ impl ChannelStore {
             .expect("checkpoint has parent")
             .to_path_buf();
         let stem = checkpoint_path.file_stem().expect("checkpoint has stem");
+        let expected_stem = hex::encode(checkpoint.name.as_bytes());
+        if validate_name(&checkpoint.name).is_err() || stem.to_str() != Some(expected_stem.as_str())
+        {
+            return Err(BrokerError::InvalidRecord(
+                "channel checkpoint name does not match its file".into(),
+            ));
+        }
         let wal_path = directory.join(format!("{}.wal", stem.to_string_lossy()));
         let commands = recover_wal(&wal_path)?;
         let mut state = ChannelState::from_checkpoint(checkpoint, max_ack_gap)?;
@@ -166,7 +179,10 @@ impl ChannelStore {
     pub fn remove(self) -> Result<(), BrokerError> {
         self.wal.sync_all()?;
         drop(self.wal);
-        for path in [&self.checkpoint_path, &self.wal_path] {
+        // Removing the WAL first means an interrupted delete can at worst
+        // resurrect the checkpoint with an empty WAL, never leave stale
+        // commands behind a successfully removed checkpoint.
+        for path in [&self.wal_path, &self.checkpoint_path] {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -182,14 +198,16 @@ pub(crate) fn checkpoint_paths(directory: &Path) -> Result<Vec<PathBuf>, BrokerE
     if !directory.exists() {
         return Ok(Vec::new());
     }
-    let mut paths: Vec<_> = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "checkpoint")
-        })
-        .collect();
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "checkpoint")
+        {
+            paths.push(path);
+        }
+    }
     paths.sort();
     Ok(paths)
 }
@@ -475,5 +493,47 @@ mod tests {
         let mut encoded = encode_command(&command);
         encoded.push(0);
         assert!(decode_command(&encoded).is_err());
+    }
+
+    #[test]
+    fn recreating_a_channel_discards_an_orphaned_old_wal() {
+        let root = tempdir().unwrap();
+        let original = ChannelState::new("workers".into(), 0, false, 65_536);
+        let mut store = ChannelStore::create(root.path(), &original).unwrap();
+        store
+            .append(&ChannelCommand::Pause { paused: true })
+            .unwrap();
+        drop(store);
+
+        let checkpoint = root
+            .path()
+            .join(format!("{}.checkpoint", hex::encode("workers")));
+        fs::remove_file(&checkpoint).unwrap();
+        File::open(root.path()).unwrap().sync_all().unwrap();
+
+        let replacement = ChannelState::new("workers".into(), 10, false, 65_536);
+        drop(ChannelStore::create(root.path(), &replacement).unwrap());
+        let (recovered, _) = ChannelStore::open(&checkpoint, 65_536).unwrap();
+        assert!(!recovered.paused);
+        assert_eq!(recovered.ack_floor_position, 10);
+    }
+
+    #[test]
+    fn rejects_a_checkpoint_renamed_to_another_channel_identity() {
+        let root = tempdir().unwrap();
+        let state = ChannelState::new("workers".into(), 0, false, 65_536);
+        drop(ChannelStore::create(root.path(), &state).unwrap());
+        let original = root
+            .path()
+            .join(format!("{}.checkpoint", hex::encode("workers")));
+        let renamed = root
+            .path()
+            .join(format!("{}.checkpoint", hex::encode("other")));
+        fs::rename(original, &renamed).unwrap();
+
+        assert!(matches!(
+            ChannelStore::open(&renamed, 65_536),
+            Err(BrokerError::InvalidRecord(message)) if message.contains("does not match")
+        ));
     }
 }
