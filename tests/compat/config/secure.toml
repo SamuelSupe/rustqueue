@@ -12,6 +12,7 @@ advertised_http_port = 4151
 
 [storage]
 data_path = "/data"
+min_free_bytes = 67108864
 
 [security]
 auth_http_addresses = ["http://auth:4181"]

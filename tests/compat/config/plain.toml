@@ -12,6 +12,7 @@ advertised_http_port = 4151
 
 [storage]
 data_path = "/data"
+min_free_bytes = 67108864
 
 [limits]
 heartbeat_interval_ms = 1000
