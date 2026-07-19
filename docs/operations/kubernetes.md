@@ -85,7 +85,7 @@ Useful controls:
 rustqueuectl -n rustqueue rollout pause
 rustqueuectl -n rustqueue rollout resume
 rustqueuectl -n rustqueue rollout retry
-rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.7.0
+rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.7.1
 rustqueuectl -n rustqueue rollout forward
 ```
 

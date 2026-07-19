@@ -19,6 +19,7 @@ struct ProxyState {
     pool: BackendPool,
     client: reqwest::Client,
     max_body_bytes: usize,
+    body_timeout: std::time::Duration,
     inflight_bytes: Arc<Semaphore>,
     metrics: ProxyMetrics,
 }
@@ -28,6 +29,7 @@ pub async fn serve(
     pool: BackendPool,
     max_body_bytes: usize,
     max_inflight_bytes: usize,
+    body_timeout: std::time::Duration,
     metrics: ProxyMetrics,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
@@ -39,6 +41,7 @@ pub async fn serve(
         pool,
         client,
         max_body_bytes,
+        body_timeout,
         inflight_bytes: Arc::new(Semaphore::new(max_inflight_bytes)),
         metrics,
     };
@@ -100,9 +103,15 @@ async fn forward(State(state): State<ProxyState>, request: Request<Body>) -> Res
     let Ok(_permit) = Arc::clone(&state.inflight_bytes).try_acquire_many_owned(reserved) else {
         return throttled();
     };
-    let body = match axum::body::to_bytes(body, state.max_body_bytes).await {
-        Ok(body) => body,
-        Err(_) => return body_too_large(),
+    let body = match tokio::time::timeout(
+        state.body_timeout,
+        axum::body::to_bytes(body, state.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => return body_too_large(),
+        Err(_) => return body_timeout(),
     };
     let path = metadata.path_and_query;
     let backends = state.pool.shuffled(2);
@@ -192,6 +201,14 @@ fn body_too_large() -> Response {
         .into_response()
 }
 
+fn body_timeout() -> Response {
+    (
+        StatusCode::REQUEST_TIMEOUT,
+        "E_BODY_TIMEOUT proxy request body read timed out",
+    )
+        .into_response()
+}
+
 fn throttled() -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -216,6 +233,7 @@ mod tests {
             pool: BackendPool::default(),
             client: reqwest::Client::new(),
             max_body_bytes: 1024,
+            body_timeout: std::time::Duration::from_secs(1),
             inflight_bytes: Arc::new(Semaphore::new(1024)),
             metrics: ProxyMetrics::default(),
         };
@@ -240,6 +258,7 @@ mod tests {
             pool: BackendPool::default(),
             client: reqwest::Client::new(),
             max_body_bytes: 1024,
+            body_timeout: std::time::Duration::from_secs(1),
             inflight_bytes: Arc::new(Semaphore::new(1)),
             metrics: ProxyMetrics::default(),
         };

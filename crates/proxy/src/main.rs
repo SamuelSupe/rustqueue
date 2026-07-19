@@ -49,6 +49,12 @@ struct Cli {
     max_connections: usize,
     #[arg(
         long,
+        env = "RUSTQUEUE_PROXY_HTTP_BODY_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    http_body_timeout_ms: u64,
+    #[arg(
+        long,
         env = "RUSTQUEUE_PROXY_TCP_MAX_CONNECTION_AGE_SECONDS",
         default_value_t = 300
     )]
@@ -68,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
         || cli.max_inflight_bytes == 0
         || cli.max_inflight_bytes > u32::MAX as usize
         || cli.max_connections == 0
+        || cli.http_body_timeout_ms == 0
     {
         anyhow::bail!("proxy limits must be non-zero and inflight bytes must fit u32");
     }
@@ -82,6 +89,13 @@ async fn main() -> anyhow::Result<()> {
             Duration::from_secs(cli.tcp_max_connection_age_seconds),
             metrics.clone(),
         ) => result,
-        result = http::serve(cli.http_address, pool, cli.max_body_bytes, cli.max_inflight_bytes, metrics) => result,
+        result = http::serve(
+            cli.http_address,
+            pool,
+            cli.max_body_bytes,
+            cli.max_inflight_bytes,
+            Duration::from_millis(cli.http_body_timeout_ms),
+            metrics,
+        ) => result,
     }
 }

@@ -120,6 +120,8 @@ pub enum BrokerError {
     PublishWorkerLimit,
     #[error("active topic channel commit worker limit reached")]
     ChannelWorkerLimit,
+    #[error("topic channel limit reached")]
+    ChannelLimit,
     #[error("message ID sequence exhausted")]
     SequenceExhausted,
     #[error("local storage is isolated after an earlier failure; restart is required")]
@@ -267,6 +269,14 @@ impl Broker {
                 config.max_topics
             )));
         }
+        // A topic/channel mutation is persisted before its registry revision.
+        // If the final revision write failed, the durable catalog can be newer
+        // than the revision observed by discovery (including an empty catalog
+        // after deleting the last topic). Bump once on every restart so the
+        // first registry read always refreshes its cache.
+        let mut meta = meta;
+        meta.registry_revision = meta.registry_revision.saturating_add(1);
+        store_atomic(&meta_path, &meta)?;
         let revision = meta.registry_revision;
         let next_sequence = meta.next_sequence;
         let publish_groups = group_commit::PublishGroups::new(

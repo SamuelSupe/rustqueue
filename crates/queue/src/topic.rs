@@ -22,6 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+pub(crate) const MAX_CHANNELS_PER_TOPIC: usize = 1_024;
+
 pub(crate) struct TopicHandle {
     pub state: Mutex<Topic>,
     pub wake: tokio::sync::watch::Sender<u64>,
@@ -55,6 +57,13 @@ impl TopicHandle {
         )?;
         let (wake, _) = tokio::sync::watch::channel(0);
         topic.recover_channels()?;
+        if topic.channels.len() > MAX_CHANNELS_PER_TOPIC {
+            return Err(BrokerError::InvalidRecord(format!(
+                "topic channel count {} exceeds configured maximum {}",
+                topic.channels.len(),
+                MAX_CHANNELS_PER_TOPIC
+            )));
+        }
         Ok(Arc::new(Self {
             state: Mutex::new(topic),
             wake,
@@ -297,6 +306,9 @@ impl Topic {
         }
         if self.channels.contains_key(name) {
             return Ok(false);
+        }
+        if self.channels.len() >= MAX_CHANNELS_PER_TOPIC {
+            return Err(BrokerError::ChannelLimit);
         }
         let ephemeral = name.ends_with("#ephemeral");
         let barrier = if ephemeral {

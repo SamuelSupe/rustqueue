@@ -53,6 +53,36 @@ fn rejects_unbounded_topic_worker_configuration() {
 }
 
 #[test]
+fn rejects_zero_protocol_capacity_and_timeouts() {
+    let mut config = Config::default();
+    config.limits.max_connections = 0;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.max_connections = 1;
+    config.limits.max_rdy_count = 0;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.max_rdy_count = 1;
+    config.limits.http_body_timeout_ms = 0;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.http_body_timeout_ms = 1;
+    config.queue.message_timeout_ms = config.queue.max_message_timeout_ms + 1;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.max_heartbeat_interval_ms = i64::MAX as u64 + 1;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.max_output_buffer_timeout_ms = i64::MAX as u64 + 1;
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn rejects_an_unbounded_detailed_metric_configuration() {
     let mut config = Config::default();
     config.metrics.max_detailed_series = 0;

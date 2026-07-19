@@ -65,6 +65,10 @@ impl Config {
         )?;
         set_from_env("RUSTQUEUE_MAX_BODY_BYTES", &mut self.limits.max_body_bytes)?;
         set_from_env(
+            "RUSTQUEUE_HTTP_BODY_TIMEOUT_MS",
+            &mut self.limits.http_body_timeout_ms,
+        )?;
+        set_from_env(
             "RUSTQUEUE_NODE_PUBLISH_INFLIGHT_BYTES",
             &mut self.limits.node_publish_inflight_bytes,
         )?;

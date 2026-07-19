@@ -126,6 +126,7 @@ pub struct LimitsConfig {
     pub auth_timeout_ms: u64,
     pub auth_max_ttl_seconds: u64,
     pub auth_cache_max_entries: usize,
+    pub http_body_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -255,6 +256,7 @@ impl Default for LimitsConfig {
             auth_timeout_ms: 5_000,
             auth_max_ttl_seconds: 3600,
             auth_cache_max_entries: 10_000,
+            http_body_timeout_ms: 30_000,
         }
     }
 }
@@ -303,6 +305,14 @@ impl Config {
         }
         if self.queue.bootstrap_retention_seconds == 0 {
             bail!("queue.bootstrap_retention_seconds must be greater than zero");
+        }
+        if self.queue.message_timeout_ms == 0
+            || self.queue.max_message_timeout_ms < 1_000
+            || self.queue.message_timeout_ms > self.queue.max_message_timeout_ms
+            || self.queue.max_message_timeout_ms > i64::MAX as u64
+            || self.queue.max_defer_ms > i64::MAX as u64
+        {
+            bail!("queue message timeouts must satisfy 0 < default <= max, max >= 1000ms, and fit signed wire fields");
         }
         if self.queue.max_ack_gap == 0
             || self.queue.max_topics == 0

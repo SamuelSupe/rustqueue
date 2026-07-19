@@ -805,7 +805,7 @@ async fn concurrent_registry_updates_persist_the_latest_revision() {
     drop(broker);
 
     let reopened = Broker::open(config).unwrap();
-    assert_eq!(reopened.registry_revision(), expected);
+    assert!(reopened.registry_revision() > expected);
 }
 
 #[tokio::test]

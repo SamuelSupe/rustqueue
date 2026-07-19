@@ -84,9 +84,13 @@ pub(super) async fn read_publish_body(
         .publish_admission
         .try_reserve_publish(declared.unwrap_or(maximum), shape)
         .ok_or_else(|| ApiError::throttled("publish byte budget is exhausted; retry later"))?;
-    let body = axum::body::to_bytes(request.into_body(), maximum)
-        .await
-        .map_err(|_| ApiError::bad_request("E_BAD_BODY", "body exceeds configured limit"))?;
+    let body = tokio::time::timeout(
+        Duration::from_millis(state.config.limits.http_body_timeout_ms),
+        axum::body::to_bytes(request.into_body(), maximum),
+    )
+    .await
+    .map_err(|_| ApiError::timeout("E_BODY_TIMEOUT", "request body read timed out"))?
+    .map_err(|_| ApiError::bad_request("E_BAD_BODY", "body exceeds configured limit"))?;
     Ok((body, reservation))
 }
 

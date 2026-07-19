@@ -385,6 +385,7 @@ pub(super) fn copy_error(error: &BrokerError) -> BrokerError {
         BrokerError::TopicLimit => BrokerError::TopicLimit,
         BrokerError::PublishWorkerLimit => BrokerError::PublishWorkerLimit,
         BrokerError::ChannelWorkerLimit => BrokerError::ChannelWorkerLimit,
+        BrokerError::ChannelLimit => BrokerError::ChannelLimit,
         BrokerError::SequenceExhausted => BrokerError::SequenceExhausted,
         BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {
             BrokerError::StorageUnavailable

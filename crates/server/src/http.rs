@@ -199,6 +199,13 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+    fn timeout(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            code,
+            detail: detail.into(),
+        }
+    }
 }
 
 impl From<BrokerError> for ApiError {
@@ -221,7 +228,8 @@ impl From<BrokerError> for ApiError {
             }
             BrokerError::TopicLimit
             | BrokerError::PublishWorkerLimit
-            | BrokerError::ChannelWorkerLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
+            | BrokerError::ChannelWorkerLimit
+            | BrokerError::ChannelLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
             BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "E_STORAGE")
             }

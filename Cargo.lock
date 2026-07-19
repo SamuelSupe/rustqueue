@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-bench"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-console"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-discovery"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2345,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-operator"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2370,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-protocol"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "bytes",
  "serde",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-proxy"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-queue"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-server"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -2455,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-storage"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "crc32c",
@@ -2468,14 +2468,14 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-telemetry"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rustqueuectl"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "clap",
