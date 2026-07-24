@@ -112,6 +112,17 @@ impl OperationCatalog {
         Ok(())
     }
 
+    pub(crate) fn pending_id(&self, topic: &str, fingerprint: &str) -> Option<String> {
+        self.records
+            .iter()
+            .find(|(_, record)| {
+                record.topic == topic
+                    && record.fingerprint == fingerprint
+                    && record.state == OperationState::Pending
+            })
+            .map(|(id, _)| id.clone())
+    }
+
     pub(crate) fn complete(
         &mut self,
         path: &Path,
@@ -119,12 +130,30 @@ impl OperationCatalog {
         result: ManagementResult,
     ) -> io::Result<()> {
         let mut next = self.clone();
-        let record = next.records.get_mut(id).ok_or_else(|| {
+        let record = next.records.get(id).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "management operation disappeared")
         })?;
-        record.state = OperationState::Completed;
-        record.result = Some(result);
-        next.completed_order.push_back(id.to_owned());
+        let fingerprint = record.fingerprint.clone();
+        let topic = record.topic.clone();
+        let matching: Vec<_> = next
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                record.topic == topic
+                    && record.fingerprint == fingerprint
+                    && record.state == OperationState::Pending
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in matching {
+            let record = next
+                .records
+                .get_mut(&id)
+                .expect("matching operation still exists");
+            record.state = OperationState::Completed;
+            record.result = Some(result.clone());
+            next.completed_order.push_back(id);
+        }
         while next.completed_order.len() > MAX_COMPLETED {
             if let Some(expired) = next.completed_order.pop_front() {
                 if next
@@ -196,5 +225,23 @@ mod tests {
             )
             .unwrap();
         assert!(!catalog.blocks_topic("orders"));
+    }
+
+    #[test]
+    fn matching_pending_operation_can_be_adopted_after_the_caller_id_changes() {
+        let root = tempdir().unwrap();
+        let (path, mut catalog) = OperationCatalog::load(root.path()).unwrap();
+        catalog
+            .prepare(
+                &path,
+                "operation-00000001",
+                "channel:delete:orders:worker".into(),
+                "orders".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.pending_id("orders", "channel:delete:orders:worker"),
+            Some("operation-00000001".into())
+        );
     }
 }

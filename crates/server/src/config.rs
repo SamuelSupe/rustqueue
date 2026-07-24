@@ -3,14 +3,30 @@ mod environment;
 mod validation;
 
 use environment::read_optional_secret;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const MAX_SUPPORTED_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_SUPPORTED_BATCH_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SUPPORTED_MESSAGE_BYTES: usize = rustqueue_protocol::MAX_MESSAGE_BYTES;
+pub const MAX_SUPPORTED_BATCH_BYTES: usize = rustqueue_protocol::MAX_BATCH_BYTES;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeCapabilities {
+    #[serde(flatten)]
+    storage: rustqueue_storage::BinaryCapabilities,
+    pub maximum_message_bytes: usize,
+    pub maximum_batch_bytes: usize,
+}
+
+pub fn runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        storage: rustqueue_storage::binary_capabilities(),
+        maximum_message_bytes: MAX_SUPPORTED_MESSAGE_BYTES,
+        maximum_batch_bytes: MAX_SUPPORTED_BATCH_BYTES,
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -38,6 +54,7 @@ pub struct NodeConfig {
 pub struct NetworkConfig {
     pub tcp_address: SocketAddr,
     pub http_address: SocketAddr,
+    pub kodo_http_address: Option<SocketAddr>,
     pub advertised_tcp_port: u16,
     pub advertised_http_port: u16,
     pub snappy_enabled: bool,
@@ -91,7 +108,9 @@ pub struct SecurityConfig {
     pub publish_token_file: Option<PathBuf>,
     pub registry_token_file: Option<PathBuf>,
     pub console_token_file: Option<PathBuf>,
+    pub kodo_cleanup_token_file: Option<PathBuf>,
     pub console_management_enabled: bool,
+    pub kodo_cleanup_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -128,6 +147,7 @@ pub struct LimitsConfig {
     pub auth_max_ttl_seconds: u64,
     pub auth_cache_max_entries: usize,
     pub http_body_timeout_ms: u64,
+    pub disconnect_on_retriable_publish_error: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -173,6 +193,7 @@ impl Default for NetworkConfig {
         Self {
             tcp_address: "0.0.0.0:4150".parse().unwrap(),
             http_address: "0.0.0.0:4151".parse().unwrap(),
+            kodo_http_address: None,
             advertised_tcp_port: 4150,
             advertised_http_port: 4151,
             snappy_enabled: true,
@@ -198,7 +219,7 @@ impl Default for StorageConfig {
             disk_high_watermark_percent: 85,
             disk_low_watermark_percent: 75,
             min_free_bytes: 10 * 1024 * 1024 * 1024,
-            protective_eviction_enabled: true,
+            protective_eviction_enabled: false,
             disk_pressure_grace_seconds: 60,
         }
     }
@@ -238,7 +259,7 @@ impl Default for TlsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            max_body_bytes: MAX_SUPPORTED_BATCH_BYTES,
+            max_body_bytes: 64 * 1024 * 1024,
             node_publish_inflight_bytes: 512 * 1024 * 1024,
             connection_publish_inflight_bytes: 80 * 1024 * 1024,
             node_delivery_inflight_bytes: 512 * 1024 * 1024,
@@ -259,6 +280,7 @@ impl Default for LimitsConfig {
             auth_max_ttl_seconds: 3600,
             auth_cache_max_entries: 10_000,
             http_body_timeout_ms: 30_000,
+            disconnect_on_retriable_publish_error: false,
         }
     }
 }
@@ -366,6 +388,20 @@ impl Config {
         if !(1..=9).contains(&self.network.max_deflate_level) {
             bail!("network.max_deflate_level must be in 1..=9");
         }
+        if self.security.kodo_cleanup_enabled {
+            bail!(
+                "Kodo automatic cleanup is disabled until cluster-wide atomic deletion is available"
+            );
+        }
+        if self.security.kodo_cleanup_enabled != self.network.kodo_http_address.is_some() {
+            bail!("network.kodo_http_address is required exactly when Kodo cleanup is enabled");
+        }
+        if self.network.kodo_http_address.is_some_and(|address| {
+            address.port() == self.network.tcp_address.port()
+                || address.port() == self.network.http_address.port()
+        }) {
+            bail!("network.kodo_http_address must use a dedicated port");
+        }
         if self.shutdown.grace_seconds == 0 {
             bail!("shutdown.grace_seconds must be greater than zero");
         }
@@ -391,6 +427,7 @@ impl Config {
             self.security.publish_token_file.as_ref(),
             self.security.registry_token_file.as_ref(),
             self.security.console_token_file.as_ref(),
+            self.security.kodo_cleanup_token_file.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -401,6 +438,24 @@ impl Config {
         }
         if self.security.console_management_enabled && self.security.console_token_file.is_none() {
             bail!("security.console_token_file is required when console management is enabled");
+        }
+        if self.security.kodo_cleanup_enabled && self.security.kodo_cleanup_token_file.is_none() {
+            bail!("security.kodo_cleanup_token_file is required when Kodo cleanup is enabled");
+        }
+        if self.security.kodo_cleanup_enabled {
+            let cleanup = self
+                .read_kodo_cleanup_token()?
+                .context("Kodo cleanup token is unavailable")?;
+            for (scope, token) in [
+                ("admin", self.read_admin_token()?),
+                ("publish", self.read_publish_token()?),
+                ("registry", self.read_registry_token()?),
+                ("console", self.read_console_token()?),
+            ] {
+                if token.as_deref() == Some(cleanup.as_str()) {
+                    bail!("Kodo cleanup token must be distinct from the {scope} token");
+                }
+            }
         }
         Ok(())
     }
@@ -419,6 +474,9 @@ impl Config {
     }
     pub fn read_console_token(&self) -> anyhow::Result<Option<String>> {
         read_optional_secret(self.security.console_token_file.as_deref())
+    }
+    pub fn read_kodo_cleanup_token(&self) -> anyhow::Result<Option<String>> {
+        read_optional_secret(self.security.kodo_cleanup_token_file.as_deref())
     }
 }
 

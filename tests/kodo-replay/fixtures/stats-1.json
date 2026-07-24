@@ -1,0 +1,29 @@
+{
+  "version": "0.8.0",
+  "health": "OK",
+  "start_time": 1700000001,
+  "topics": [{
+    "topic_name": "events",
+    "name": "events",
+    "depth": 0,
+    "memory_depth": 0,
+    "backend_depth": 0,
+    "message_count": 10,
+    "paused": false,
+    "channels": [{
+      "channel_name": "workers",
+      "name": "workers",
+      "depth": 4,
+      "memory_depth": 0,
+      "backend_depth": 4,
+      "message_count": 10,
+      "in_flight_count": 1,
+      "deferred_count": 2,
+      "requeue_count": 3,
+      "timeout_count": 4,
+      "client_count": 0,
+      "clients": [],
+      "paused": false
+    }]
+  }]
+}

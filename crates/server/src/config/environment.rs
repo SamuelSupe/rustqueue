@@ -27,6 +27,13 @@ impl Config {
         )?;
         set_from_env("RUSTQUEUE_TCP_ADDRESS", &mut self.network.tcp_address)?;
         set_from_env("RUSTQUEUE_HTTP_ADDRESS", &mut self.network.http_address)?;
+        if let Ok(value) = env::var("RUSTQUEUE_KODO_HTTP_ADDRESS") {
+            self.network.kodo_http_address = Some(
+                value
+                    .parse()
+                    .context("parse environment variable RUSTQUEUE_KODO_HTTP_ADDRESS")?,
+            );
+        }
         if let Ok(value) = env::var("RUSTQUEUE_DATA_PATH") {
             self.storage.data_path = value.into();
         }
@@ -67,6 +74,10 @@ impl Config {
         set_from_env(
             "RUSTQUEUE_HTTP_BODY_TIMEOUT_MS",
             &mut self.limits.http_body_timeout_ms,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_DISCONNECT_ON_RETRIABLE_PUBLISH_ERROR",
+            &mut self.limits.disconnect_on_retriable_publish_error,
         )?;
         set_from_env(
             "RUSTQUEUE_TCP_COMMAND_TIMEOUT_MS",

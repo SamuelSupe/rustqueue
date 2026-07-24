@@ -32,18 +32,21 @@ impl Topic {
         self.persist_channel(channel, ChannelCommand::Pause { paused })
     }
 
-    pub fn stats(&self) -> TopicStats {
+    pub fn stats(&mut self) -> TopicStats {
         let last = self.last_position();
+        let now_ms = now_ms();
+        let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();
         let mut channels: Vec<_> = self
             .channels
-            .values()
-            .map(|channel| channel.state.stats(last))
+            .values_mut()
+            .map(|channel| channel.state.stats(last, &scheduled, now_ms))
             .collect();
         channels.sort_by(|left, right| left.name.cmp(&right.name));
         TopicStats {
             name: self.name.clone(),
             paused: self.manifest.paused,
+            published_count: self.published_count,
             message_count: self.messages.total_count(),
             segment_count,
             segment_bytes,
@@ -51,8 +54,10 @@ impl Topic {
         }
     }
 
-    pub fn add_aggregate_stats(&self, aggregate: &mut QueueAggregateStats) {
+    pub fn add_aggregate_stats(&mut self, aggregate: &mut QueueAggregateStats) {
         let last = self.last_position();
+        let now_ms = now_ms();
+        let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();
         aggregate.topic_count = aggregate.topic_count.saturating_add(1);
         aggregate.message_count = aggregate
@@ -60,8 +65,9 @@ impl Topic {
             .saturating_add(self.messages.total_count());
         aggregate.segment_count = aggregate.segment_count.saturating_add(segment_count);
         aggregate.segment_bytes = aggregate.segment_bytes.saturating_add(segment_bytes);
-        for channel in self.channels.values() {
-            let (depth, in_flight, deferred, ack_gap) = channel.state.metric_counts(last);
+        for channel in self.channels.values_mut() {
+            let (depth, in_flight, deferred, ack_gap) =
+                channel.state.metric_counts(last, &scheduled, now_ms);
             aggregate.channel_count = aggregate.channel_count.saturating_add(1);
             aggregate.channel_depth = aggregate.channel_depth.saturating_add(depth);
             aggregate.channel_in_flight = aggregate.channel_in_flight.saturating_add(in_flight);
@@ -186,17 +192,40 @@ impl Topic {
         Ok(self.log.scrub_targets(false)?)
     }
 
-    pub fn sync(&self) -> Result<(), BrokerError> {
+    pub fn sync(&mut self) -> Result<(), BrokerError> {
         self.log.sync()?;
+        self.checkpoint_channels()?;
         store_atomic(&self.manifest_path, &self.manifest)?;
         Ok(())
     }
 
-    pub fn expire_in_flight(&mut self) -> usize {
+    pub fn expire_in_flight(&mut self) -> Result<usize, BrokerError> {
         self.channels
             .values_mut()
-            .map(|channel| channel.state.expire_in_flight())
-            .sum()
+            .try_fold(0usize, |total, channel| {
+                Ok(total.saturating_add(channel.expire_in_flight()?))
+            })
+    }
+
+    pub fn expire_channel_in_flight(&mut self, channel: &str) -> Result<usize, BrokerError> {
+        self.channels
+            .get_mut(channel)
+            .ok_or(BrokerError::ChannelNotFound)?
+            .expire_in_flight()
+    }
+
+    pub fn has_expired_in_flight(&self) -> bool {
+        self.channels
+            .values()
+            .any(|channel| channel.has_expired_in_flight())
+    }
+
+    pub fn channel_has_expired_in_flight(&self, channel: &str) -> Result<bool, BrokerError> {
+        Ok(self
+            .channels
+            .get(channel)
+            .ok_or(BrokerError::ChannelNotFound)?
+            .has_expired_in_flight())
     }
 
     pub fn checkpoint_channels(&mut self) -> Result<(), BrokerError> {

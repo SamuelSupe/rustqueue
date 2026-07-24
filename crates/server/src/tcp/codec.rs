@@ -35,29 +35,37 @@ impl From<std::io::Error> for CommandReadError {
     }
 }
 
-pub(super) async fn read_initial_command(
-    stream: &mut TcpStream,
+pub(super) async fn read_initial_command<R>(
+    stream: &mut R,
     config: &Config,
     admission: &PublishAdmission,
     connection_budget: &ConnectionBudget,
-) -> Result<ParsedCommand, CommandReadError> {
-    let mut line = Vec::with_capacity(64);
-    loop {
-        let byte = stream.read_u8().await?;
-        line.push(byte);
-        if byte == b'\n' {
-            break;
-        }
-        if line.len() > 1024 {
-            return Err(CommandReadError::protocol(
-                "E_INVALID",
-                "command line exceeds limit",
-            ));
-        }
-    }
+) -> Result<ParsedCommand, CommandReadError>
+where
+    R: AsyncRead + Unpin,
+{
+    let handshake_timeout = Duration::from_millis(config.limits.client_handshake_timeout_ms);
+    let first = tokio::time::timeout(handshake_timeout, stream.read_u8())
+        .await
+        .map_err(|_| CommandReadError::protocol("E_INVALID", "initial command timed out"))??;
+    let line = tokio::time::timeout(handshake_timeout, read_command_line(stream, first))
+        .await
+        .map_err(|_| CommandReadError::protocol("E_INVALID", "initial command timed out"))??;
     let command = parse_command(&line)?;
-    let (body, reservation) =
-        read_command_body(stream, &command, config, admission, connection_budget).await?;
+    let body_timeout = if matches!(
+        command,
+        Command::Publish { .. } | Command::MultiPublish { .. } | Command::DeferredPublish { .. }
+    ) {
+        Duration::from_millis(config.limits.tcp_command_timeout_ms)
+    } else {
+        handshake_timeout
+    };
+    let (body, reservation) = tokio::time::timeout(
+        body_timeout,
+        read_command_body(stream, &command, config, admission, connection_budget),
+    )
+    .await
+    .map_err(|_| CommandReadError::protocol("E_INVALID", "initial command body timed out"))??;
     Ok(ParsedCommand {
         command,
         body,
@@ -94,6 +102,21 @@ async fn read_started_command<R>(
 where
     R: AsyncRead + Unpin,
 {
+    let line = read_command_line(reader, first).await?;
+    let command = parse_command(&line)?;
+    let (body, reservation) =
+        read_command_body(reader, &command, config, admission, connection_budget).await?;
+    Ok(ParsedCommand {
+        command,
+        body,
+        publish_reservation: reservation,
+    })
+}
+
+async fn read_command_line<R>(reader: &mut R, first: u8) -> Result<Vec<u8>, CommandReadError>
+where
+    R: AsyncRead + Unpin,
+{
     let mut line = Vec::with_capacity(64);
     line.push(first);
     while line.last() != Some(&b'\n') {
@@ -105,14 +128,7 @@ where
             ));
         }
     }
-    let command = parse_command(&line)?;
-    let (body, reservation) =
-        read_command_body(reader, &command, config, admission, connection_budget).await?;
-    Ok(ParsedCommand {
-        command,
-        body,
-        publish_reservation: reservation,
-    })
+    Ok(line)
 }
 
 async fn read_command_body<R>(
@@ -491,5 +507,27 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn first_publish_body_uses_command_timeout_not_handshake_timeout() {
+        let (mut peer, mut server) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            peer.write_all(b"PUB events\n\0\0\0\x04").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            peer.write_all(b"body").await.unwrap();
+        });
+        let mut config = Config::default();
+        config.limits.client_handshake_timeout_ms = 10;
+        config.limits.tcp_command_timeout_ms = 100;
+        let metrics = Arc::new(Metrics::default());
+        let admission = PublishAdmission::new(config.limits.node_publish_inflight_bytes, metrics);
+        let connection = ConnectionBudget::new(config.limits.connection_publish_inflight_bytes);
+        let command = read_initial_command(&mut server, &config, &admission, &connection)
+            .await
+            .unwrap();
+        assert!(matches!(command.command, Command::Publish { .. }));
+        assert_eq!(command.body.as_deref(), Some(b"body".as_slice()));
+        writer.await.unwrap();
     }
 }

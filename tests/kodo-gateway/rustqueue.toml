@@ -1,0 +1,18 @@
+[storage]
+data_path = "/data"
+feature_level = 2
+max_segment_bytes = 268435456
+min_free_bytes = 0
+protective_eviction_enabled = false
+
+[queue]
+max_message_bytes = 104857600
+
+[limits]
+max_body_bytes = 134217728
+node_publish_inflight_bytes = 1073741824
+connection_publish_inflight_bytes = 167772160
+node_delivery_inflight_bytes = 536870912
+connection_delivery_inflight_bytes = 134217728
+tcp_command_timeout_ms = 120000
+http_body_timeout_ms = 120000

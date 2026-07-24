@@ -37,6 +37,7 @@ impl<'a> StatusBuilder<'a> {
                 operation_history: previous.operation_history,
                 orphaned_pvcs: previous.orphaned_pvcs,
                 desired_storage_size: cluster.spec.storage_size.clone(),
+                kodo_producer_restart_baseline_nonce: previous.kodo_producer_restart_baseline_nonce,
             },
         }
     }
@@ -94,6 +95,7 @@ impl<'a> StatusBuilder<'a> {
         let started_at = current
             .as_ref()
             .filter(|operation| operation.id == update.id)
+            .filter(|operation| !resume_resets_operation_clock(&operation.phase, update.phase))
             .map(|operation| operation.started_at.clone())
             .unwrap_or_else(|| timestamp.clone());
         if let Some(previous) = current.filter(|operation| operation.id != update.id) {
@@ -135,9 +137,22 @@ impl<'a> StatusBuilder<'a> {
         self
     }
 
+    pub fn kodo_producer_restart_baseline_nonce(mut self, nonce: Option<String>) -> Self {
+        self.status.kodo_producer_restart_baseline_nonce = nonce;
+        self
+    }
+
     pub fn build(self) -> RustQueueStatus {
         self.status
     }
+}
+
+fn resume_resets_operation_clock(previous: &str, next: &str) -> bool {
+    matches!(previous, "Paused" | "AwaitingCanaryApproval" | "Blocked")
+        && !matches!(
+            next,
+            "Paused" | "AwaitingCanaryApproval" | "Blocked" | "Completed" | "Failed"
+        )
 }
 
 pub(super) fn operation_id(kind: &str, target: &str, revision: &str) -> String {
@@ -206,6 +221,7 @@ mod tests {
                 proxy_node_selector: BTreeMap::new(),
                 proxy_tcp_max_connection_age_seconds: 300,
                 discovery_replicas: 2,
+                kodo_compatibility: crate::crd::KodoCompatibility::default(),
                 maintenance: None,
                 rollout: RolloutPolicy::default(),
                 broker_scheduling: BrokerScheduling::default(),
@@ -286,5 +302,49 @@ mod tests {
             .operation(update())
             .build();
         assert_eq!(second.current_operation.unwrap().completed_at, first);
+    }
+
+    #[test]
+    fn resuming_a_human_gate_restarts_the_operation_timeout_clock() {
+        let mut resource = cluster();
+        resource.status = Some(
+            StatusBuilder::new(&resource, 3, 3, 1)
+                .operation(OperationUpdate {
+                    id: "rollout-1",
+                    kind: "Rollout",
+                    phase: "Paused",
+                    target: "queue:v2",
+                    revision: "r2",
+                    message: "paused",
+                    previous_image: Some("queue:v1".into()),
+                    current_broker: None,
+                })
+                .build(),
+        );
+        resource
+            .status
+            .as_mut()
+            .unwrap()
+            .current_operation
+            .as_mut()
+            .unwrap()
+            .started_at = "2000-01-01T00:00:00Z".into();
+
+        let resumed = StatusBuilder::new(&resource, 3, 3, 1)
+            .operation(OperationUpdate {
+                id: "rollout-1",
+                kind: "Rollout",
+                phase: "Draining",
+                target: "queue:v2",
+                revision: "r2",
+                message: "running",
+                previous_image: Some("queue:v1".into()),
+                current_broker: Some("queue-2".into()),
+            })
+            .build()
+            .current_operation
+            .unwrap();
+        assert_ne!(resumed.started_at, "2000-01-01T00:00:00Z");
+        assert!(!resume_resets_operation_clock("Draining", "Replacing"));
     }
 }

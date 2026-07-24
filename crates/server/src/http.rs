@@ -1,16 +1,22 @@
 mod compat;
 mod helpers;
+mod kodo_compat;
 mod manage;
 mod native;
+mod nsq_stats;
+mod tokens;
 
 use compat::*;
 use helpers::*;
 use manage::*;
 use native::*;
+use nsq_stats::*;
+use tokens::TokenSet;
 
 use crate::admission::PublishAdmission;
 use crate::config::Config;
 use crate::metrics::Metrics;
+use crate::subscriptions::SubscriptionRegistry;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
@@ -27,18 +33,19 @@ use tokio::net::TcpListener;
 use tower_http::timeout::RequestBodyTimeoutLayer;
 use tracing::info;
 
+pub(crate) use kodo_compat::serve_kodo_compat;
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Config>,
     broker: Arc<Broker>,
     metrics: Arc<Metrics>,
-    admin_token: Option<Arc<str>>,
-    publish_token: Option<Arc<str>>,
-    registry_token: Option<Arc<str>>,
-    console_token: Option<Arc<str>>,
+    tokens: TokenSet,
     accepting: Arc<AtomicBool>,
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
+    subscriptions: SubscriptionRegistry,
+    started_at: i64,
 }
 
 #[derive(Debug)]
@@ -80,6 +87,7 @@ struct StatsQuery {
     format: Option<String>,
     topic: Option<String>,
     channel: Option<String>,
+    include_clients: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +106,7 @@ struct Producer {
     version: &'static str,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: Arc<Config>,
     broker: Arc<Broker>,
@@ -105,19 +114,18 @@ pub async fn serve(
     accepting: Arc<AtomicBool>,
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
+    subscriptions: SubscriptionRegistry,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let state = AppState {
-        admin_token: config.read_admin_token()?.map(Arc::from),
-        publish_token: config.read_publish_token()?.map(Arc::from),
-        registry_token: config.read_registry_token()?.map(Arc::from),
-        console_token: config.read_console_token()?.map(Arc::from),
-        config: Arc::clone(&config),
+    let state = app_state(
+        config,
         broker,
         metrics,
         accepting,
         delivering,
         publish_admission,
-    };
+        subscriptions,
+    )?;
     let mut router = Router::new()
         .route("/ping", get(ping))
         .route("/info", get(info_handler))
@@ -149,19 +157,74 @@ pub async fn serve(
         .route("/v1/observe/head", get(observe_head))
         .route("/v1/storage/scrub", post(scrub))
         .layer(middleware::from_fn(nsq_content_negotiation));
-    if config.security.console_management_enabled {
+    if state.config.security.console_management_enabled {
         router = router
             .route("/v1/manage/topics/{action}", post(manage_topic))
             .route("/v1/manage/channels/{action}", post(manage_channel))
             .route("/v1/manage/fences/sync", post(sync_fences));
+    } else if state.config.security.kodo_cleanup_enabled {
+        router = router.route(
+            "/v1/manage/channels/delete-if-idle",
+            post(delete_idle_channel),
+        );
     }
+    let timeout = state.config.limits.http_body_timeout_ms;
+    let address = state.config.network.http_address;
+    let tokens = state.tokens.clone();
+    let token_shutdown = shutdown.clone();
     let router = router.with_state(state).layer(RequestBodyTimeoutLayer::new(
-        std::time::Duration::from_millis(config.limits.http_body_timeout_ms),
+        std::time::Duration::from_millis(timeout),
     ));
-    let listener = TcpListener::bind(config.network.http_address).await?;
-    info!(address = %config.network.http_address, "HTTP API listening");
-    axum::serve(listener, router).await?;
+    let listener = TcpListener::bind(address).await?;
+    info!(%address, "HTTP API listening");
+    let reloader = tokio::spawn(tokens.reload(token_shutdown));
+    let result = axum::serve(listener, router)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown))
+        .await;
+    reloader.abort();
+    result?;
     Ok(())
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+fn app_state(
+    config: Arc<Config>,
+    broker: Arc<Broker>,
+    metrics: Arc<Metrics>,
+    accepting: Arc<AtomicBool>,
+    delivering: Arc<AtomicBool>,
+    publish_admission: Arc<PublishAdmission>,
+    subscriptions: SubscriptionRegistry,
+) -> anyhow::Result<AppState> {
+    Ok(AppState {
+        tokens: TokenSet::from_config(&config)?,
+        config: Arc::clone(&config),
+        broker,
+        metrics,
+        accepting,
+        delivering,
+        publish_admission,
+        subscriptions,
+        started_at: unix_seconds(),
+    })
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
 }
 
 async fn nsq_content_negotiation(request: Request<Body>, next: Next) -> Response {
@@ -202,6 +265,13 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+    fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            detail: detail.into(),
+        }
+    }
     fn timeout(code: &'static str, detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::REQUEST_TIMEOUT,
@@ -220,6 +290,7 @@ impl From<BrokerError> for ApiError {
             BrokerError::InvalidTopic => (StatusCode::BAD_REQUEST, "E_BAD_TOPIC"),
             BrokerError::ChannelNotFound => (StatusCode::NOT_FOUND, "E_BAD_CHANNEL"),
             BrokerError::ChannelTombstoned => (StatusCode::CONFLICT, "E_CHANNEL_TOMBSTONED"),
+            BrokerError::ChannelNotIdle { .. } => (StatusCode::CONFLICT, "E_CHANNEL_NOT_IDLE"),
             BrokerError::ManagementUnavailable => {
                 (StatusCode::SERVICE_UNAVAILABLE, "E_MANAGEMENT_UNAVAILABLE")
             }
@@ -233,9 +304,10 @@ impl From<BrokerError> for ApiError {
             | BrokerError::PublishWorkerLimit
             | BrokerError::ChannelWorkerLimit
             | BrokerError::ChannelLimit => (StatusCode::TOO_MANY_REQUESTS, "E_THROTTLED"),
-            BrokerError::StorageUnavailable | BrokerError::Storage(_) | BrokerError::Io(_) => {
-                (StatusCode::SERVICE_UNAVAILABLE, "E_STORAGE")
-            }
+            BrokerError::StorageUnavailable
+            | BrokerError::Storage(_)
+            | BrokerError::Io(_)
+            | BrokerError::InvalidRecord(_) => (StatusCode::SERVICE_UNAVAILABLE, "E_STORAGE"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "E_INTERNAL"),
         };
         Self {
@@ -286,6 +358,13 @@ mod tests {
     }
 
     #[test]
+    fn durable_record_failures_are_reported_as_storage_unavailable() {
+        let error = ApiError::from(BrokerError::InvalidRecord("corrupt local state".into()));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.code, "E_STORAGE");
+    }
+
+    #[test]
     fn registry_exposes_channel_names_instead_of_internal_stats() {
         let topics = registry_topics(&BrokerStats {
             publish_group_commit: Default::default(),
@@ -296,14 +375,18 @@ mod tests {
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,
+                published_count: 3,
                 message_count: 3,
                 segment_count: 1,
                 segment_bytes: 256,
                 channels: vec![ChannelStats {
                     name: "workers".into(),
                     depth: 2,
+                    message_count: 3,
                     in_flight_count: 1,
                     deferred_count: 0,
+                    requeue_count: 0,
+                    timeout_count: 0,
                     paused: false,
                     ephemeral: false,
                     ack_cursor: 1,
@@ -321,13 +404,24 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer console-secret"),
         );
-        assert!(authorize(&headers, Some("console-secret"), "console").is_ok());
-        assert!(authorize(&headers, Some("admin-secret"), "admin").is_err());
-        assert!(authorize_any(
-            &headers,
-            &[Some("registry-secret"), Some("console-secret")],
-            "read-only"
-        )
-        .is_ok());
+        let console = tokens::TokenSource::fixed("console", "console-secret");
+        let admin = tokens::TokenSource::fixed("admin", "admin-secret");
+        let registry = tokens::TokenSource::fixed("registry", "registry-secret");
+        assert!(authorize(&headers, &console, "console").is_ok());
+        assert!(authorize(&headers, &admin, "admin").is_err());
+        assert!(authorize_any(&headers, &[&registry, &console], "read-only").is_ok());
+    }
+
+    #[test]
+    fn kodo_cleanup_token_is_distinct_from_admin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer cleanup-secret"),
+        );
+        let cleanup = tokens::TokenSource::fixed("Kodo cleanup", "cleanup-secret");
+        let admin = tokens::TokenSource::fixed("admin", "admin-secret");
+        assert!(authorize(&headers, &cleanup, "Kodo cleanup").is_ok());
+        assert!(authorize(&headers, &admin, "admin").is_err());
     }
 }

@@ -15,3 +15,5 @@ pub const HEARTBEAT: &[u8] = b"_heartbeat_";
 pub const OK: &[u8] = b"OK";
 pub const CLOSE_WAIT: &[u8] = b"CLOSE_WAIT";
 pub const MESSAGE_ID_LEN: usize = 16;
+pub const MAX_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
+pub const MAX_BATCH_BYTES: usize = 128 * 1024 * 1024;

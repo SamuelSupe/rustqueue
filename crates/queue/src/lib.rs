@@ -19,8 +19,8 @@ pub use delivery_budget::DeliveryHold;
 pub use delivery_guard::DeliveryGuard;
 pub use eviction::ProtectiveEviction;
 pub use management::{
-    ChannelFence, ChannelManagementAction, ManagementFenceSnapshot, ManagementResult,
-    TopicManagementAction,
+    ChannelFence, ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot,
+    ManagementResult, TopicManagementAction,
 };
 pub use model::{
     BrokerLatencyStats, BrokerStats, ChannelGroupCommitStats, ChannelStats, Delivery,

@@ -31,6 +31,7 @@ impl Broker {
     ) -> Result<DeliveryBatch, BrokerError> {
         self.ensure_storage_healthy()?;
         self.ensure_management_access(topic, Some(channel))?;
+        self.expire_channel_in_flight(topic, channel).await?;
         let handle = self.topic(topic)?;
         let mut wake = handle.wake.subscribe();
         let timeout = timeout.unwrap_or(self.inner.config.message_timeout);

@@ -154,6 +154,9 @@ impl Topic {
             message_id: id,
             available_at_ms,
             attempts,
+            cumulative_count: runtime
+                .durable_counters
+                .then(|| runtime.state.next_requeue_count()),
         })
     }
 

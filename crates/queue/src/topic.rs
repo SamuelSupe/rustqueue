@@ -39,6 +39,8 @@ pub(crate) struct Topic {
     messages: MessageIndex,
     channels: HashMap<String, ChannelRuntime>,
     max_ack_gap: usize,
+    durable_channel_counters: bool,
+    published_count: u64,
 }
 
 impl TopicHandle {
@@ -106,6 +108,8 @@ impl TopicHandle {
                 messages: MessageIndex::new(index_cache),
                 channels: HashMap::new(),
                 max_ack_gap,
+                durable_channel_counters: storage_feature_level >= 2,
+                published_count: 0,
             }),
             wake,
         }))
@@ -160,10 +164,16 @@ impl Topic {
             }
             let mut path_messages = Vec::new();
             for location in log.locations_for_segment(&path)? {
-                let record = log.read_location(&location)?;
-                if record.kind == RecordKind::PublishBatch {
-                    path_messages.extend(batch::metas(&record, &location)?);
-                }
+                let messages =
+                    log.read_location_with(&location, |header, payload_len, reader| match header
+                        .kind
+                    {
+                        RecordKind::PublishBatch => {
+                            batch::metas_from_reader(header, payload_len, reader, &location)
+                        }
+                        _ => Ok(Vec::new()),
+                    })?;
+                path_messages.extend(messages);
             }
             if immutable {
                 log.persist_recovery_index(&path, recovery::encode(path_messages.iter()))?;
@@ -182,6 +192,7 @@ impl Topic {
             manifest.next_position = recovered_next;
             store_atomic(&manifest_path, &manifest)?;
         }
+        let published_count = manifest.next_position.saturating_sub(1);
         Ok(Self {
             name: manifest.name.clone(),
             directory: directory.into(),
@@ -191,6 +202,8 @@ impl Topic {
             messages,
             channels: HashMap::new(),
             max_ack_gap,
+            durable_channel_counters: storage_feature_level >= 2,
+            published_count,
         })
     }
 
@@ -212,6 +225,7 @@ impl Topic {
                 ChannelRuntime {
                     state,
                     store: Some(store),
+                    durable_counters: self.durable_channel_counters,
                 },
             );
         }
@@ -250,6 +264,9 @@ impl Topic {
         let metas = batch::metas_after_append(timestamp_ns, available_at_ms, &location, &batch);
         let ids = metas.iter().map(|message| message.id).collect();
         self.messages.append(metas, reservation)?;
+        self.published_count = self
+            .published_count
+            .saturating_add(batch.entries.len() as u64);
         if previous_segment != self.log.current_segment_path() {
             self.persist_segment_index(&previous_segment)?;
         }
@@ -348,8 +365,14 @@ impl Topic {
                 &state,
             )?)
         };
-        self.channels
-            .insert(name.into(), ChannelRuntime { state, store });
+        self.channels.insert(
+            name.into(),
+            ChannelRuntime {
+                state,
+                store,
+                durable_counters: self.durable_channel_counters,
+            },
+        );
         Ok(true)
     }
 
@@ -368,6 +391,21 @@ impl Topic {
         let mut names: Vec<_> = self.channels.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn channel_counts(&mut self, channel: &str) -> Result<(u64, u64, u64), BrokerError> {
+        let now_ms = now_ms();
+        let scheduled = self.messages.deferred_positions(now_ms);
+        let last_position = self.last_position();
+        let channel = self
+            .channels
+            .get(channel)
+            .ok_or(BrokerError::ChannelNotFound)?;
+        let (depth, in_flight, deferred, _) =
+            channel
+                .state
+                .metric_counts(last_position, &scheduled, now_ms);
+        Ok((depth, in_flight, deferred))
     }
 
     #[cfg(test)]

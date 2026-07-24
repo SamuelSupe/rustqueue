@@ -261,7 +261,9 @@ async fn protective_eviction_persists_channel_gap_and_audit_before_deleting() {
     assert_eq!(report.topic, "events");
     assert_eq!(report.messages, 1);
     assert_eq!(report.through_position, 1);
-    assert_eq!(broker.stats().topics[0].channels[0].ack_cursor, 1);
+    let channel = &broker.stats().topics[0].channels[0];
+    assert_eq!(channel.ack_cursor, 1);
+    assert_eq!(channel.message_count, 3);
     assert_eq!(
         std::fs::read_dir(root.path().join("audit"))
             .unwrap()
@@ -271,6 +273,7 @@ async fn protective_eviction_persists_channel_gap_and_audit_before_deleting() {
     drop(broker);
 
     let broker = Broker::open(config(root.path())).unwrap();
+    assert_eq!(broker.stats().topics[0].channels[0].message_count, 3);
     let next = broker
         .next_message("events", "workers", None)
         .await

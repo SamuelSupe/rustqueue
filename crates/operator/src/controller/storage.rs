@@ -169,16 +169,16 @@ fn claim_ordinal(name: &str, cluster: &str) -> Option<u32> {
     name.strip_prefix(&format!("data-{cluster}-"))?.parse().ok()
 }
 
-fn parse_quantity(value: &str) -> anyhow::Result<u128> {
+pub(super) fn parse_quantity(value: &str) -> anyhow::Result<u128> {
     let split = value
         .find(|character: char| !character.is_ascii_digit() && character != '.')
         .unwrap_or(value.len());
     let (number, suffix) = value.split_at(split);
-    anyhow::ensure!(!number.is_empty(), "invalid storage quantity {value}");
+    anyhow::ensure!(!number.is_empty(), "invalid resource quantity {value}");
     let number: f64 = number.parse()?;
     anyhow::ensure!(
         number.is_finite() && number >= 0.0,
-        "invalid storage quantity {value}"
+        "invalid resource quantity {value}"
     );
     let multiplier = match suffix {
         "" => 1_u128,
@@ -194,7 +194,7 @@ fn parse_quantity(value: &str) -> anyhow::Result<u128> {
         "Ti" => 1_u128 << 40,
         "Pi" => 1_u128 << 50,
         "Ei" => 1_u128 << 60,
-        _ => anyhow::bail!("unsupported storage quantity suffix in {value}"),
+        _ => anyhow::bail!("unsupported resource quantity suffix in {value}"),
     };
     Ok((number * multiplier as f64) as u128)
 }

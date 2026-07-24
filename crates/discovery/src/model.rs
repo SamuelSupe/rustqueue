@@ -116,4 +116,18 @@ impl Producer {
             node_id: registry.node_id,
         }
     }
+
+    pub fn gateway(address: String, ordinal: usize) -> Self {
+        let tcp_port = [4150, 4152, 4153].get(ordinal).copied().unwrap_or(4150);
+        let http_port = [4151, 4154, 4155].get(ordinal).copied().unwrap_or(4151);
+        Self {
+            remote_address: format!("{address}:{tcp_port}"),
+            hostname: address.clone(),
+            broadcast_address: address,
+            tcp_port,
+            http_port,
+            version: env!("CARGO_PKG_VERSION").into(),
+            node_id: 1_000_000u64.saturating_add(ordinal as u64),
+        }
+    }
 }

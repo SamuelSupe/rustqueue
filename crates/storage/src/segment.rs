@@ -13,7 +13,9 @@ mod scrub;
 
 use crate::{crash_failpoint, Record, RecordHeader, BASE_STORAGE_FEATURE_LEVEL, HEADER_LEN};
 use append::write_parts;
-use files::{read_record, scan_segment, segment_base_index, segment_path, segment_paths};
+use files::{
+    read_record, scan_segment, segment_base_index, segment_path, segment_paths, visit_record,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -279,13 +281,23 @@ impl SegmentLog {
         durable: bool,
     ) -> Result<RecordLocation, StorageError> {
         self.ensure_available()?;
-        let required = record.kind.required_writer_feature_level();
+        let payload_len = payload
+            .iter()
+            .try_fold(0usize, |total, part| total.checked_add(part.len()))
+            .ok_or_else(|| {
+                StorageError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "record payload length overflow",
+                ))
+            })?;
+        let required = record.kind.required_writer_feature_level(payload_len);
         if required > self.active_writer_feature_level {
             return Err(StorageError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "record kind {:?} requires writer feature level {required}, active level is {}",
-                    record.kind, self.active_writer_feature_level
+                    "record kind {:?} with {payload_len} payload bytes requires writer feature level {required}, active level is {}",
+                    record.kind,
+                    self.active_writer_feature_level
                 ),
             )));
         }
@@ -373,17 +385,16 @@ impl SegmentLog {
     }
 
     pub fn read_location(&self, location: &RecordLocation) -> Result<Record, StorageError> {
-        let result = read_record(location).and_then(|record| {
-            if record.index != location.index {
-                return Err(StorageError::Corrupt {
-                    path: location.segment.as_ref().clone(),
-                    offset: location.offset,
-                    reason: "recovery index points at a different record".into(),
-                });
-            }
-            Ok(record)
-        });
+        let result = read_record(location);
         self.observe_read(result)
+    }
+
+    pub fn read_location_with<T>(
+        &self,
+        location: &RecordLocation,
+        visitor: impl FnOnce(RecordHeader, usize, &mut dyn io::Read) -> io::Result<T>,
+    ) -> Result<T, StorageError> {
+        self.observe_read(visit_record(location, visitor))
     }
 
     pub fn read_all(&self) -> Result<Vec<Record>, StorageError> {

@@ -62,12 +62,10 @@ pub(super) async fn registry(
 ) -> Result<Json<Value>, ApiError> {
     authorize_any(
         &headers,
-        &[
-            state.registry_token.as_deref(),
-            state.console_token.as_deref(),
-        ],
+        &[&state.tokens.registry, &state.tokens.console],
         "registry or console",
     )?;
+    state.broker.expire_in_flight().await?;
     let stats = state.broker.stats();
     let topics = registry_topics(&stats);
     let (stored_messages, depth, in_flight) = backlog(&stats);
@@ -83,7 +81,8 @@ pub(super) async fn registry(
         && management_ready
         && storage_ready
         && (process_ready || stored_messages > 0 || depth > 0 || in_flight > 0);
-    let (binary, storage) = state.broker.capabilities();
+    let (_, storage) = state.broker.capabilities();
+    let binary = crate::config::runtime_capabilities();
     Ok(Json(json!({
         "format": 7,
         "revision": state.broker.registry_revision(),
@@ -108,10 +107,7 @@ pub(super) async fn registry_head(
 ) -> Result<Json<Value>, ApiError> {
     authorize_any(
         &headers,
-        &[
-            state.registry_token.as_deref(),
-            state.console_token.as_deref(),
-        ],
+        &[&state.tokens.registry, &state.tokens.console],
         "registry or console",
     )?;
     let process_ready = state.accepting.load(Ordering::Acquire);
@@ -138,13 +134,11 @@ pub(super) async fn capabilities(
 ) -> Result<Json<Value>, ApiError> {
     authorize_any(
         &headers,
-        &[
-            state.registry_token.as_deref(),
-            state.console_token.as_deref(),
-        ],
+        &[&state.tokens.registry, &state.tokens.console],
         "registry or console",
     )?;
-    let (binary, storage) = state.broker.capabilities();
+    let (_, storage) = state.broker.capabilities();
+    let binary = crate::config::runtime_capabilities();
     Ok(Json(json!({"binary": binary, "storage": storage})))
 }
 
@@ -174,13 +168,10 @@ pub(super) async fn drain_status(
 ) -> Result<Json<Value>, ApiError> {
     authorize_any(
         &headers,
-        &[
-            state.registry_token.as_deref(),
-            state.console_token.as_deref(),
-        ],
+        &[&state.tokens.registry, &state.tokens.console],
         "registry or console",
     )?;
-    state.broker.expire_in_flight();
+    state.broker.expire_in_flight().await?;
     let stats = state.broker.metrics_stats(false, 0);
     let (stored_messages, depth, in_flight) = backlog(&stats);
     let draining = !state.accepting.load(Ordering::Acquire);
@@ -212,7 +203,7 @@ pub(super) async fn set_drain(
     headers: HeaderMap,
     Json(request): Json<DrainRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state.accepting.store(!request.enabled, Ordering::Release);
     state.delivering.store(
         !request.enabled || !request.freeze_deliveries,
@@ -223,7 +214,7 @@ pub(super) async fn set_drain(
         freeze_deliveries = request.freeze_deliveries,
         "broker drain state changed"
     );
-    state.broker.expire_in_flight();
+    state.broker.expire_in_flight().await?;
     let stats = state.broker.metrics_stats(false, 0);
     let (stored_messages, depth, in_flight) = backlog(&stats);
     let publish_inflight_bytes = state.metrics.publish_inflight_bytes.load(Ordering::Acquire);
@@ -252,25 +243,25 @@ pub(super) async fn set_drain(
 pub(super) async fn native_stats(
     State(state): State<AppState>,
     Query(query): Query<StatsQuery>,
-) -> Json<Value> {
-    let filtered = filter_stats(
-        state.broker.stats(),
-        query.topic.as_deref(),
-        query.channel.as_deref(),
-    );
-    Json(json!({
+) -> Result<Json<Value>, ApiError> {
+    state.broker.expire_in_flight().await?;
+    let filtered = state
+        .broker
+        .filtered_stats(query.topic.as_deref(), query.channel.as_deref());
+    Ok(Json(json!({
         "complete": true,
         "node_id": state.config.node.id,
         "collected_at_ms": now_ms(),
         "topics": filtered.topics,
-    }))
+    })))
 }
 
 pub(super) async fn observe(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.console_token.as_deref(), "console")?;
+    authorize(&headers, &state.tokens.console, "console")?;
+    state.broker.expire_in_flight().await?;
     let stats = state.broker.stats();
     let segment_count = stats.aggregate.segment_count;
     let segment_bytes = stats.aggregate.segment_bytes;
@@ -294,7 +285,7 @@ pub(super) async fn observe_head(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.console_token.as_deref(), "console")?;
+    authorize(&headers, &state.tokens.console, "console")?;
     Ok(Json(observation_head(&state)))
 }
 
@@ -304,7 +295,8 @@ fn observation_head(state: &AppState) -> Value {
     let storage_healthy = state.broker.storage_healthy();
     let disk_ready = state.publish_admission.storage_ready();
     let management_ready = state.broker.management_fences_ready();
-    let (binary, storage) = state.broker.capabilities();
+    let (_, storage) = state.broker.capabilities();
+    let binary = crate::config::runtime_capabilities();
     let runtime = state.metrics.snapshot();
     json!({
         "schema_version": 1,
@@ -350,7 +342,7 @@ pub(super) async fn scrub(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     let records = state.broker.scrub().await?;
     Ok(Json(json!({"status": "ok", "records_checked": records})))
 }

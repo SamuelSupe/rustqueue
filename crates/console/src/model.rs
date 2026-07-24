@@ -318,6 +318,7 @@ mod tests {
             .push(rustqueue_queue::TopicStats {
                 name: "events".into(),
                 paused: false,
+                published_count: 0,
                 message_count: 1,
                 segment_count: 1,
                 segment_bytes: 128,

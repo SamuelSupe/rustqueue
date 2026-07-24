@@ -16,6 +16,7 @@ parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+rustqueue-protocol.workspace = true
 rustqueue-telemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true

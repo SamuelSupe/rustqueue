@@ -1,7 +1,7 @@
 # RustQueue format v7 share-nothing architecture
 
 Status: accepted implementation contract
-Target release: 0.7.2
+Target release: 0.8.0
 Data format: v7, clean directories only
 
 ## 1. Goal
@@ -60,14 +60,18 @@ There is no broker-to-broker message path and no cluster consensus path.
 ### 2.3 Bootstrap retention
 
 Every broker retains each topic message for at least 90 seconds even when no
-channel exists. When a local channel is created, its initial cursor starts at
-the oldest message still inside this bootstrap window.
+channel exists. The Kodo compatibility profile requires 180 seconds so the
+default Go consumer can survive one failed 60-second Lookupd poll, including
+its 30% initial jitter. When a local channel is created, its initial cursor
+starts at the oldest message still inside this bootstrap window.
 
 This deliberately prefers duplicates over misses during the normal discovery
 window. The guarantee is bounded:
 
 - If discovery and `SUB` complete within 90 seconds, messages accepted by a new
   fallback owner remain consumable by the newly created local channel.
+- In the Kodo profile, the equivalent bound is 180 seconds and includes a
+  second default lookup poll after one failed request.
 - A newly created channel may receive a small amount of data published before
   its `SUB`.
 - If all consumers are absent for longer than the bootstrap window and a topic
@@ -131,7 +135,9 @@ Each replica:
 3. expires stale broker observations after 5 seconds;
 4. maintains topic, channel, consumer, and publisher indexes incrementally, so
    lookup requests do not scan every Broker registry;
-5. serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, and `/info`.
+5. serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, and `/info`;
+   `/lookup` returns the healthy owners during a partial Broker outage while
+   the complete-inventory metric remains false.
 
 Discovery state is derived and is never authoritative message metadata. A
 restart reconstructs the complete index from ready brokers. Replicas do not
@@ -166,7 +172,9 @@ membership reconciler. It manages:
 - one broker StatefulSet;
 - one RWO SSD PVC per ordinal with `Retain` semantics;
 - required one-broker-per-node anti-affinity;
-- automatic scale-up to the count of eligible labelled nodes;
+- automatic scaling to the count of explicitly labelled member nodes, bounded
+  by `minBrokers` and `maxBrokers`; cordon and transient Node readiness changes
+  do not express scale-down intent;
 - conservative highest-ordinal scale-down;
 - declarative targeted Broker maintenance;
 - durable operation status and bounded operation history;

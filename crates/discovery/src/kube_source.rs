@@ -6,6 +6,7 @@ use kube::api::{Api, ListParams};
 use kube::Client;
 use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,11 +23,12 @@ pub struct RefreshConfig {
     pub poll_interval: Duration,
     pub endpoint_slice_timeout: Duration,
     pub stale_after: Duration,
-    pub registry_token: Option<String>,
+    pub registry_token_file: Option<PathBuf>,
     pub max_parallel_polls: usize,
 }
 
 pub async fn run_refresh_loop(directory: Directory, config: RefreshConfig) -> anyhow::Result<()> {
+    directory.configure_source_health(config.stale_after);
     let client = Client::try_default()
         .await
         .context("create Kubernetes client")?;
@@ -51,8 +53,21 @@ pub async fn run_refresh_loop(directory: Directory, config: RefreshConfig) -> an
         {
             Ok(Ok(slices)) => {
                 let endpoints = endpoints_from_slices(&slices.items, config.fallback_http_port);
+                let endpoints_empty = endpoints.is_empty();
                 directory.replace_endpoints(endpoints);
-                poll_registries(&directory, &http, &config).await;
+                let token = match load_registry_token(config.registry_token_file.as_deref()) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        tracing::warn!(%error, "registry token reload failed");
+                        directory.expire(config.stale_after);
+                        continue;
+                    }
+                };
+                let successful_polls =
+                    poll_registries(&directory, &http, &config, token.as_deref()).await;
+                if endpoints_empty || successful_polls > 0 {
+                    directory.mark_source_success();
+                }
             }
             Ok(Err(error)) => tracing::warn!(%error, "EndpointSlice refresh failed"),
             Err(_) => {
@@ -109,12 +124,17 @@ fn endpoints_from_slices(slices: &[EndpointSlice], fallback_port: u16) -> BTreeS
     result
 }
 
-async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: &RefreshConfig) {
+async fn poll_registries(
+    directory: &Directory,
+    http: &reqwest::Client,
+    config: &RefreshConfig,
+    token: Option<&str>,
+) -> usize {
     let permits = Arc::new(Semaphore::new(config.max_parallel_polls.max(1)));
     let mut polls = FuturesUnordered::new();
     for endpoint in directory.endpoints() {
         let http = http.clone();
-        let token = config.registry_token.clone();
+        let token = token.map(str::to_owned);
         let permits = Arc::clone(&permits);
         let metrics = directory.metrics().clone();
         let directory = directory.clone();
@@ -151,11 +171,27 @@ async fn poll_registries(directory: &Directory, http: &reqwest::Client, config: 
             Some((endpoint, Some(registry)))
         });
     }
+    let mut successful = 0;
     while let Some(observation) = polls.next().await {
-        if let Some((endpoint, Some(registry))) = observation {
-            directory.observe(endpoint, registry);
+        if let Some((endpoint, registry)) = observation {
+            successful += 1;
+            if let Some(registry) = registry {
+                directory.observe(endpoint, registry);
+            }
         }
     }
+    successful
+}
+
+fn load_registry_token(path: Option<&Path>) -> anyhow::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let token = std::fs::read_to_string(path)
+        .with_context(|| format!("read registry token file {}", path.display()))?;
+    let token = token.trim();
+    anyhow::ensure!(!token.is_empty(), "registry token file is empty");
+    Ok(Some(token.to_owned()))
 }
 
 async fn read_json_bounded<T: serde::de::DeserializeOwned>(
@@ -214,5 +250,24 @@ mod tests {
         let endpoints = endpoints_from_slices(&[slice], 9999);
         assert_eq!(endpoints.len(), 2);
         assert_eq!(endpoints.iter().next().unwrap().http_port, 4151);
+    }
+
+    #[test]
+    fn registry_token_file_is_reloaded_and_empty_values_fail_closed() {
+        let path =
+            std::env::temp_dir().join(format!("rustqueue-discovery-token-{}", std::process::id()));
+        std::fs::write(&path, "first\n").unwrap();
+        assert_eq!(
+            load_registry_token(Some(&path)).unwrap().as_deref(),
+            Some("first")
+        );
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(
+            load_registry_token(Some(&path)).unwrap().as_deref(),
+            Some("second")
+        );
+        std::fs::write(&path, " \n").unwrap();
+        assert!(load_registry_token(Some(&path)).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

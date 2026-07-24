@@ -20,6 +20,7 @@ STORAGE_CLASS_CREATED=0
 CONSOLE_FORWARD_PID=""
 
 source "$(dirname "$0")/lib/console-multi-owner.sh"
+source "$(dirname "$0")/lib/token-rotation.sh"
 
 require() {
   command -v "$1" >/dev/null || { echo "missing required command: $1" >&2; exit 1; }
@@ -30,6 +31,9 @@ diagnostics() {
   kubectl -n "$NAMESPACE" describe rustqueue "$QUEUE" || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=operator --tail=300 || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=console --tail=300 || true
+  kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=discovery --tail=300 || true
+  kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=broker --tail=300 --prefix || true
+  kubectl -n "$NAMESPACE" logs default-lookup-bootstrap --tail=300 || true
   kubectl -n "$NAMESPACE" logs operational-ledger --tail=300 || true
 }
 
@@ -71,15 +75,23 @@ wait_namespace_deleted() {
 }
 
 wait_queue_ready() {
-  local brokers=$1 deadline=$((SECONDS + ${2:-360}))
+  local brokers=$1 deadline=$((SECONDS + ${2:-360})) minimum_generation=${3:-0}
+  local active_feature_level=${4:-}
   while (( SECONDS < deadline )); do
-    local phase desired ready observed generation
-    phase=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-    desired=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.desiredBrokers}' 2>/dev/null || true)
-    ready=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.readyBrokers}' 2>/dev/null || true)
-    observed=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)
-    generation=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
-    if [[ "$phase" == "Ready" && "$desired" == "$brokers" && "$ready" == "$brokers" && "$observed" == "$generation" ]]; then
+    local queue
+    queue=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o json 2>/dev/null || true)
+    if jq -e \
+      --argjson brokers "$brokers" \
+      --argjson minimum_generation "$minimum_generation" \
+      --arg active_feature_level "$active_feature_level" \
+      '(.metadata.generation // 0) >= $minimum_generation
+        and .status.phase == "Ready"
+        and .status.desiredBrokers == $brokers
+        and .status.readyBrokers == $brokers
+        and .status.observedGeneration == .metadata.generation
+        and ($active_feature_level == ""
+          or (.status.activeStorageFeatureLevel | tostring) == $active_feature_level)' \
+      <<<"$queue" >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
@@ -331,9 +343,9 @@ require jq
 }
 
 if [[ "$BUILD_IMAGES" == "1" ]]; then
-  BUILD_VERSION=0.7.2-e2e-a MAX_STORAGE_FEATURE_LEVEL=1 make image
+  BUILD_VERSION=0.8.0-e2e-a MAX_STORAGE_FEATURE_LEVEL=1 make image
   docker tag rustqueue:dev "$BROKER_IMAGE_A"
-  BUILD_VERSION=0.7.2-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image-from-dist
+  BUILD_VERSION=0.8.0-e2e-b MAX_STORAGE_FEATURE_LEVEL=2 make image-from-dist
   docker tag rustqueue:dev "$BROKER_IMAGE_B"
   [[ "$(docker image inspect "$BROKER_IMAGE_A" -f '{{.Id}}')" != \
      "$(docker image inspect "$BROKER_IMAGE_B" -f '{{.Id}}')" ]] || {
@@ -429,6 +441,8 @@ kubectl -n "$NAMESPACE" exec "$QUEUE-0" -c broker -- \
   http://127.0.0.1:4151/v1/drain >/dev/null
 wait_queue_ready 3 120
 
+ADMIN_TOKEN=$(accept_admin_token_rotation "$NAMESPACE" "$QUEUE" 3)
+
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p "{\"spec\":{\"maintenance\":{\"broker\":\"$QUEUE-2\",\"enabled\":true}}}" >/dev/null
 wait_queue_phase Maintenance 120
@@ -517,13 +531,10 @@ kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/instance="$QUEUE",app.kube
   jq -e --arg image "$BROKER_IMAGE_B" \
     '.items | (length == 3) and all(.[]; all(.spec.containers[]; .image == $image))' >/dev/null
 
-kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
-  -p '{"spec":{"storageFeatureLevel":2,"rollout":{"requireCanaryApproval":false,"approvedRevision":null}}}' >/dev/null
-wait_queue_ready 3 420
-[[ "$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.activeStorageFeatureLevel}')" == "2" ]] || {
-  echo "feature level 2 was not activated after the compatible rollout" >&2
-  exit 1
-}
+feature_generation=$(kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p '{"spec":{"storageFeatureLevel":2,"rollout":{"requireCanaryApproval":false,"approvedRevision":null}}}' \
+  -o json | jq -r '.metadata.generation')
+wait_queue_ready 3 420 "$feature_generation" 2
 
 uids_before=$(kubectl -n "$NAMESPACE" get pods \
   -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker \

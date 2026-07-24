@@ -12,6 +12,8 @@ mod maintenance;
 mod management;
 #[path = "broker/metadata_budget.rs"]
 mod metadata_budget;
+#[path = "broker/stats.rs"]
+mod stats;
 #[path = "broker/topics.rs"]
 mod topics;
 
@@ -19,7 +21,6 @@ use crate::delivery_budget::DeliveryBudget;
 use crate::management::FenceCatalog;
 use crate::management_ops::OperationCatalog;
 use crate::metadata::{load_optional, load_topic_manifest, store_atomic, BrokerMeta};
-use crate::model::{BrokerStats, QueueAggregateStats};
 use crate::payload_reader::PayloadReader;
 use crate::telemetry::QueueMetrics;
 use crate::topic::index::MessageIndexCache;
@@ -36,6 +37,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+const FEATURE_LEVEL_2_MAX_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
@@ -100,6 +103,12 @@ pub enum BrokerError {
     ChannelNotFound,
     #[error("channel is protected by an active deletion tombstone")]
     ChannelTombstoned,
+    #[error("channel is not idle: depth={depth}, in_flight={in_flight}, deferred={deferred}")]
+    ChannelNotIdle {
+        depth: u64,
+        in_flight: u64,
+        deferred: u64,
+    },
     #[error("management fence catalog has not been synchronized")]
     ManagementUnavailable,
     #[error("registry revision conflict: expected {expected}, actual {actual}")]
@@ -186,14 +195,18 @@ impl Broker {
                 "topic and publish worker limits must be greater than zero".into(),
             ));
         }
-        if config
-            .max_message_bytes
+        let readable_message_bytes = if config.storage_feature_level >= 2 {
+            FEATURE_LEVEL_2_MAX_MESSAGE_BYTES
+        } else {
+            config.max_message_bytes
+        };
+        if readable_message_bytes
             .checked_mul(2)
             .is_none_or(|minimum| config.delivery_inflight_bytes < minimum)
             || config.delivery_inflight_bytes > u32::MAX as usize
         {
             return Err(BrokerError::InvalidRecord(
-                "delivery byte budget must fit u32 and the payload read working set".into(),
+                "delivery byte budget must fit u32 and every message readable at the active storage feature level".into(),
             ));
         }
         ensure_data_format(&config.data_path)
@@ -451,56 +464,6 @@ impl Broker {
 
     pub fn channel_names(&self, topic: &str) -> Result<Vec<String>, BrokerError> {
         Ok(self.topic(topic)?.state.lock().channel_names())
-    }
-
-    pub fn stats(&self) -> BrokerStats {
-        let mut topics: Vec<_> = self
-            .inner
-            .topics
-            .read()
-            .values()
-            .map(|topic| topic.state.lock().stats())
-            .collect();
-        topics.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut aggregate = QueueAggregateStats::default();
-        for topic in &topics {
-            aggregate.add_topic(topic);
-        }
-        BrokerStats {
-            publish_group_commit: self.inner.publish_groups.stats(),
-            channel_group_commit: self.inner.channel_groups.stats(),
-            latency: self.inner.metrics.snapshot(),
-            delivery_budget: self.inner.delivery_budget.snapshot(),
-            aggregate,
-            topics,
-        }
-    }
-
-    pub fn metrics_stats(&self, detailed: bool, max_series: usize) -> BrokerStats {
-        let mut aggregate = QueueAggregateStats::default();
-        let mut topics = Vec::new();
-        let mut remaining = max_series;
-        for handle in self.inner.topics.read().values() {
-            let topic = handle.state.lock();
-            topic.add_aggregate_stats(&mut aggregate);
-            if detailed && remaining > 0 {
-                let mut stats = topic.stats();
-                remaining = remaining.saturating_sub(1);
-                let channel_limit = remaining / 4;
-                stats.channels.truncate(channel_limit);
-                remaining = remaining.saturating_sub(stats.channels.len().saturating_mul(4));
-                topics.push(stats);
-            }
-        }
-        topics.sort_by(|left, right| left.name.cmp(&right.name));
-        BrokerStats {
-            publish_group_commit: self.inner.publish_groups.stats(),
-            channel_group_commit: self.inner.channel_groups.stats(),
-            latency: self.inner.metrics.snapshot(),
-            delivery_budget: self.inner.delivery_budget.snapshot(),
-            aggregate,
-            topics,
-        }
     }
 
     pub fn registry_revision(&self) -> u64 {

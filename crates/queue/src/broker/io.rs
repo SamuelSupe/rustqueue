@@ -60,7 +60,8 @@ impl Broker {
         self.ensure_storage_healthy()?;
         self.ensure_management_access(topic, Some(channel))?;
         let available = now_ms().saturating_add(delay.as_millis().min(i64::MAX as u128) as i64);
-        self.inner
+        let result = self
+            .inner
             .channel_groups
             .submit(
                 self,
@@ -71,7 +72,8 @@ impl Broker {
                     available_at_ms: available,
                 },
             )
-            .await
+            .await;
+        result
     }
 
     pub fn touch(
@@ -118,11 +120,12 @@ impl Broker {
         let path = self
             .storage_task(move || crate::outbox::store(&directory, &entry_for_write))
             .await?;
-        self.publish(
-            &entry.target_topic,
-            vec![entry.body.clone()],
-            Duration::ZERO,
-        )
+        let broker = self.clone();
+        let target_topic = entry.target_topic.clone();
+        let body = entry.body.clone();
+        self.storage_task(move || {
+            broker.publish_durable_body_sync(&target_topic, &[body], Duration::ZERO)
+        })
         .await?;
         self.finish_inner(
             &entry.source_topic,
@@ -135,13 +138,13 @@ impl Broker {
             .await
     }
 
-    pub(super) fn publish_sync(
+    fn publish_durable_body_sync(
         &self,
         topic: &str,
         bodies: &[Bytes],
         delay: Duration,
     ) -> Result<Vec<u64>, BrokerError> {
-        self.validate_publish_request(topic, bodies)?;
+        self.validate_publish_request_with_limit(topic, bodies, self.durable_message_read_limit())?;
         let mut metadata = self.reserve_message_metadata(bodies.len())?;
         let handle = self.get_or_create_topic(topic)?;
         let mut state = handle.state.lock();
@@ -159,6 +162,15 @@ impl Broker {
         topic: &str,
         bodies: &[Bytes],
     ) -> Result<usize, BrokerError> {
+        self.validate_publish_request_with_limit(topic, bodies, self.inner.config.max_message_bytes)
+    }
+
+    fn validate_publish_request_with_limit(
+        &self,
+        topic: &str,
+        bodies: &[Bytes],
+        max_message_bytes: usize,
+    ) -> Result<usize, BrokerError> {
         validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
         self.ensure_management_access(topic, None)?;
         if bodies.is_empty() || bodies.len() > batch::MAX_MESSAGES {
@@ -166,7 +178,7 @@ impl Broker {
         }
         if bodies
             .iter()
-            .any(|body| body.is_empty() || body.len() > self.inner.config.max_message_bytes)
+            .any(|body| body.is_empty() || body.len() > max_message_bytes)
         {
             return Err(BrokerError::MessageTooLarge);
         }
@@ -177,6 +189,14 @@ impl Broker {
             return Err(BrokerError::BatchTooLarge);
         }
         Ok(encoded_bytes.expect("validated encoded length"))
+    }
+
+    fn durable_message_read_limit(&self) -> usize {
+        if self.inner.compatibility.minimum_reader_feature_level >= 2 {
+            100 * 1024 * 1024
+        } else {
+            rustqueue_storage::LEGACY_MAX_RECORD_BYTES.saturating_sub(24)
+        }
     }
 
     pub(super) fn append_publish_to_topic(
@@ -220,7 +240,7 @@ impl Broker {
     pub(super) fn recover_outbox(&self) -> Result<(), BrokerError> {
         for path in crate::outbox::paths(&self.inner.config.data_path.join("dlq-outbox"))? {
             let entry = crate::outbox::load(&path)?;
-            self.publish_sync(&entry.target_topic, &[entry.body], Duration::ZERO)?;
+            self.publish_durable_body_sync(&entry.target_topic, &[entry.body], Duration::ZERO)?;
             let finish = self.topic(&entry.source_topic).and_then(|topic| {
                 topic
                     .state

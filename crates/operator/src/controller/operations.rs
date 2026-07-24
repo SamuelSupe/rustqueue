@@ -59,21 +59,42 @@ pub(super) async fn reconcile(
     current: i32,
     revision: &str,
     effective_image: &str,
+    disruptions_allowed: bool,
 ) -> anyhow::Result<(String, String, Option<PendingOperation>)> {
-    if desired < cluster.spec.min_brokers {
+    if insufficient_eligible_nodes(eligible, desired, cluster.spec.min_brokers) {
+        let resumed = drain::resume_all(context, cluster, namespace, auth).await?;
+        let resumed = if resumed.is_empty() {
+            String::new()
+        } else {
+            format!("; resumed disrupted Brokers {}", resumed.join(", "))
+        };
         return Ok((
             "InsufficientNodes".into(),
             format!(
-                "{eligible} eligible nodes; minimum is {}",
+                "{eligible} eligible nodes; desired is {desired} and minimum is {}{resumed}",
                 cluster.spec.min_brokers
             ),
             None,
         ));
     }
     if let Some(request) = &cluster.spec.maintenance {
-        return reconcile_maintenance(context, cluster, namespace, auth, revision, request).await;
+        if request.enabled && !disruptions_allowed {
+            drain::resume_all(context, cluster, namespace, auth).await?;
+            return Ok(waiting_for_kodo_cutover());
+        }
+        if request.enabled {
+            return reconcile_maintenance(context, cluster, namespace, auth, revision, request)
+                .await;
+        }
+        // A completed maintenance request may remain in spec. Resume its
+        // target, then continue with scale and rollout reconciliation.
+        drain::resume_one(context, namespace, &request.broker, auth).await?;
     }
     if current > desired {
+        if !disruptions_allowed {
+            drain::resume_all(context, cluster, namespace, auth).await?;
+            return Ok(waiting_for_kodo_cutover());
+        }
         return reconcile_scale_down(
             context, cluster, namespace, auth, current, desired, revision,
         )
@@ -97,6 +118,17 @@ pub(super) async fn reconcile(
     if desired == 0 {
         return Ok(("Ready".into(), "no eligible Broker nodes".into(), None));
     }
+    if !disruptions_allowed {
+        drain::resume_all(context, cluster, namespace, auth).await?;
+        if drain::brokers_current_and_ready(context, cluster, namespace, revision, current).await? {
+            return Ok((
+                "Ready".into(),
+                "all Brokers already match the target revision".into(),
+                None,
+            ));
+        }
+        return Ok(waiting_for_kodo_cutover());
+    }
     reconcile_rollout(
         context,
         cluster,
@@ -107,6 +139,21 @@ pub(super) async fn reconcile(
         effective_image,
     )
     .await
+}
+
+fn insufficient_eligible_nodes(eligible: usize, desired: i32, minimum: i32) -> bool {
+    desired < minimum
+        || usize::try_from(desired)
+            .map(|desired| eligible < desired)
+            .unwrap_or(true)
+}
+
+fn waiting_for_kodo_cutover() -> (String, String, Option<PendingOperation>) {
+    (
+        "WaitingForKodoCutover".into(),
+        "waiting for Kodo Gateway cutover safety gates before disrupting a Broker".into(),
+        None,
+    )
 }
 
 async fn reconcile_maintenance(
@@ -146,7 +193,9 @@ async fn reconcile_maintenance(
         previous_image: None,
         current_broker: Some(request.broker.clone()),
     };
-    let phase = if request.enabled {
+    let phase = if progress.phase == "Blocked" {
+        "MaintenanceBlocked"
+    } else if request.enabled {
         "Maintenance"
     } else {
         "Ready"
@@ -214,6 +263,11 @@ async fn reconcile_rollout(
         Some(image) => Some(image),
         None => drain::previous_image(context, cluster, namespace, revision).await?,
     };
+    if timed_out || previous.is_some_and(|operation| operation.phase == "Failed") {
+        if let Some(target) = previous.and_then(|operation| operation.current_broker.as_deref()) {
+            drain::resume_one(context, namespace, target, auth).await?;
+        }
+    }
     let progress = if let Some(failed) = previous.filter(|operation| operation.phase == "Failed") {
         drain::Progress {
             target: failed.current_broker.clone(),
@@ -279,6 +333,13 @@ fn rollout_phase_can_timeout(phase: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_three_broker_profile_reports_insufficient_eligible_nodes() {
+        assert!(insufficient_eligible_nodes(2, 3, 3));
+        assert!(!insufficient_eligible_nodes(3, 3, 3));
+        assert!(insufficient_eligible_nodes(0, 0, 1));
+    }
 
     #[test]
     fn terminal_and_human_gated_rollouts_never_time_out() {

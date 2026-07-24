@@ -28,11 +28,15 @@ maintenance_startup_delay_seconds = 30
 disk_high_watermark_percent = 85
 disk_low_watermark_percent = 75
 min_free_bytes = 10737418240
-protective_eviction_enabled = true
+# Explicit opt-in: this permanently removes the oldest durable messages after
+# sustained disk pressure.
+protective_eviction_enabled = false
 disk_pressure_grace_seconds = 60
 
 [queue]
-# The stable v7 wire limit is 32 MiB; 20 MiB is the production default.
+# The stable v7 wire limit is 100 MiB; 20 MiB remains the conservative default.
+# Messages above the legacy durable-record bound require storage feature level 2
+# plus correspondingly larger body, publish, delivery, and segment limits.
 max_message_bytes = 20971520
 # Backlog is not capped by message count. Disk watermarks are the publish limit.
 message_timeout_ms = 60000

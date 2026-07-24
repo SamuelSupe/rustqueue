@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_NODES_BYTES: usize = 4 * 1024 * 1024;
 const FULL_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+const ROUTING_STALE_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct NodesResponse {
@@ -23,12 +24,14 @@ struct HeadResponse {
 struct Source {
     revision: u64,
     producers: Vec<Backend>,
+    brokers: Vec<Backend>,
     seen_at: Instant,
     full_at: Instant,
 }
 
 pub async fn run(
-    pool: BackendPool,
+    publish_pool: BackendPool,
+    broker_pool: BackendPool,
     addresses: Vec<String>,
     metrics: ProxyMetrics,
 ) -> anyhow::Result<()> {
@@ -38,6 +41,7 @@ pub async fn run(
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let mut sources = BTreeMap::<String, Source>::new();
+    let mut last_coherent_at = None;
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -46,18 +50,56 @@ pub async fn run(
         for address in &addresses {
             refresh_source(&client, address, &mut sources).await;
         }
-        sources.retain(|_, source| source.seen_at.elapsed() <= Duration::from_secs(5));
-        if sources.is_empty() {
-            pool.clear_if_stale(Duration::from_secs(5));
-        } else {
-            pool.replace(
-                sources
-                    .values()
-                    .flat_map(|source| source.producers.iter().cloned())
-                    .collect(),
-            );
+        sources.retain(|_, source| source.seen_at.elapsed() <= ROUTING_STALE_AFTER);
+        match coherent_sources(&sources) {
+            Some((producers, brokers, observed_at)) => {
+                publish_pool.replace(producers);
+                broker_pool.replace(brokers);
+                last_coherent_at = Some(observed_at);
+            }
+            None if last_coherent_is_fresh(last_coherent_at, Instant::now()) => {
+                tracing::debug!(
+                    "retaining the last coherent routing snapshot during Discovery revision skew"
+                );
+            }
+            None => {
+                if !sources.is_empty() {
+                    tracing::debug!(
+                        "active discovery replicas returned different routing revisions"
+                    );
+                }
+                publish_pool.replace(Vec::new());
+                broker_pool.replace(Vec::new());
+            }
         }
     }
+}
+
+fn coherent_sources(
+    sources: &BTreeMap<String, Source>,
+) -> Option<(Vec<Backend>, Vec<Backend>, Instant)> {
+    let revision = sources.values().next()?.revision;
+    if sources.values().any(|source| source.revision != revision) {
+        return None;
+    }
+    let observed_at = sources.values().map(|source| source.seen_at).min()?;
+    Some((
+        sources
+            .values()
+            .flat_map(|source| source.producers.iter().cloned())
+            .collect(),
+        sources
+            .values()
+            .flat_map(|source| source.brokers.iter().cloned())
+            .collect(),
+        observed_at,
+    ))
+}
+
+fn last_coherent_is_fresh(last_coherent_at: Option<Instant>, now: Instant) -> bool {
+    last_coherent_at.is_some_and(|observed_at| {
+        now.saturating_duration_since(observed_at) <= ROUTING_STALE_AFTER
+    })
 }
 
 async fn refresh_source(
@@ -95,42 +137,70 @@ async fn refresh_source(
             return;
         }
     }
-    let url = format!("{address}/v1/publishers");
-    let nodes = match client.get(url).send().await {
-        Ok(response) => match response.error_for_status() {
-            Ok(response) => {
-                match read_json_bounded::<NodesResponse>(response, MAX_NODES_BYTES).await {
-                    Ok(nodes) => nodes,
-                    Err(error) => {
-                        tracing::debug!(%error, "discovery response was invalid");
-                        return;
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::debug!(%error, "discovery returned an error");
-                return;
-            }
-        },
+    let nodes = match fetch_nodes(client, &format!("{address}/v1/publishers")).await {
+        Ok(nodes) => nodes,
         Err(error) => {
-            tracing::debug!(%error, "discovery request failed");
+            tracing::debug!(%error, "discovery publishers response was invalid");
             return;
         }
     };
+    let broker_nodes = match fetch_optional_nodes(client, &format!("{address}/v1/brokers")).await {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            tracing::debug!(%error, "discovery brokers response was invalid");
+            return;
+        }
+    };
+    let Some(revision) = coherent_revision(head.as_ref(), &nodes, broker_nodes.as_ref()) else {
+        tracing::debug!("discovery routing snapshot revisions did not match");
+        return;
+    };
+    let brokers = broker_nodes
+        .map(|nodes| nodes.producers)
+        .unwrap_or_else(|| nodes.producers.clone());
     sources.insert(
         address.to_owned(),
         Source {
-            revision: head.map_or(nodes.revision, |head| head.revision),
+            revision,
             producers: nodes.producers,
+            brokers,
             seen_at: now,
             full_at: now,
         },
     );
 }
 
+async fn fetch_nodes(client: &reqwest::Client, url: &str) -> anyhow::Result<NodesResponse> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    read_json_bounded(response, MAX_NODES_BYTES).await
+}
+
+async fn fetch_optional_nodes(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<Option<NodesResponse>> {
+    let response = client.get(url).send().await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    Ok(Some(
+        read_json_bounded(response.error_for_status()?, MAX_NODES_BYTES).await?,
+    ))
+}
+
 fn source_is_current(source: &Source, revision: u64, now: Instant) -> bool {
     source.revision == revision
         && now.saturating_duration_since(source.full_at) < FULL_REFRESH_INTERVAL
+}
+
+fn coherent_revision(
+    head: Option<&HeadResponse>,
+    publishers: &NodesResponse,
+    brokers: Option<&NodesResponse>,
+) -> Option<u64> {
+    let revision = head.map_or(publishers.revision, |head| head.revision);
+    (publishers.revision == revision && brokers.is_none_or(|brokers| brokers.revision == revision))
+        .then_some(revision)
 }
 
 async fn read_json_bounded<T: serde::de::DeserializeOwned>(
@@ -161,6 +231,7 @@ mod tests {
         Source {
             revision: 7,
             producers: Vec::new(),
+            brokers: Vec::new(),
             seen_at: now,
             full_at: now,
         }
@@ -178,5 +249,56 @@ mod tests {
         ));
         assert!(!source_is_current(&source, 7, now + FULL_REFRESH_INTERVAL));
         assert!(!source_is_current(&source, 8, now));
+    }
+
+    #[test]
+    fn mixed_discovery_revisions_are_rejected() {
+        let publishers = NodesResponse {
+            revision: 7,
+            producers: Vec::new(),
+        };
+        let brokers = NodesResponse {
+            revision: 8,
+            producers: Vec::new(),
+        };
+        assert_eq!(
+            coherent_revision(
+                Some(&HeadResponse { revision: 7 }),
+                &publishers,
+                Some(&brokers)
+            ),
+            None
+        );
+        assert_eq!(
+            coherent_revision(Some(&HeadResponse { revision: 7 }), &publishers, None),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn active_discovery_replicas_must_agree_before_routing() {
+        let now = Instant::now();
+        let mut sources = BTreeMap::from([
+            ("first".into(), source(now)),
+            ("second".into(), source(now)),
+        ]);
+        assert!(coherent_sources(&sources).is_some());
+
+        sources.get_mut("second").unwrap().revision = 8;
+        assert!(coherent_sources(&sources).is_none());
+
+        sources.remove("second");
+        assert!(coherent_sources(&sources).is_some());
+    }
+
+    #[test]
+    fn last_coherent_routing_only_bridges_bounded_revision_skew() {
+        let now = Instant::now();
+        assert!(last_coherent_is_fresh(Some(now), now + ROUTING_STALE_AFTER));
+        assert!(!last_coherent_is_fresh(
+            Some(now),
+            now + ROUTING_STALE_AFTER + Duration::from_millis(1)
+        ));
+        assert!(!last_coherent_is_fresh(None, now));
     }
 }

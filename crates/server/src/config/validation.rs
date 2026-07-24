@@ -1,4 +1,4 @@
-use super::{Config, MAX_SUPPORTED_BATCH_BYTES};
+use super::{Config, MAX_SUPPORTED_BATCH_BYTES, MAX_SUPPORTED_MESSAGE_BYTES};
 use crate::admission::{working_set_bytes, PublishShape};
 use anyhow::bail;
 
@@ -8,14 +8,37 @@ impl Config {
         {
             bail!("limits.max_body_bytes must be in 1..={MAX_SUPPORTED_BATCH_BYTES}");
         }
-        if self.limits.connection_publish_inflight_bytes
-            < working_set_bytes(self.limits.max_body_bytes, PublishShape::Multi)
+        let publish_working_set =
+            working_set_bytes(self.limits.max_body_bytes, PublishShape::Multi).max(
+                working_set_bytes(self.queue.max_message_bytes, PublishShape::Single),
+            );
+        if self.limits.connection_publish_inflight_bytes < publish_working_set
             || self.limits.node_publish_inflight_bytes
                 < self.limits.connection_publish_inflight_bytes
         {
             bail!("publish inflight limits must fit the encoded working set and satisfy connection <= node");
         }
-        if self.limits.connection_delivery_inflight_bytes < self.queue.max_message_bytes
+        let maximum_record_payload = self.queue.max_message_bytes.saturating_add(24).max(
+            self.limits
+                .max_body_bytes
+                .saturating_add(16 * rustqueue_protocol::MAX_MPUB_MESSAGES),
+        );
+        if maximum_record_payload > rustqueue_storage::MAX_RECORD_BYTES {
+            bail!("configured publish limits can exceed the durable record contract");
+        }
+        if maximum_record_payload > rustqueue_storage::LEGACY_MAX_RECORD_BYTES
+            && self.storage.feature_level < 2
+        {
+            bail!(
+                "publish limits above the v7 legacy record bound require storage.feature_level = 2"
+            );
+        }
+        let retained_message_bound = if self.storage.feature_level >= 2 {
+            MAX_SUPPORTED_MESSAGE_BYTES
+        } else {
+            self.queue.max_message_bytes
+        };
+        if self.limits.connection_delivery_inflight_bytes < retained_message_bound
             || self
                 .limits
                 .connection_delivery_inflight_bytes
@@ -23,7 +46,7 @@ impl Config {
                 .is_none_or(|minimum| self.limits.node_delivery_inflight_bytes < minimum)
             || self.limits.node_delivery_inflight_bytes > u32::MAX as usize
         {
-            bail!("delivery inflight limits must fit one message plus the payload-read working set and fit u32");
+            bail!("delivery inflight limits must fit every readable durable message plus the payload-read working set and fit u32");
         }
         if self.limits.client_handshake_timeout_ms == 0
             || self.limits.tcp_command_timeout_ms == 0

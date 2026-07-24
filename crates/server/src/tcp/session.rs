@@ -1,6 +1,7 @@
 use super::*;
 
-type FetchFuture<'a> = Pin<Box<dyn Future<Output = Result<FetchResponse, String>> + Send + 'a>>;
+type FetchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<FetchResponse, BrokerError>> + Send + 'a>>;
 
 struct PendingFetch<'a> {
     request: FetchRequest,
@@ -9,7 +10,7 @@ struct PendingFetch<'a> {
 
 async fn poll_pending_fetch(
     pending: &mut Option<PendingFetch<'_>>,
-) -> Result<FetchResponse, String> {
+) -> Result<FetchResponse, BrokerError> {
     pending
         .as_mut()
         .expect("disabled fetch future is never polled")
@@ -32,6 +33,7 @@ pub(super) async fn run_session(
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
     connection_budget: Arc<ConnectionBudget>,
+    subscriptions: SubscriptionRegistry,
     mut state: SessionState,
 ) -> anyhow::Result<()> {
     let (read_half, write_half) = tokio::io::split(io);
@@ -76,11 +78,25 @@ pub(super) async fn run_session(
 
     let session_result: anyhow::Result<()> = async {
         loop {
+            let expired = expire_client_deadlines(&mut state.in_flight, Instant::now());
+            if expired {
+                if let Some(subscription) = state.subscription.as_ref() {
+                    broker.expire_channel_in_flight(
+                        &subscription.topic,
+                        &subscription.channel,
+                    )
+                    .await?;
+                }
+                state.update_subscription_flow();
+            }
             if state.closing && state.in_flight.is_empty() {
                 break;
             }
             if let Some(command) = pending.take() {
                 if !accepting.load(Ordering::Acquire) && publish_command(&command.command) {
+                    if config.limits.disconnect_on_retriable_publish_error {
+                        break;
+                    }
                     write_error_timed(
                         &mut writer,
                         state.heartbeat,
@@ -91,11 +107,25 @@ pub(super) async fn run_session(
                     continue;
                 }
                 if !publish_admission.storage_ready() && publish_command(&command.command) {
+                    if config.limits.disconnect_on_retriable_publish_error {
+                        break;
+                    }
                     write_error_timed(
                         &mut writer,
                         state.heartbeat,
                         "E_THROTTLED",
                         "local disk is above its publish watermark",
+                    )
+                    .await?;
+                    continue;
+                }
+                if !broker.storage_healthy() && publish_command(&command.command) {
+                    metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
+                    write_error_timed(
+                        &mut writer,
+                        state.heartbeat,
+                        "E_PUB_RETRY",
+                        "local storage was unavailable before publish",
                     )
                     .await?;
                     continue;
@@ -122,6 +152,7 @@ pub(super) async fn run_session(
                         metrics,
                         authenticator.as_deref(),
                         &ephemeral_consumers,
+                        &subscriptions,
                         &mut state,
                         &mut writer,
                     ),
@@ -134,8 +165,7 @@ pub(super) async fn run_session(
                 continue;
             }
 
-            let now = Instant::now();
-            state.in_flight.retain(|_, deadline| *deadline > now);
+            state.update_subscription_flow();
             let available = state.rdy.saturating_sub(state.in_flight.len() as u64);
             if pending_fetch.is_none()
                 && !state.closing
@@ -159,6 +189,7 @@ pub(super) async fn run_session(
                     pending_fetch = Some(PendingFetch { request, future });
                 }
             }
+            let in_flight_deadline = state.in_flight.values().copied().min();
 
             tokio::select! {
                 command = command_rx.recv() => {
@@ -169,16 +200,36 @@ pub(super) async fn run_session(
                         Ok(command) => command,
                         Err(CommandReadError::Io(_)) => break,
                         Err(CommandReadError::Protocol { code, detail }) => {
+                            if disconnect_on_retriable_protocol_error(config, code) {
+                                break;
+                            }
                             write_error_timed(&mut writer, state.heartbeat, code, &detail).await?;
                             break;
                         }
                     };
                     if !accepting.load(Ordering::Acquire) && publish_command(&command.command) {
+                        if config.limits.disconnect_on_retriable_publish_error {
+                            break;
+                        }
                         write_error_timed(&mut writer, state.heartbeat, "E_DRAINING", "broker is draining").await?;
                         continue;
                     }
                     if !publish_admission.storage_ready() && publish_command(&command.command) {
+                        if config.limits.disconnect_on_retriable_publish_error {
+                            break;
+                        }
                         write_error_timed(&mut writer, state.heartbeat, "E_THROTTLED", "local disk is above its publish watermark").await?;
+                        continue;
+                    }
+                    if !broker.storage_healthy() && publish_command(&command.command) {
+                        metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
+                        write_error_timed(
+                            &mut writer,
+                            state.heartbeat,
+                            "E_PUB_RETRY",
+                            "local storage was unavailable before publish",
+                        )
+                        .await?;
                         continue;
                     }
                     if state.closing && !shutdown_command_allowed(&command.command) {
@@ -197,6 +248,7 @@ pub(super) async fn run_session(
                             metrics,
                             authenticator.as_deref(),
                             &ephemeral_consumers,
+                            &subscriptions,
                             &mut state,
                             &mut writer,
                         ),
@@ -288,13 +340,25 @@ pub(super) async fn run_session(
                                 state
                                     .in_flight
                                     .insert(delivery.id, Instant::now() + state.message_timeout);
+                                if let Some(subscription) = &state.subscription {
+                                    subscription.lease.observe_delivery();
+                                }
                                 delivery_guard.accept(delivery.id);
                                 metrics.delivered_messages.fetch_add(1, Ordering::Relaxed);
                             }
+                            state.update_subscription_flow();
                         }
                         Err(error) => {
-                            metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
-                            write_error_timed(&mut writer, state.heartbeat, "E_DELIVERY_FAILED", &error).await?;
+                            if broker_storage_error(&error) {
+                                metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
+                            }
+                            write_error_timed(
+                                &mut writer,
+                                state.heartbeat,
+                                "E_DELIVERY_FAILED",
+                                &error.to_string(),
+                            )
+                            .await?;
                             break;
                         }
                     }
@@ -314,6 +378,7 @@ pub(super) async fn run_session(
                 _ = output_buffer_tick.tick(), if state.output_buffer_timeout.is_some() && writer.has_pending() => {
                     flush_timed(&mut writer, state.heartbeat).await?;
                 }
+                _ = wait_for_in_flight_deadline(in_flight_deadline) => {}
             }
         }
         Ok(())
@@ -344,7 +409,10 @@ pub(super) async fn run_session(
     session_result
 }
 
-async fn fetch_deliveries(broker: &Broker, request: FetchRequest) -> Result<FetchResponse, String> {
+async fn fetch_deliveries(
+    broker: &Broker,
+    request: FetchRequest,
+) -> Result<FetchResponse, BrokerError> {
     let batch = broker
         .fetch_batch_retained(
             &request.topic,
@@ -354,8 +422,7 @@ async fn fetch_deliveries(broker: &Broker, request: FetchRequest) -> Result<Fetc
             Duration::from_millis(request.wait_ms as u64),
             Some(Duration::from_millis(request.timeout_ms)),
         )
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let (deliveries, delivery_guard) = batch.into_parts();
     let deliveries = deliveries
         .into_iter()
@@ -402,6 +469,19 @@ fn delivery_is_outstanding(in_flight: &HashMap<u64, Instant>, id: u64) -> bool {
     in_flight.contains_key(&id)
 }
 
+fn expire_client_deadlines(in_flight: &mut HashMap<u64, Instant>, now: Instant) -> bool {
+    let before = in_flight.len();
+    in_flight.retain(|_, deadline| *deadline > now);
+    in_flight.len() != before
+}
+
+async fn wait_for_in_flight_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +525,35 @@ mod tests {
         in_flight.clear();
         assert!(!delivery_is_outstanding(&in_flight, 7));
         assert!(!delivery_is_outstanding(&in_flight, 8));
+    }
+
+    #[test]
+    fn client_deadlines_expire_without_waiting_for_another_fetch() {
+        let now = Instant::now();
+        let mut in_flight = HashMap::from([
+            (7, now - Duration::from_millis(1)),
+            (8, now + Duration::from_secs(1)),
+        ]);
+        assert!(expire_client_deadlines(&mut in_flight, now));
+        assert_eq!(in_flight.keys().copied().collect::<Vec<_>>(), vec![8]);
+        assert!(!expire_client_deadlines(&mut in_flight, now));
+    }
+
+    #[test]
+    fn kodo_publish_admission_pressure_forces_producer_failover() {
+        let mut config = Config::default();
+        assert!(!disconnect_on_retriable_protocol_error(
+            &config,
+            "E_THROTTLED"
+        ));
+        config.limits.disconnect_on_retriable_publish_error = true;
+        assert!(disconnect_on_retriable_protocol_error(
+            &config,
+            "E_THROTTLED"
+        ));
+        assert!(!disconnect_on_retriable_protocol_error(
+            &config,
+            "E_BAD_MESSAGE"
+        ));
     }
 }

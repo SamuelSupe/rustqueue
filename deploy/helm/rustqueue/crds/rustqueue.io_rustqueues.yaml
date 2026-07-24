@@ -46,10 +46,10 @@ spec:
                 minFreeBytes: {type: integer, format: int64, minimum: 0, default: 10737418240}
                 diskHighWatermarkPercent: {type: integer, format: int32, minimum: 1, maximum: 100, default: 85}
                 diskLowWatermarkPercent: {type: integer, format: int32, minimum: 0, maximum: 99, default: 75}
-                protectiveEvictionEnabled: {type: boolean, default: true}
+                protectiveEvictionEnabled: {type: boolean, default: false}
                 diskPressureGraceSeconds: {type: integer, format: int64, minimum: 0, default: 60}
                 bootstrapRetentionSeconds: {type: integer, format: int64, minimum: 1, default: 90}
-                maxMessageBytes: {type: integer, format: int64, minimum: 1, maximum: 33554432, default: 20971520}
+                maxMessageBytes: {type: integer, format: int64, minimum: 1, maximum: 104857600, default: 20971520}
                 maxTopics: {type: integer, format: int64, minimum: 1, default: 10000}
                 maxPublishWorkers: {type: integer, format: int64, minimum: 1, default: 1024}
                 publishWorkerIdleSeconds: {type: integer, format: int64, minimum: 1, default: 60}
@@ -64,6 +64,32 @@ spec:
                   default: {}
                 proxyTcpMaxConnectionAgeSeconds: {type: integer, format: int64, minimum: 0, default: 300}
                 discoveryReplicas: {type: integer, format: int32, minimum: 2, default: 2}
+                kodoCompatibility:
+                  type: object
+                  default:
+                    enabled: false
+                    decommissionConfirmed: false
+                    producerRestartNonce: ""
+                    cleanupEnabled: false
+                    cutoverGraceSeconds: 630
+                    allowedPodSelector:
+                      app.kubernetes.io/name: kodo
+                    allowedNamespaceSelector: {}
+                  properties:
+                    enabled: {type: boolean, default: false}
+                    decommissionConfirmed: {type: boolean, default: false}
+                    producerRestartNonce: {type: string, default: ""}
+                    cleanupEnabled: {type: boolean, enum: [false], default: false}
+                    cutoverGraceSeconds: {type: integer, format: int64, minimum: 630, maximum: 86400, default: 630}
+                    allowedPodSelector:
+                      type: object
+                      additionalProperties: {type: string}
+                      default:
+                        app.kubernetes.io/name: kodo
+                    allowedNamespaceSelector:
+                      type: object
+                      additionalProperties: {type: string}
+                      default: {}
                 maintenance:
                   type: object
                   nullable: true
@@ -171,3 +197,6 @@ spec:
                   default: []
                   items: {type: string}
                 desiredStorageSize: {type: string, default: ""}
+                kodoProducerRestartBaselineNonce:
+                  type: string
+                  nullable: true

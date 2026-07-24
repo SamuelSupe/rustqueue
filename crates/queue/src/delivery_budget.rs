@@ -49,6 +49,12 @@ impl DeliveryBudget {
             .ok_or_else(|| {
                 BrokerError::InvalidRecord("delivery working set overflows usize".into())
             })?;
+        if bytes > self.capacity {
+            return Err(BrokerError::InvalidRecord(format!(
+                "delivery working set {bytes} exceeds configured byte budget {}",
+                self.capacity
+            )));
+        }
         let permits = u32::try_from(bytes).map_err(|_| {
             BrokerError::InvalidRecord("delivery batch exceeds the byte budget contract".into())
         })?;
@@ -100,5 +106,21 @@ impl Waiter {
 impl Drop for Waiter {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_request_fails_instead_of_waiting_forever() {
+        let budget = DeliveryBudget::new(8);
+        let error = match budget.acquire(5).await {
+            Ok(_) => panic!("oversized delivery request was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exceeds configured byte budget"));
+        assert_eq!(budget.snapshot().waiters, 0);
     }
 }
