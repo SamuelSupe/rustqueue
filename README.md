@@ -1,16 +1,18 @@
 # RustQueue
 
 [![CI](https://github.com/SamuelSupe/rustqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelSupe/rustqueue/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SamuelSupe/rustqueue)](https://github.com/SamuelSupe/rustqueue/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Kubernetes](https://img.shields.io/badge/kubernetes-1.28%2B-326CE5.svg)](https://kubernetes.io/)
 
-RustQueue 0.7 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.8 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Status: production candidate for workloads that accept single-PVC durability
-> and at-least-once delivery. This project does not replicate messages between
+> Current release: [v0.8.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.0).
+> RustQueue is a production candidate for workloads that accept single-PVC
+> durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
 
 The complete architecture and reliability contract is documented in
@@ -22,7 +24,9 @@ The complete architecture and reliability contract is documented in
 | --- | --- |
 | Durability | `PUB`/`MPUB`/`DPUB` return only after local segment `fsync`; `FIN`/`REQ` use a durable channel WAL |
 | Delivery | At least once; a restart may redeliver a message without a durable `FIN` |
-| Compatibility | NSQ V2 core commands, lookup, TLS/mTLS, AUTH, Snappy, Deflate, fan-out and ephemeral channels |
+| Compatibility | NSQ V2 core commands, lookup, standard Stats fields, TLS/mTLS, AUTH, Snappy, Deflate, fan-out and ephemeral channels |
+| Kodo | Default-off compatibility profile: stable publish Gateways from `/nodes`, real Broker owners from `/lookup`, and no upstream Kodo change |
+| Message size | Conservative 20 MiB default; stable 100 MiB protocol/storage ceiling; Kodo profile validates exactly 104,857,500 bytes |
 | Deployment | Kubernetes 1.28+, SSD-backed RWO PVCs, StatefulSet Broker ordinals, retained claims |
 | Scaling | Add Brokers without a central queue coordinator; consumers connect to every owner of a Topic |
 | Data model | Local Topic/Channel state; no cross-Broker ordering or global channel catalog |
@@ -32,10 +36,41 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
+## What's new in 0.8
+
+- **Kodo compatibility lives in RustQueue.** Discovery `/nodes` advertises
+  three stable Gateway identities for publishing, while `/lookup` continues to
+  return the real Broker owners used by consumers. Existing Kodo producer and
+  consumer behavior is preserved.
+- **Safe producer failover.** Gateways route only to publish-ready Brokers and
+  retry another Broker only after an explicit pre-commit rejection. A failure
+  after a full body write is reported as ambiguous and is never replayed
+  automatically.
+- **Accurate NSQ Stats.** `/stats` exposes standard `topic_name`,
+  `channel_name`, depth, client and cumulative-count fields. Topic and Channel
+  message, requeue and timeout counters remain durable and monotonic across
+  restart, empty and eviction.
+- **100 MiB large-message support.** The v7 storage format now has a stable
+  100 MiB protocol/storage ceiling. The Kodo profile raises the runtime limits
+  and release acceptance publishes and consumes Kodo's exact
+  104,857,500-byte maximum.
+- **Fail-closed administration and rollout.** Unauthenticated Kodo channel
+  cleanup stays disabled. Native management uses scoped tokens, and the
+  Operator blocks Broker maintenance until Gateway cutover and the explicit
+  Kodo producer-restart fence are complete.
+
+See the [v0.8.0 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.0)
+for the complete upgrade and validation record.
+
 ## Architecture
 
 ```text
-producer -> node-local proxy -> one publish-ready broker -> that broker's PVC
+standard producer -> proxy Service ----------------------------+
+                                                               |
+Kodo producer -> discovery /nodes -> Gateway Service ----------+
+                                      (3 advertised identities) |
+                                                               v
+                                            one publish-ready Broker -> its PVC
 
 consumer -> discovery /lookup -> every broker that owns the topic
                               -> direct NSQ TCP connections
@@ -86,7 +121,8 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 
 ## Components
 
-- `rustqueued`: local durable NSQ broker and HTTP management API.
+- `rustqueued`: local durable NSQ broker, standard NSQ Stats compatibility and
+  authenticated HTTP management API.
 - `rustqueue-discovery`: stateless EndpointSlice-derived lookup service with
   incremental topic/channel indexes and revision-head registry polling.
 - `rustqueue-proxy`: bounded producer TCP/HTTP proxy; new TCP connections choose
@@ -99,7 +135,8 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   sent is returned as ambiguous and is never retried automatically.
 - `rustqueue-operator`: creates the StatefulSet, retained PVCs, discovery,
   proxy, RBAC, disruption budgets, PVC expansion and drain-aware one-at-a-time
-  rolling updates.
+  rolling updates. The 0.8 Kodo profile adds atomic Discovery cutover,
+  producer-restart fencing and fail-closed decommissioning.
 - `rustqueue-console`: Kubernetes and broker observability backend serving the
   bilingual Carbon UI, with default-off native Topic/Channel management.
 - `rustqueuectl`: Kubernetes-aware cluster status, targeted maintenance,
@@ -141,6 +178,8 @@ ephemeral channels, Snappy, Deflate, TLS, mTLS and external AUTH.
 
 ## Kubernetes
 
+### Standard deployment
+
 Prerequisites:
 
 - Kubernetes 1.28 or later;
@@ -168,7 +207,12 @@ scrub, upgrade or the NSQ-compatible admin API. Client TLS is optional and
 always supplied through an existing Kubernetes Secret; the operator does not
 run a CA.
 
-Kodo compatibility is a separate, default-off deployment profile:
+### Kodo compatibility in 0.8
+
+Kodo compatibility is implemented entirely by RustQueue as a separate,
+default-off deployment profile. Kodo continues to use RustQueue Discovery:
+`/nodes` returns publish Gateways and `/lookup` returns consumer-facing Broker
+owners.
 
 ```sh
 helm upgrade --install rustqueue deploy/helm/rustqueue \
@@ -179,11 +223,11 @@ helm upgrade --install rustqueue deploy/helm/rustqueue \
 
 The chart pins this profile to three Brokers, storage feature level 2, a
 180-second bootstrap-retention window, a 100 MiB RustQueue single-message
-ceiling, a
-one-CPU/2 GiB Broker request, and three stable Gateway Pods with required
-hostname anti-affinity. The profile therefore needs three schedulable nodes. Each
-Gateway requests one CPU and 768 MiB, is not CPU-limited, and is limited to
-1 GiB memory so its fixed 512 MiB in-flight body budget is scheduler-backed.
+ceiling, a one-CPU/2 GiB Broker request, and three stable Gateway Pods with
+required hostname anti-affinity. The profile therefore needs three schedulable
+nodes. Each Gateway requests one CPU and 768 MiB, is not CPU-limited, and is
+limited to 1 GiB memory so its fixed 512 MiB in-flight body budget is
+scheduler-backed.
 The reviewed Kodo source enforces an application maximum of 104857500 bytes
 (100 MiB minus 100 bytes) and sets the go-nsq producer write deadline to three
 seconds. A maximum-size publish therefore needs more than roughly 34 MiB/s of
@@ -304,6 +348,8 @@ KODO_SOURCE_DIR=/path/to/kodo make kodo-replay
 KODO_ACCEPTANCE=1 KODO_SOURCE_DIR=/path/to/kodo ./scripts/release-gate.sh
 ```
 
+### Console and operations
+
 The chart enables RustQueue Console by default as a ClusterIP-only Service. It
 does not create an Ingress and has no built-in login. Put the Service behind
 your existing VPN, SSO or authenticated Ingress when broader access is needed:
@@ -384,6 +430,11 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
+The v0.8.0 release additionally passed the unmodified Kodo source replay,
+an exact 104,857,500-byte `PUB`/`DPUB` with one Gateway failover, and a
+three-Broker operational ledger with 3,239 expected and unique messages, zero
+missing, zero duplicates and zero publish errors.
+
 ## Disk pressure
 
 The broker checks its data filesystem once per second. At either the configured
@@ -424,6 +475,10 @@ Compatible endpoints:
 - `/topic/create|delete|empty|pause|unpause`
 - `/channel/create|delete|empty|pause|unpause`
 
+In the Kodo compatibility profile, automatic `/channel/delete` cleanup is
+intentionally fail-closed. Use RustQueue's authenticated native management
+flow for administrative changes.
+
 Native broker endpoints:
 
 - `GET /v1/health`
@@ -462,8 +517,9 @@ aggregate gauges/counters.
 
 ## Storage and upgrades
 
-Format v7 is a clean break. A v6 or older directory is refused; there is no
-in-place migration. Within v7, record tags and existing fields are append-only.
+RustQueue 0.8 keeps disk format v7. Format v7 is a clean break: a v6 or older
+directory is refused and there is no in-place migration. Within v7, record tags
+and existing fields are append-only.
 Every binary declares its reader/writer feature range and protocol message/body
 limits, and every PVC persists its active writer and minimum reader levels in
 `/data/COMPATIBILITY`. The operator probes the target image and every running
@@ -525,6 +581,8 @@ registry responses.
 
 `./scripts/release-gate.sh` is the repeatable production gate. It runs format,
 build, unit, clippy, Helm, fuzz and official-client compatibility checks;
+`KODO_ACCEPTANCE=1 KODO_SOURCE_DIR=/path/to/kodo` additionally runs the pinned,
+unmodified Kodo parser/admin replay and the 100 MiB Gateway acceptance;
 `K8S_ACCEPTANCE=1` additionally requires the OrbStack context and runs base,
 Console-management and multi-broker Kubernetes acceptances, including forced
 Console restart after one owner of a multi-owner operation completes. The same
@@ -532,6 +590,6 @@ non-Kubernetes gate runs in GitHub Actions.
 
 ## Non-goals
 
-RustQueue 0.7 does not provide message replication, backups, exactly-once
+RustQueue 0.8 does not provide message replication, backups, exactly-once
 delivery, a global channel catalog, online data migration, cross-region
 replication, or Broker/PVC lifecycle controls in Console.
