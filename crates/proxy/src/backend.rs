@@ -4,7 +4,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Backend {
@@ -16,7 +16,11 @@ pub struct Backend {
 
 impl Backend {
     pub fn tcp_address(&self) -> String {
-        format!("{}:{}", self.broadcast_address, self.tcp_port)
+        if self.broadcast_address.contains(':') && !self.broadcast_address.starts_with('[') {
+            format!("[{}]:{}", self.broadcast_address, self.tcp_port)
+        } else {
+            format!("{}:{}", self.broadcast_address, self.tcp_port)
+        }
     }
     pub fn http_origin(&self) -> String {
         if self.broadcast_address.contains(':') && !self.broadcast_address.starts_with('[') {
@@ -36,13 +40,14 @@ pub struct BackendPool {
 struct PoolState {
     backends: Vec<Backend>,
     active_connections: BTreeMap<u64, usize>,
+    invalidation: BTreeMap<u64, watch::Sender<u64>>,
     next_tie: usize,
-    updated_at: Option<Instant>,
 }
 
 pub struct BackendLease {
     backend: Backend,
     pool: BackendPool,
+    invalidation: watch::Receiver<u64>,
 }
 
 impl Deref for BackendLease {
@@ -77,6 +82,18 @@ impl BackendPool {
             unique.insert(backend.node_id, backend);
         }
         let mut state = self.inner.write();
+        let next: BTreeMap<_, _> = unique.iter().map(|(id, backend)| (*id, backend)).collect();
+        let changed: Vec<_> = state
+            .backends
+            .iter()
+            .filter(|backend| next.get(&backend.node_id).copied() != Some(*backend))
+            .map(|backend| backend.node_id)
+            .collect();
+        for node_id in changed {
+            if let Some(sender) = state.invalidation.get(&node_id) {
+                sender.send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+        }
         state.backends = unique.into_values().collect();
         let node_ids: std::collections::BTreeSet<_> = state
             .backends
@@ -86,16 +103,14 @@ impl BackendPool {
         state
             .active_connections
             .retain(|node_id, active| *active > 0 || node_ids.contains(node_id));
-        state.updated_at = Some(Instant::now());
-    }
-
-    pub fn clear_if_stale(&self, maximum_age: Duration) {
-        let mut state = self.inner.write();
-        if state
-            .updated_at
-            .is_none_or(|updated| updated.elapsed() > maximum_age)
-        {
-            state.backends.clear();
+        state
+            .invalidation
+            .retain(|node_id, _| node_ids.contains(node_id));
+        for node_id in node_ids {
+            state
+                .invalidation
+                .entry(node_id)
+                .or_insert_with(|| watch::channel(0).0);
         }
     }
 
@@ -135,10 +150,20 @@ impl BackendPool {
         let backend = candidates[state.next_tie % candidates.len()].clone();
         state.next_tie = state.next_tie.wrapping_add(1);
         *state.active_connections.entry(backend.node_id).or_default() += 1;
+        let invalidation = state
+            .invalidation
+            .entry(backend.node_id)
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe();
         Some(BackendLease {
             backend,
             pool: self.clone(),
+            invalidation,
         })
+    }
+
+    pub fn all(&self) -> Vec<Backend> {
+        self.inner.read().backends.clone()
     }
 
     pub fn len(&self) -> usize {
@@ -146,9 +171,27 @@ impl BackendPool {
     }
 }
 
+impl BackendLease {
+    pub fn invalidation(&self) -> watch::Receiver<u64> {
+        self.invalidation.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_addresses_bracket_ipv6_literals() {
+        let backend = Backend {
+            broadcast_address: "2001:db8::1".into(),
+            tcp_port: 4150,
+            http_port: 4151,
+            node_id: 1,
+        };
+        assert_eq!(backend.tcp_address(), "[2001:db8::1]:4150");
+        assert_eq!(backend.http_origin(), "http://[2001:db8::1]:4151");
+    }
 
     #[test]
     fn pool_deduplicates_five_hundred_discovered_brokers() {
@@ -204,5 +247,20 @@ mod tests {
         let first = pool.lease().unwrap().node_id;
         let second = pool.lease().unwrap().node_id;
         assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn removing_a_backend_invalidates_its_active_lease() {
+        let pool = BackendPool::default();
+        pool.replace(vec![Backend {
+            broadcast_address: "broker-1".into(),
+            tcp_port: 4150,
+            http_port: 4151,
+            node_id: 1,
+        }]);
+        let lease = pool.lease().unwrap();
+        let mut invalidation = lease.invalidation();
+        pool.replace(Vec::new());
+        assert!(invalidation.changed().await.is_ok() || invalidation.has_changed().is_err());
     }
 }

@@ -21,6 +21,7 @@ use crate::auth::{AuthError, AuthSession, Authenticator};
 use crate::compression::{self, BoxIo};
 use crate::config::Config;
 use crate::metrics::Metrics;
+use crate::subscriptions::{ClientIdentity, SubscriptionLease, SubscriptionRegistry};
 use crate::tls;
 use anyhow::Context;
 use bytes::Bytes;
@@ -42,10 +43,21 @@ use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{interval, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
+
+pub(crate) fn broker_storage_error(error: &BrokerError) -> bool {
+    matches!(
+        error,
+        BrokerError::StorageUnavailable
+            | BrokerError::Storage(_)
+            | BrokerError::Io(_)
+            | BrokerError::InvalidRecord(_)
+    )
+}
 
 #[derive(Debug)]
 struct ParsedCommand {
@@ -63,6 +75,7 @@ enum Compression {
 struct Subscription {
     topic: String,
     channel: String,
+    lease: SubscriptionLease,
 }
 
 const MAX_FETCH_MESSAGES: u16 = 64;
@@ -107,6 +120,7 @@ struct SessionState {
     rdy: u64,
     in_flight: HashMap<u64, Instant>,
     closing: bool,
+    client_identity: ClientIdentity,
 }
 
 impl SessionState {
@@ -118,8 +132,17 @@ impl SessionState {
         self.sample_cursor = (self.sample_cursor + 1) % 100;
         selected
     }
+
+    fn update_subscription_flow(&self) {
+        if let Some(subscription) = &self.subscription {
+            subscription
+                .lease
+                .update_flow(self.rdy, self.in_flight.len());
+        }
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     config: Arc<Config>,
     broker: Arc<Broker>,
@@ -127,6 +150,9 @@ pub async fn serve(
     accepting: Arc<AtomicBool>,
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
+    subscriptions: SubscriptionRegistry,
+    mut shutdown: watch::Receiver<bool>,
+    shutdown_grace: Duration,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.network.tcp_address).await?;
     let tls_acceptor = tls::acceptor(config.security.tls.as_ref())?;
@@ -137,8 +163,22 @@ pub async fn serve(
     let ephemeral_consumers = EphemeralConsumers::default();
     info!(address = %config.network.tcp_address, "NSQ TCP listener ready");
 
+    let mut sessions = JoinSet::new();
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            result = listener.accept() => Some(result?),
+            result = sessions.join_next(), if !sessions.is_empty() => {
+                log_session_result(result);
+                None
+            }
+            _ = shutdown.changed() => break,
+        };
+        let Some((stream, peer)) = accepted else {
+            continue;
+        };
+        if *shutdown.borrow() {
+            break;
+        }
         let permit = match Arc::clone(&permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -155,7 +195,8 @@ pub async fn serve(
         let accepting = Arc::clone(&accepting);
         let delivering = Arc::clone(&delivering);
         let publish_admission = Arc::clone(&publish_admission);
-        tokio::spawn(async move {
+        let subscriptions = subscriptions.clone();
+        sessions.spawn(async move {
             let _permit = permit;
             metrics.tcp_connections.fetch_add(1, Ordering::Relaxed);
             if let Err(error) = handle_connection(
@@ -170,6 +211,7 @@ pub async fn serve(
                 accepting,
                 delivering,
                 publish_admission,
+                subscriptions,
             )
             .await
             {
@@ -177,6 +219,31 @@ pub async fn serve(
             }
             metrics.tcp_connections.fetch_sub(1, Ordering::Relaxed);
         });
+    }
+    info!("NSQ TCP listener stopped accepting new connections");
+    if tokio::time::timeout(shutdown_grace, drain_sessions(&mut sessions))
+        .await
+        .is_err()
+    {
+        warn!(
+            active_sessions = sessions.len(),
+            "NSQ TCP shutdown grace expired"
+        );
+        sessions.abort_all();
+        drain_sessions(&mut sessions).await;
+    }
+    Ok(())
+}
+
+async fn drain_sessions(sessions: &mut JoinSet<()>) {
+    while let Some(result) = sessions.join_next().await {
+        log_session_result(Some(result));
+    }
+}
+
+fn log_session_result(result: Option<Result<(), tokio::task::JoinError>>) {
+    if let Some(Err(error)) = result {
+        warn!(%error, "NSQ TCP session task failed");
     }
 }
 
@@ -193,6 +260,7 @@ async fn handle_connection(
     accepting: Arc<AtomicBool>,
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
+    subscriptions: SubscriptionRegistry,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true)?;
     let handshake_timeout = Duration::from_millis(config.limits.client_handshake_timeout_ms);
@@ -207,20 +275,20 @@ async fn handle_connection(
     let connection_budget = Arc::new(ConnectionBudget::new(
         config.limits.connection_publish_inflight_bytes,
     ));
-    let first = match tokio::time::timeout(
-        handshake_timeout,
-        read_initial_command(&mut stream, config, &publish_admission, &connection_budget),
-    )
-    .await
-    .context("initial command timeout")?
-    {
-        Ok(command) => command,
-        Err(CommandReadError::Io(error)) => return Err(error.into()),
-        Err(CommandReadError::Protocol { code, detail }) => {
-            write_error(&mut stream, code, &detail).await?;
-            return Ok(());
-        }
-    };
+    let first =
+        match read_initial_command(&mut stream, config, &publish_admission, &connection_budget)
+            .await
+        {
+            Ok(command) => command,
+            Err(CommandReadError::Io(error)) => return Err(error.into()),
+            Err(CommandReadError::Protocol { code, detail }) => {
+                if disconnect_on_retriable_protocol_error(config, code) {
+                    return Ok(());
+                }
+                write_error(&mut stream, code, &detail).await?;
+                return Ok(());
+            }
+        };
     let mut state = SessionState {
         identified: false,
         encrypted: false,
@@ -239,6 +307,10 @@ async fn handle_connection(
         rdy: 0,
         in_flight: HashMap::new(),
         closing: false,
+        client_identity: ClientIdentity {
+            remote_address: peer.to_string(),
+            ..ClientIdentity::default()
+        },
     };
 
     let (mut io, pending, negotiated): (BoxIo, Option<ParsedCommand>, Option<Compression>) =
@@ -271,6 +343,10 @@ async fn handle_connection(
             state.output_buffer_size = output.size;
             state.output_buffer_timeout = output.timeout;
             state.sample_rate = sample_rate;
+            state.client_identity.client_id = identify.client_id.clone();
+            state.client_identity.hostname = identify.hostname.clone();
+            state.client_identity.user_agent = identify.user_agent.clone();
+            state.client_identity.sample_rate = sample_rate;
             let use_tls = identify.feature_negotiation && identify.tls_v1 && tls_acceptor.is_some();
             let negotiated = match negotiate_compression(&identify, config) {
                 Ok(compression) => compression,
@@ -300,6 +376,7 @@ async fn handle_connection(
                 let mut io: BoxIo = Box::new(tls_stream);
                 write_frame(&mut io, FrameType::Response, OK).await?;
                 state.encrypted = true;
+                state.client_identity.tls = true;
                 (io, None, negotiated)
             } else {
                 (Box::new(stream), None, negotiated)
@@ -314,6 +391,8 @@ async fn handle_connection(
     }
 
     if let Some(compression) = negotiated {
+        state.client_identity.snappy = matches!(compression, Compression::Snappy);
+        state.client_identity.deflate = matches!(compression, Compression::Deflate(_));
         io = match compression {
             Compression::Snappy => compression::snappy(io),
             Compression::Deflate(level) => compression::deflate(io, level),
@@ -334,7 +413,12 @@ async fn handle_connection(
         delivering,
         publish_admission,
         connection_budget,
+        subscriptions,
         state,
     )
     .await
+}
+
+fn disconnect_on_retriable_protocol_error(config: &Config, code: &str) -> bool {
+    config.limits.disconnect_on_retriable_publish_error && code == "E_THROTTLED"
 }

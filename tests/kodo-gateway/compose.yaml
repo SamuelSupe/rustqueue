@@ -1,0 +1,85 @@
+services:
+  broker-0: &broker
+    image: ${BROKER_IMAGE:-rustqueue:dev}
+    entrypoint: ["rustqueued", "--config", "/etc/rustqueue/rustqueue.toml"]
+    environment:
+      POD_NAME: queue-0
+      RUSTQUEUE_BROADCAST_ADDRESS: broker-0
+    volumes:
+      - ./rustqueue.toml:/etc/rustqueue/rustqueue.toml:ro
+    tmpfs:
+      - /data:size=512m,uid=65532,gid=65532,mode=0700
+  broker-1:
+    <<: *broker
+    environment:
+      POD_NAME: queue-1
+      RUSTQUEUE_BROADCAST_ADDRESS: broker-1
+  broker-2:
+    <<: *broker
+    environment:
+      POD_NAME: queue-2
+      RUSTQUEUE_BROADCAST_ADDRESS: broker-2
+
+  discovery:
+    image: ${COMPAT_IMAGE:-rustqueue-go-compat:kodo-e2e}
+    command: ["fake-discovery"]
+    environment: &inventory
+      RUSTQUEUE_FAKE_BROKERS: broker-0|4150|4151|1,broker-1|4150|4151|2,broker-2|4150|4151|3
+      RUSTQUEUE_FAKE_GATEWAYS: gateway-0|4150|4151|1000000,gateway-1|4150|4154|1000001,gateway-2|4150|4155|1000002
+
+  empty-discovery:
+    image: ${COMPAT_IMAGE:-rustqueue-go-compat:kodo-e2e}
+    command: ["fake-discovery"]
+    environment:
+      <<: *inventory
+      RUSTQUEUE_FAKE_EMPTY_PUBLISHERS: "1"
+
+  gateway-0: &gateway
+    image: ${BROKER_IMAGE:-rustqueue:dev}
+    entrypoint: ["rustqueue-proxy"]
+    environment:
+      RUSTQUEUE_DISCOVERY_URLS: http://discovery:4161
+      RUSTQUEUE_KODO_COMPATIBILITY_ENABLED: "true"
+      RUSTQUEUE_KODO_GATEWAY_ORDINAL: "0"
+      RUSTQUEUE_PROXY_MAX_MESSAGE_BYTES: "104857600"
+      RUSTQUEUE_PROXY_MAX_BODY_BYTES: "134217728"
+      RUSTQUEUE_PROXY_MAX_INFLIGHT_BYTES: "134217728"
+      RUSTQUEUE_PROXY_TCP_COMMAND_TIMEOUT_MS: "120000"
+      RUSTQUEUE_PROXY_TCP_MAX_CONNECTION_AGE_SECONDS: "0"
+    depends_on:
+      - empty-discovery
+      - broker-0
+      - broker-1
+      - broker-2
+  gateway-1:
+    <<: *gateway
+    environment:
+      RUSTQUEUE_DISCOVERY_URLS: http://discovery:4161
+      RUSTQUEUE_KODO_COMPATIBILITY_ENABLED: "true"
+      RUSTQUEUE_KODO_GATEWAY_ORDINAL: "1"
+      RUSTQUEUE_PROXY_MAX_MESSAGE_BYTES: "104857600"
+      RUSTQUEUE_PROXY_MAX_BODY_BYTES: "134217728"
+      RUSTQUEUE_PROXY_MAX_INFLIGHT_BYTES: "536870912"
+      RUSTQUEUE_PROXY_TCP_COMMAND_TIMEOUT_MS: "120000"
+      RUSTQUEUE_PROXY_TCP_MAX_CONNECTION_AGE_SECONDS: "0"
+  gateway-2:
+    <<: *gateway
+    environment:
+      RUSTQUEUE_DISCOVERY_URLS: http://empty-discovery:4161
+      RUSTQUEUE_KODO_COMPATIBILITY_ENABLED: "true"
+      RUSTQUEUE_KODO_GATEWAY_ORDINAL: "2"
+      RUSTQUEUE_PROXY_MAX_MESSAGE_BYTES: "104857600"
+      RUSTQUEUE_PROXY_MAX_BODY_BYTES: "134217728"
+      RUSTQUEUE_PROXY_MAX_INFLIGHT_BYTES: "536870912"
+      RUSTQUEUE_PROXY_TCP_COMMAND_TIMEOUT_MS: "120000"
+      RUSTQUEUE_PROXY_TCP_MAX_CONNECTION_AGE_SECONDS: "0"
+
+  acceptance:
+    image: ${COMPAT_IMAGE:-rustqueue-go-compat:kodo-e2e}
+    command: ["kodo-gateway", "discovery:4161", "gateway-2:4160"]
+    environment:
+      <<: *inventory
+    depends_on:
+      - gateway-0
+      - gateway-1
+      - gateway-2

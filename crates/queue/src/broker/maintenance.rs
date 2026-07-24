@@ -120,13 +120,56 @@ impl Broker {
             .sum()
     }
 
-    pub fn expire_in_flight(&self) -> usize {
-        self.inner
+    pub async fn expire_in_flight(&self) -> Result<usize, BrokerError> {
+        self.ensure_storage_healthy()?;
+        if !self
+            .inner
             .topics
             .read()
             .values()
-            .map(|topic| topic.state.lock().expire_in_flight())
-            .sum()
+            .any(|topic| topic.state.lock().has_expired_in_flight())
+        {
+            return Ok(0);
+        }
+        let broker = self.clone();
+        self.storage_task(move || {
+            broker
+                .inner
+                .topics
+                .read()
+                .values()
+                .try_fold(0usize, |total, topic| {
+                    Ok(total.saturating_add(topic.state.lock().expire_in_flight()?))
+                })
+        })
+        .await
+    }
+
+    pub async fn expire_channel_in_flight(
+        &self,
+        topic: &str,
+        channel: &str,
+    ) -> Result<usize, BrokerError> {
+        self.ensure_storage_healthy()?;
+        if !self
+            .topic(topic)?
+            .state
+            .lock()
+            .channel_has_expired_in_flight(channel)?
+        {
+            return Ok(0);
+        }
+        let broker = self.clone();
+        let topic = topic.to_owned();
+        let channel = channel.to_owned();
+        self.storage_task(move || {
+            broker
+                .topic(&topic)?
+                .state
+                .lock()
+                .expire_channel_in_flight(&channel)
+        })
+        .await
     }
 
     pub async fn flush(&self) -> Result<(), BrokerError> {

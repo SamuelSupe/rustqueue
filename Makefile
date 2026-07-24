@@ -1,4 +1,4 @@
-.PHONY: test check fmt clippy rustfmt-component clippy-component release-bin image image-from-dist operator-release-bin operator-image console-ui-build console-ui-check \
+.PHONY: test check fmt clippy rustfmt-component clippy-component release-bin image image-from-dist operator-release-bin operator-image console-ui-build console-ui-check kodo-replay kodo-gateway-acceptance \
 	helm-lint helm-template k8s-acceptance k8s-console-management-acceptance k8s-multi-acceptance up down compat compat-go compat-python \
 	fuzz-smoke benchmark release-gate
 
@@ -76,6 +76,10 @@ helm-lint:
 	helm lint deploy/helm/rustqueue
 	helm lint deploy/helm/rustqueue --set monitoring.serviceMonitor.enabled=true \
 		--set monitoring.prometheusRule.enabled=true
+	helm lint deploy/helm/rustqueue --set queue.kodoCompatibility.enabled=true \
+		--set queue.imagePullPolicy=Never
+	! helm template rustqueue deploy/helm/rustqueue \
+		--set queue.kodoCompatibility.cleanupEnabled=true
 	! rg -n 'x-kubernetes-preserve-unknown-fields:[[:space:]]*false' \
 		deploy/helm/rustqueue/crds
 
@@ -84,6 +88,9 @@ helm-template:
 	helm template rustqueue deploy/helm/rustqueue --namespace rustqueue \
 		--set monitoring.serviceMonitor.enabled=true \
 		--set monitoring.prometheusRule.enabled=true
+	helm template rustqueue deploy/helm/rustqueue --namespace rustqueue \
+		--set queue.kodoCompatibility.enabled=true \
+		--set queue.imagePullPolicy=Never
 
 k8s-acceptance:
 	./scripts/acceptance-k8s.sh
@@ -108,6 +115,12 @@ compat-go:
 
 compat-python:
 	./scripts/compat-python.sh
+
+kodo-replay:
+	bash ./scripts/kodo-replay.sh
+
+kodo-gateway-acceptance:
+	bash ./scripts/acceptance-kodo-gateway.sh
 
 fuzz-smoke:
 	./scripts/fuzz-smoke.sh

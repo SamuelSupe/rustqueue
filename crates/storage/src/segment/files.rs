@@ -1,5 +1,5 @@
 use super::{RecordLocation, StorageError};
-use crate::{Record, HEADER_LEN};
+use crate::{Record, RecordHeader, HEADER_LEN};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -9,14 +9,77 @@ const SEGMENT_PREFIX: &str = "segment-";
 const SEGMENT_SUFFIX: &str = ".rqlog";
 
 pub(super) fn read_record(location: &RecordLocation) -> Result<Record, StorageError> {
+    visit_record(location, |header, payload_len, reader| {
+        let mut payload = Vec::with_capacity(payload_len);
+        reader.read_to_end(&mut payload)?;
+        Ok(Record {
+            kind: header.kind,
+            flags: header.flags,
+            index: header.index,
+            timestamp_ns: header.timestamp_ns,
+            message_id: header.message_id,
+            available_at_ms: header.available_at_ms,
+            payload,
+        })
+    })
+}
+
+pub(super) fn visit_record<T>(
+    location: &RecordLocation,
+    visitor: impl FnOnce(RecordHeader, usize, &mut dyn Read) -> io::Result<T>,
+) -> Result<T, StorageError> {
     let mut file = File::open(location.segment.as_ref())?;
     file.seek(SeekFrom::Start(location.offset))?;
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header)?;
     let payload_len = Record::payload_len(&header)?;
-    let mut payload = vec![0; payload_len];
-    file.read_exact(&mut payload)?;
-    Record::decode(&header, payload).map_err(StorageError::Io)
+    if location.encoded_len != HEADER_LEN as u64 + payload_len as u64 {
+        return Err(corrupt(
+            location.segment.as_ref(),
+            location.offset,
+            "record location length does not match its header",
+        ));
+    }
+    let decoded = RecordHeader::decode(&header)?;
+    if decoded.index != location.index {
+        return Err(corrupt(
+            location.segment.as_ref(),
+            location.offset,
+            "recovery index points at a different record",
+        ));
+    }
+    let expected_crc = u32::from_be_bytes(header[44..48].try_into().unwrap());
+    let mut reader = ChecksummedReader {
+        inner: file.take(payload_len as u64),
+        crc32c: crc32c::crc32c(&header[..44]),
+        bytes_read: 0,
+    };
+    let value = visitor(decoded, payload_len, &mut reader).map_err(|error| {
+        corrupt(
+            location.segment.as_ref(),
+            location.offset,
+            error.to_string(),
+        )
+    })?;
+    let mut buffer = [0u8; 64 * 1024];
+    while reader.bytes_read < payload_len {
+        let read = reader.read(&mut buffer).map_err(StorageError::Io)?;
+        if read == 0 {
+            return Err(corrupt(
+                location.segment.as_ref(),
+                location.offset,
+                "partial record payload",
+            ));
+        }
+    }
+    if reader.crc32c != expected_crc {
+        return Err(corrupt(
+            location.segment.as_ref(),
+            location.offset,
+            "record checksum mismatch",
+        ));
+    }
+    Ok(value)
 }
 
 pub(super) fn scan_segment(
@@ -58,25 +121,49 @@ pub(super) fn scan_segment(
             }
             return Err(corrupt(path, offset, "partial record payload"));
         }
-        let mut payload = vec![0; payload_len];
-        file.read_exact(&mut payload)?;
-        let record_checksum =
-            crc32c::crc32c_append(crc32c::crc32c_append(checksum, &header), &payload);
-        match Record::decode(&header, payload) {
-            Ok(record) => {
-                checksum = record_checksum;
-                locations.push(RecordLocation {
-                    index: record.index,
-                    segment: Arc::clone(&segment),
-                    offset,
-                    encoded_len: record_len,
-                });
-            }
-            Err(error) => return Err(corrupt(path, offset, error.to_string())),
+        let decoded = RecordHeader::decode(&header)
+            .map_err(|error| corrupt(path, offset, error.to_string()))?;
+        checksum = crc32c::crc32c_append(checksum, &header);
+        let mut record_crc = crc32c::crc32c(&header[..44]);
+        let mut remaining = payload_len;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let wanted = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..wanted])?;
+            checksum = crc32c::crc32c_append(checksum, &buffer[..wanted]);
+            record_crc = crc32c::crc32c_append(record_crc, &buffer[..wanted]);
+            remaining -= wanted;
         }
+        let expected_crc = u32::from_be_bytes(header[44..48].try_into().unwrap());
+        if record_crc != expected_crc {
+            return Err(corrupt(path, offset, "record checksum mismatch"));
+        }
+        locations.push(RecordLocation {
+            index: decoded.index,
+            segment: Arc::clone(&segment),
+            offset,
+            encoded_len: record_len,
+        });
         offset += record_len;
     }
     Ok((locations, 0, offset, checksum))
+}
+
+struct ChecksummedReader<R> {
+    inner: R,
+    crc32c: u32,
+    bytes_read: usize,
+}
+
+impl<R: Read> Read for ChecksummedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.crc32c = crc32c::crc32c_append(self.crc32c, &buffer[..read]);
+            self.bytes_read = self.bytes_read.saturating_add(read);
+        }
+        Ok(read)
+    }
 }
 
 fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> StorageError {

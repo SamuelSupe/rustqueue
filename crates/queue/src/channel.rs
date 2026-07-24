@@ -16,6 +16,8 @@ pub(crate) enum ChannelCommand {
         message_id: u64,
         available_at_ms: i64,
         attempts: u16,
+        #[serde(default)]
+        cumulative_count: Option<u64>,
     },
     Pause {
         paused: bool,
@@ -25,6 +27,9 @@ pub(crate) enum ChannelCommand {
     },
     Evict {
         through_position: u64,
+    },
+    Timeout {
+        cumulative_count: u64,
     },
 }
 
@@ -38,6 +43,12 @@ pub(crate) struct ChannelCheckpoint {
     pub requeued_until: BTreeMap<u64, i64>,
     #[serde(default)]
     pub attempts: BTreeMap<u64, u16>,
+    #[serde(default)]
+    pub message_count_origin_position: Option<u64>,
+    #[serde(default)]
+    pub requeue_count: u64,
+    #[serde(default)]
+    pub timeout_count: u64,
     pub paused: bool,
     pub ephemeral: bool,
 }
@@ -50,6 +61,7 @@ struct InFlight {
 pub(crate) struct ChannelRuntime {
     pub state: ChannelState,
     pub store: Option<ChannelStore>,
+    pub durable_counters: bool,
 }
 
 pub(crate) struct ChannelState {
@@ -60,6 +72,7 @@ pub(crate) struct ChannelState {
     pub requeued_until: BTreeMap<u64, i64>,
     pub paused: bool,
     pub ephemeral: bool,
+    message_count_origin_position: u64,
     next_position: u64,
     in_flight: HashMap<u64, InFlight>,
     in_flight_ids: HashMap<u64, u64>,
@@ -67,6 +80,8 @@ pub(crate) struct ChannelState {
     attempts: HashMap<u64, u16>,
     next_token: u64,
     max_ack_gap: usize,
+    requeue_count: u64,
+    timeout_count: u64,
 }
 
 pub(crate) enum MessageAvailability {
@@ -91,6 +106,7 @@ impl ChannelState {
             requeued_until: BTreeMap::new(),
             paused: false,
             ephemeral,
+            message_count_origin_position: barrier_position,
             next_position: barrier_position.saturating_add(1),
             in_flight: HashMap::new(),
             in_flight_ids: HashMap::new(),
@@ -98,6 +114,8 @@ impl ChannelState {
             attempts: HashMap::new(),
             next_token: 1,
             max_ack_gap: max_ack_gap.max(1),
+            requeue_count: 0,
+            timeout_count: 0,
         }
     }
 
@@ -105,12 +123,19 @@ impl ChannelState {
         checkpoint: ChannelCheckpoint,
         max_ack_gap: usize,
     ) -> Result<Self, BrokerError> {
-        if checkpoint.format != 7 || checkpoint.ack_floor_position < checkpoint.barrier_position {
+        let message_count_origin_position = checkpoint
+            .message_count_origin_position
+            .unwrap_or(checkpoint.barrier_position);
+        if checkpoint.format != 7
+            || checkpoint.ack_floor_position < checkpoint.barrier_position
+            || message_count_origin_position > checkpoint.barrier_position
+        {
             return Err(BrokerError::InvalidRecord(
                 "invalid channel checkpoint".into(),
             ));
         }
         let next_position = checkpoint.ack_floor_position.saturating_add(1);
+        let redelivery = checkpoint.requeued_until.keys().copied().collect();
         Ok(Self {
             name: checkpoint.name,
             barrier_position: checkpoint.barrier_position,
@@ -119,13 +144,16 @@ impl ChannelState {
             requeued_until: checkpoint.requeued_until,
             paused: checkpoint.paused,
             ephemeral: checkpoint.ephemeral,
+            message_count_origin_position,
             next_position,
             in_flight: HashMap::new(),
             in_flight_ids: HashMap::new(),
-            redelivery: BTreeSet::new(),
+            redelivery,
             attempts: checkpoint.attempts.into_iter().collect(),
             next_token: 1,
             max_ack_gap: max_ack_gap.max(1),
+            requeue_count: checkpoint.requeue_count,
+            timeout_count: checkpoint.timeout_count,
         })
     }
 
@@ -142,6 +170,9 @@ impl ChannelState {
                 .iter()
                 .map(|(position, attempts)| (*position, *attempts))
                 .collect(),
+            message_count_origin_position: Some(self.message_count_origin_position),
+            requeue_count: self.requeue_count,
+            timeout_count: self.timeout_count,
             paused: self.paused,
             ephemeral: self.ephemeral,
         }
@@ -154,12 +185,20 @@ impl ChannelState {
                 position,
                 available_at_ms,
                 attempts,
+                cumulative_count,
                 ..
             } => {
+                let already_applied = self.requeued_until.get(&position) == Some(&available_at_ms)
+                    && self.attempts.get(&position) == Some(&attempts);
                 self.remove_in_flight(position);
                 self.redelivery.insert(position);
                 self.requeued_until.insert(position, available_at_ms);
                 self.attempts.insert(position, attempts);
+                if let Some(count) = cumulative_count {
+                    self.requeue_count = self.requeue_count.max(count);
+                } else if !already_applied {
+                    self.requeue_count = self.requeue_count.saturating_add(1);
+                }
             }
             ChannelCommand::Pause { paused } => self.paused = paused,
             ChannelCommand::Empty { through_position }
@@ -184,6 +223,9 @@ impl ChannelState {
                     .retain(|position| *position > through_position);
                 self.next_position = self.next_position.max(through_position.saturating_add(1));
             }
+            ChannelCommand::Timeout { cumulative_count } => {
+                self.timeout_count = self.timeout_count.max(cumulative_count);
+            }
         }
     }
 
@@ -196,7 +238,6 @@ impl ChannelState {
         if self.paused {
             return NextCandidate::None;
         }
-        self.expire_in_flight();
         let mut absent = Vec::new();
         let redelivery: Vec<_> = self.redelivery.iter().copied().collect();
         for position in redelivery {
@@ -236,6 +277,7 @@ impl ChannelState {
             if position <= self.ack_floor_position
                 || self.acknowledged.contains(&position)
                 || self.in_flight.contains_key(&position)
+                || self.redelivery.contains(&position)
             {
                 self.next_position = self.next_position.saturating_add(1);
                 continue;
@@ -304,6 +346,10 @@ impl ChannelState {
         self.attempts.get(&position).copied().unwrap_or_default()
     }
 
+    pub fn next_requeue_count(&self) -> u64 {
+        self.requeue_count.saturating_add(1)
+    }
+
     pub fn touch(&mut self, position: u64, timeout: Duration) -> bool {
         let Some(flight) = self.in_flight.get_mut(&position) else {
             return false;
@@ -328,32 +374,40 @@ impl ChannelState {
         count
     }
 
-    pub fn expire_in_flight(&mut self) -> usize {
-        let now = Instant::now();
-        let expired: Vec<_> = self
-            .in_flight
+    fn expired_positions(&self, now: Instant) -> Vec<u64> {
+        self.in_flight
             .iter()
             .filter_map(|(position, flight)| (flight.deadline <= now).then_some(*position))
-            .collect();
-        let count = expired.len();
-        for position in expired {
-            self.remove_in_flight(position);
-            self.redelivery.insert(position);
+            .collect()
+    }
+
+    fn expire_positions(&mut self, positions: &[u64]) {
+        for position in positions {
+            self.remove_in_flight(*position);
+            self.redelivery.insert(*position);
         }
-        count
     }
 
     pub fn first_in_flight_position(&self) -> Option<u64> {
         self.in_flight.keys().copied().min()
     }
 
-    pub fn stats(&self, last_position: u64) -> ChannelStats {
-        let (depth, in_flight_count, deferred_count, ack_gap) = self.metric_counts(last_position);
+    pub fn stats(
+        &self,
+        last_position: u64,
+        scheduled: &BTreeSet<u64>,
+        now_ms: i64,
+    ) -> ChannelStats {
+        let (depth, in_flight_count, deferred_count, ack_gap) =
+            self.metric_counts(last_position, scheduled, now_ms);
         ChannelStats {
             name: self.name.clone(),
             depth,
+            message_count: last_position.saturating_sub(self.message_count_origin_position),
             in_flight_count,
             deferred_count,
+            requeue_count: self.requeue_count,
+            timeout_count: self.timeout_count,
             paused: self.paused,
             ephemeral: self.ephemeral,
             ack_cursor: self.ack_floor_position,
@@ -361,14 +415,39 @@ impl ChannelState {
         }
     }
 
-    pub fn metric_counts(&self, last_position: u64) -> (u64, u64, u64, u64) {
+    pub fn metric_counts(
+        &self,
+        last_position: u64,
+        scheduled: &BTreeSet<u64>,
+        now_ms: i64,
+    ) -> (u64, u64, u64, u64) {
         let total = last_position.saturating_sub(self.ack_floor_position);
+        let scheduled_count = scheduled
+            .iter()
+            .filter(|position| self.is_outstanding(**position, last_position))
+            .count() as u64;
+        let requeued_count = self
+            .requeued_until
+            .iter()
+            .filter(|(position, until)| {
+                **until > now_ms
+                    && !scheduled.contains(position)
+                    && self.is_outstanding(**position, last_position)
+            })
+            .count() as u64;
         (
             total.saturating_sub(self.acknowledged.len() as u64),
             self.in_flight.len() as u64,
-            self.requeued_until.len() as u64,
+            scheduled_count.saturating_add(requeued_count),
             self.acknowledged.len() as u64,
         )
+    }
+
+    fn is_outstanding(&self, position: u64, last_position: u64) -> bool {
+        position > self.ack_floor_position
+            && position <= last_position
+            && !self.acknowledged.contains(&position)
+            && !self.in_flight.contains_key(&position)
     }
 
     fn acknowledge(&mut self, position: u64) {
@@ -398,6 +477,38 @@ impl ChannelState {
     }
 }
 
+impl ChannelRuntime {
+    pub fn has_expired_in_flight(&self) -> bool {
+        !self.state.expired_positions(Instant::now()).is_empty()
+    }
+
+    pub fn expire_in_flight(&mut self) -> Result<usize, BrokerError> {
+        let positions = self.state.expired_positions(Instant::now());
+        if positions.is_empty() {
+            return Ok(0);
+        }
+        let cumulative_count = self
+            .state
+            .timeout_count
+            .saturating_add(positions.len() as u64);
+        if self.durable_counters {
+            let command = ChannelCommand::Timeout { cumulative_count };
+            if let Some(store) = self.store.as_mut() {
+                store.append(&command)?;
+            }
+            self.state.expire_positions(&positions);
+            self.state.apply(&command);
+        } else {
+            self.state.expire_positions(&positions);
+            self.state.timeout_count = cumulative_count;
+        }
+        if let Some(store) = self.store.as_mut() {
+            store.checkpoint_if_needed(&self.state)?;
+        }
+        Ok(positions.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,7 +529,71 @@ mod tests {
     fn in_flight_expiry_uses_a_monotonic_deadline() {
         let mut channel = ChannelState::new("workers".into(), 0, false, 16);
         channel.reserve(1, 10, Duration::ZERO);
-        assert_eq!(channel.expire_in_flight(), 1);
+        let mut runtime = ChannelRuntime {
+            state: channel,
+            store: None,
+            durable_counters: true,
+        };
+        assert_eq!(runtime.expire_in_flight().unwrap(), 1);
+        let channel = runtime.state;
         assert_eq!(channel.in_flight_position(10), None);
+        assert_eq!(
+            channel.stats(1, &BTreeSet::new(), i64::MAX).timeout_count,
+            1
+        );
+    }
+
+    #[test]
+    fn cumulative_counters_and_message_count_survive_checkpoint_and_empty() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 16);
+        channel.reserve(1, 10, Duration::ZERO);
+        let mut runtime = ChannelRuntime {
+            state: channel,
+            store: None,
+            durable_counters: true,
+        };
+        runtime.state.apply(&ChannelCommand::Requeue {
+            position: 1,
+            message_id: 10,
+            available_at_ms: 0,
+            attempts: 1,
+            cumulative_count: Some(1),
+        });
+        runtime.state.reserve(2, 11, Duration::ZERO);
+        runtime.expire_in_flight().unwrap();
+        runtime.state.apply(&ChannelCommand::Empty {
+            through_position: 2,
+        });
+        let current = runtime.state.stats(2, &BTreeSet::new(), i64::MAX);
+        assert_eq!(current.message_count, 2);
+        assert_eq!(current.requeue_count, 1);
+        assert_eq!(current.timeout_count, 1);
+
+        let recovered = ChannelState::from_checkpoint(runtime.state.checkpoint(), 16).unwrap();
+        let restarted = recovered.stats(4, &BTreeSet::new(), i64::MAX);
+        assert_eq!(restarted.message_count, 4);
+        assert_eq!(restarted.requeue_count, 1);
+        assert_eq!(restarted.timeout_count, 1);
+    }
+
+    #[test]
+    fn legacy_checkpoint_starts_monotonic_count_at_its_persisted_barrier() {
+        let checkpoint: ChannelCheckpoint = serde_json::from_value(serde_json::json!({
+            "format": 7,
+            "name": "workers",
+            "barrier_position": 5,
+            "ack_floor_position": 5,
+            "acknowledged": [],
+            "requeued_until": {},
+            "paused": false,
+            "ephemeral": false
+        }))
+        .unwrap();
+        let mut state = ChannelState::from_checkpoint(checkpoint, 16).unwrap();
+        assert_eq!(state.stats(7, &BTreeSet::new(), i64::MAX).message_count, 2);
+        state.apply(&ChannelCommand::Empty {
+            through_position: 7,
+        });
+        assert_eq!(state.stats(7, &BTreeSet::new(), i64::MAX).message_count, 2);
     }
 }

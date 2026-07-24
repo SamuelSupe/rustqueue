@@ -32,6 +32,16 @@ struct Cli {
     endpoint_slice_timeout_ms: u64,
     #[arg(long, env = "RUSTQUEUE_REGISTRY_TOKEN_FILE")]
     registry_token_file: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "RUSTQUEUE_KODO_COMPATIBILITY_ENABLED",
+        default_value_t = false
+    )]
+    kodo_compatibility_enabled: bool,
+    #[arg(long, env = "RUSTQUEUE_KODO_GATEWAY_ADDRESS")]
+    kodo_gateway_address: Option<String>,
+    #[arg(long, env = "RUSTQUEUE_KODO_CLEANUP_ENABLED", default_value_t = false)]
+    kodo_cleanup_enabled: bool,
 }
 
 #[tokio::main]
@@ -46,12 +56,38 @@ async fn main() -> anyhow::Result<()> {
     if cli.endpoint_slice_timeout_ms == 0 {
         anyhow::bail!("EndpointSlice timeout must be greater than zero");
     }
-    let token = cli
-        .registry_token_file
-        .map(std::fs::read_to_string)
-        .transpose()?
-        .map(|token| token.trim().to_owned());
+    if cli.kodo_cleanup_enabled {
+        anyhow::bail!(
+            "Kodo automatic cleanup is disabled until cluster-wide atomic deletion is available"
+        );
+    }
+    if cli.kodo_compatibility_enabled {
+        if cli
+            .kodo_gateway_address
+            .as_deref()
+            .is_none_or(|address| address.trim().is_empty())
+        {
+            anyhow::bail!("Kodo Gateway address is required and cannot be empty");
+        }
+    } else if cli.kodo_cleanup_enabled || cli.kodo_gateway_address.is_some() {
+        anyhow::bail!("Kodo cleanup and Gateway address require Kodo compatibility");
+    }
     let directory = Directory::default();
+    if cli.kodo_compatibility_enabled {
+        directory.configure_kodo(
+            cli.kodo_gateway_address
+                .map(|address| {
+                    let address = address.trim().to_owned();
+                    (0..3)
+                        .map(|ordinal| {
+                            rustqueue_discovery::Producer::gateway(address.clone(), ordinal)
+                        })
+                        .collect()
+                })
+                .expect("validated Kodo Gateway address"),
+            cli.kodo_cleanup_enabled,
+        );
+    }
     let refresh = run_refresh_loop(
         directory.clone(),
         RefreshConfig {
@@ -61,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
             poll_interval: Duration::from_secs(2),
             endpoint_slice_timeout: Duration::from_millis(cli.endpoint_slice_timeout_ms),
             stale_after: Duration::from_secs(5),
-            registry_token: token,
+            registry_token_file: cli.registry_token_file,
             max_parallel_polls: 128,
         },
     );

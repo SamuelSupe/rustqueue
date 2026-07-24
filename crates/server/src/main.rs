@@ -5,6 +5,7 @@ mod config;
 mod disk_guard;
 mod http;
 mod metrics;
+mod subscriptions;
 mod tcp;
 mod tls;
 
@@ -18,7 +19,8 @@ use rustqueue_storage::DataDirectoryLock;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{error, info};
+use subscriptions::SubscriptionRegistry;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -86,7 +88,9 @@ async fn main() -> anyhow::Result<()> {
         config.limits.node_publish_inflight_bytes,
         Arc::clone(&metrics),
     ));
+    let subscriptions = SubscriptionRegistry::default();
     let initially_pressured = disk_guard::initialize(&config, &publish_admission, &metrics)?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     info!(
         node_id = config.node.id,
@@ -96,63 +100,229 @@ async fn main() -> anyhow::Result<()> {
         "starting share-nothing RustQueue broker"
     );
 
-    let tcp_task = tokio::spawn(tcp::serve(
+    let mut tcp_task = tokio::spawn(tcp::serve(
         Arc::clone(&config),
         Arc::clone(&broker),
         Arc::clone(&metrics),
         Arc::clone(&accepting),
         Arc::clone(&delivering),
         Arc::clone(&publish_admission),
+        subscriptions.clone(),
+        shutdown_rx.clone(),
+        std::time::Duration::from_secs(config.shutdown.grace_seconds)
+            .saturating_sub(std::time::Duration::from_millis(250)),
     ));
-    let http_task = tokio::spawn(http::serve(
+    let mut http_task = tokio::spawn(http::serve(
         Arc::clone(&config),
         Arc::clone(&broker),
         Arc::clone(&metrics),
         Arc::clone(&accepting),
         Arc::clone(&delivering),
         Arc::clone(&publish_admission),
+        subscriptions.clone(),
+        shutdown_rx.clone(),
     ));
-    let scrub_task = tokio::spawn(run_scrubber(
+    let mut kodo_http_task = tokio::spawn(http::serve_kodo_compat(
+        Arc::clone(&config),
+        Arc::clone(&broker),
+        Arc::clone(&metrics),
+        Arc::clone(&accepting),
+        Arc::clone(&delivering),
+        Arc::clone(&publish_admission),
+        subscriptions,
+        shutdown_rx,
+    ));
+    let mut scrub_task = tokio::spawn(run_scrubber(
         Arc::clone(&broker),
         std::time::Duration::from_secs(config.storage.maintenance_startup_delay_seconds),
         std::time::Duration::from_secs(config.storage.scrub_interval_seconds),
     ));
-    let disk_task = tokio::spawn(disk_guard::run(
+    let mut disk_task = tokio::spawn(disk_guard::run(
         Arc::clone(&config),
         Arc::clone(&broker),
         Arc::clone(&publish_admission),
         Arc::clone(&metrics),
         initially_pressured,
     ));
-    let storage_health_task = tokio::spawn(monitor_storage_health(Arc::clone(&broker)));
+    let mut storage_health_task = tokio::spawn(monitor_storage_health(Arc::clone(&broker)));
 
-    tokio::select! {
-        result = tcp_task => result.context("TCP task join")??,
-        result = http_task => result.context("HTTP task join")??,
-        result = scrub_task => result.context("storage scrub task join")??,
-        result = disk_task => result.context("disk guard task join")??,
-        result = storage_health_task => result.context("storage health task join")??,
+    let (completed_task, terminal_result) = tokio::select! {
+        result = &mut tcp_task => (
+            Some(RuntimeTask::Tcp),
+            unexpected_task_exit("TCP", result),
+        ),
+        result = &mut http_task => (
+            Some(RuntimeTask::Http),
+            unexpected_task_exit("HTTP", result),
+        ),
+        result = &mut kodo_http_task => (
+            Some(RuntimeTask::KodoHttp),
+            unexpected_task_exit("Kodo HTTP", result),
+        ),
+        result = &mut scrub_task => (
+            Some(RuntimeTask::Scrub),
+            unexpected_task_exit("storage scrub", result),
+        ),
+        result = &mut disk_task => (
+            Some(RuntimeTask::DiskGuard),
+            unexpected_task_exit("disk guard", result),
+        ),
+        result = &mut storage_health_task => (
+            Some(RuntimeTask::StorageHealth),
+            unexpected_task_exit("storage health", result),
+        ),
         _ = shutdown_signal() => {
             info!("shutdown signal received");
-            accepting.store(false, Ordering::Release);
-            delivering.store(false, Ordering::Release);
-            let deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(config.shutdown.grace_seconds);
-            while metrics.tcp_connections.load(Ordering::Acquire) > 0
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            let released = broker.release_all_in_flight();
-            broker.flush().await.context("flush queue state")?;
-            info!(released, "share-nothing broker stopped cleanly");
+            (None, Ok(()))
         },
+    };
+    accepting.store(false, Ordering::Release);
+    delivering.store(false, Ordering::Release);
+    let _ = shutdown_tx.send(true);
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(config.shutdown.grace_seconds);
+    while shutdown_work_in_progress(
+        &metrics,
+        tcp_task.is_finished() && http_task.is_finished() && kodo_http_task.is_finished(),
+    ) && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Ok(())
+    if shutdown_work_in_progress(
+        &metrics,
+        tcp_task.is_finished() && http_task.is_finished() && kodo_http_task.is_finished(),
+    ) {
+        warn!(
+            tcp_connections = metrics.tcp_connections.load(Ordering::Acquire),
+            publish_inflight_bytes = metrics.publish_inflight_bytes.load(Ordering::Acquire),
+            "broker shutdown grace expired with client work in progress"
+        );
+    }
+    let mut cleanup_error = None;
+    if completed_task != Some(RuntimeTask::Tcp) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_service_task(&mut tcp_task, "TCP").await,
+        );
+    }
+    if completed_task != Some(RuntimeTask::Http) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_service_task(&mut http_task, "HTTP").await,
+        );
+    }
+    if completed_task != Some(RuntimeTask::KodoHttp) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_service_task(&mut kodo_http_task, "Kodo HTTP").await,
+        );
+    }
+    if completed_task != Some(RuntimeTask::Scrub) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_background_task(&mut scrub_task, "storage scrub").await,
+        );
+    }
+    if completed_task != Some(RuntimeTask::DiskGuard) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_background_task(&mut disk_task, "disk guard").await,
+        );
+    }
+    if completed_task != Some(RuntimeTask::StorageHealth) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_background_task(&mut storage_health_task, "storage health").await,
+        );
+    }
+    let released = broker.release_all_in_flight();
+    record_cleanup_error(
+        &mut cleanup_error,
+        broker.flush().await.context("flush queue state"),
+    );
+    info!(released, "share-nothing broker stopped cleanly");
+    combine_shutdown_results(terminal_result, cleanup_error)
+}
+
+fn shutdown_work_in_progress(metrics: &Metrics, services_finished: bool) -> bool {
+    !services_finished || metrics.publish_inflight_bytes.load(Ordering::Acquire) > 0
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RuntimeTask {
+    Tcp,
+    Http,
+    KodoHttp,
+    Scrub,
+    DiskGuard,
+    StorageHealth,
+}
+
+fn unexpected_task_exit(
+    name: &str,
+    result: Result<anyhow::Result<()>, tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    match result {
+        Ok(Ok(())) => anyhow::bail!("{name} task stopped unexpectedly"),
+        Ok(Err(error)) => Err(error).with_context(|| format!("{name} task stopped with an error")),
+        Err(error) => Err(error).with_context(|| format!("{name} task join")),
+    }
+}
+
+fn record_cleanup_error(first: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        warn!(%error, "broker shutdown cleanup step failed");
+        if first.is_none() {
+            *first = Some(error);
+        }
+    }
+}
+
+fn combine_shutdown_results(
+    terminal: anyhow::Result<()>,
+    cleanup: Option<anyhow::Error>,
+) -> anyhow::Result<()> {
+    match (terminal, cleanup) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) | (Ok(()), Some(error)) => Err(error),
+        (Err(terminal), Some(cleanup)) => Err(anyhow::anyhow!(
+            "{terminal:#}; shutdown cleanup also failed: {cleanup:#}"
+        )),
+    }
+}
+
+async fn stop_service_task(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    name: &str,
+) -> anyhow::Result<()> {
+    if !task.is_finished() {
+        warn!(
+            service = name,
+            "service did not stop before the broker deadline; aborting it"
+        );
+        task.abort();
+    }
+    match task.await {
+        Ok(result) => result.with_context(|| format!("{name} service stopped with an error")),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("{name} service task join")),
+    }
+}
+
+async fn stop_background_task(
+    task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    name: &str,
+) -> anyhow::Result<()> {
+    task.abort();
+    match task.await {
+        Ok(result) => result.with_context(|| format!("{name} task stopped with an error")),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("{name} task join")),
+    }
 }
 
 fn write_binary_capabilities(path: &std::path::Path) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(&rustqueue_storage::binary_capabilities())?;
+    let bytes = serde_json::to_vec(&config::runtime_capabilities())?;
     std::fs::write(path, bytes).with_context(|| format!("write capabilities to {}", path.display()))
 }
 
@@ -213,4 +383,25 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_waits_for_service_completion_and_publish_reservations() {
+        let metrics = Metrics::default();
+        assert!(!shutdown_work_in_progress(&metrics, true));
+        assert!(shutdown_work_in_progress(&metrics, false));
+
+        metrics.tcp_connections.store(1, Ordering::Release);
+        assert!(!shutdown_work_in_progress(&metrics, true));
+        metrics.tcp_connections.store(0, Ordering::Release);
+
+        metrics
+            .publish_inflight_bytes
+            .store(1024, Ordering::Release);
+        assert!(shutdown_work_in_progress(&metrics, true));
+    }
 }

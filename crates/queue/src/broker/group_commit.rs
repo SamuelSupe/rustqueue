@@ -415,6 +415,15 @@ pub(super) fn copy_error(error: &BrokerError) -> BrokerError {
         BrokerError::TopicTombstoned => BrokerError::TopicTombstoned,
         BrokerError::ChannelNotFound => BrokerError::ChannelNotFound,
         BrokerError::ChannelTombstoned => BrokerError::ChannelTombstoned,
+        BrokerError::ChannelNotIdle {
+            depth,
+            in_flight,
+            deferred,
+        } => BrokerError::ChannelNotIdle {
+            depth: *depth,
+            in_flight: *in_flight,
+            deferred: *deferred,
+        },
         BrokerError::ManagementUnavailable => BrokerError::ManagementUnavailable,
         BrokerError::RevisionConflict { expected, actual } => BrokerError::RevisionConflict {
             expected: *expected,

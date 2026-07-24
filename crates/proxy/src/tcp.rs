@@ -1,3 +1,6 @@
+#[path = "tcp/gateway.rs"]
+mod gateway;
+
 use crate::backend::BackendPool;
 use crate::metrics::ProxyMetrics;
 use rand::Rng;
@@ -5,33 +8,77 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
+
+pub struct Limits {
+    pub max_connections: usize,
+    pub max_connection_age: Duration,
+    pub terminate_producer_protocol: bool,
+    pub max_message_bytes: usize,
+    pub max_body_bytes: usize,
+    pub command_timeout: Duration,
+    pub inflight_bytes: Arc<Semaphore>,
+}
 
 pub async fn serve(
     address: SocketAddr,
     pool: BackendPool,
-    max_connections: usize,
-    max_connection_age: Duration,
+    limits: Limits,
     metrics: ProxyMetrics,
+    mut shutdown: watch::Receiver<bool>,
+    shutdown_grace: Duration,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let connections = Arc::new(Semaphore::new(max_connections));
+    let connections = Arc::new(Semaphore::new(limits.max_connections));
+    let mut sessions = JoinSet::new();
     tracing::info!(%address, "producer TCP proxy listening");
     loop {
-        let (mut client, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            result = listener.accept() => Some(result?),
+            result = sessions.join_next(), if !sessions.is_empty() => {
+                log_session_result(result);
+                None
+            }
+            _ = shutdown.changed() => break,
+        };
+        let Some((mut client, peer)) = accepted else {
+            continue;
+        };
         let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
             tracing::debug!(%peer, "rejecting producer because proxy connection limit is reached");
             continue;
         };
+        let metrics = metrics.clone();
+        if limits.terminate_producer_protocol {
+            let pool = pool.clone();
+            let gateway_limits = gateway::Limits {
+                max_message_bytes: limits.max_message_bytes,
+                max_body_bytes: limits.max_body_bytes,
+                command_timeout: limits.command_timeout,
+                inflight_bytes: Arc::clone(&limits.inflight_bytes),
+            };
+            let session_shutdown = shutdown.clone();
+            sessions.spawn(async move {
+                let _permit = permit;
+                let _ = client.set_nodelay(true);
+                if let Err(error) =
+                    gateway::run(client, pool, gateway_limits, metrics, session_shutdown).await
+                {
+                    tracing::debug!(%peer, %error, "producer Gateway session closed");
+                }
+            });
+            continue;
+        }
         let Some(backend) = pool.lease() else {
             tracing::debug!(%peer, "rejecting producer because no broker is ready");
             continue;
         };
-        let metrics = metrics.clone();
-        let connection_age = jittered_connection_age(max_connection_age);
-        tokio::spawn(async move {
+        let connection_age = jittered_connection_age(limits.max_connection_age);
+        sessions.spawn(async move {
             let _permit = permit;
             let _backend_lease = backend;
+            let mut invalidation = _backend_lease.invalidation();
             let connect_timer = metrics.backend.timer();
             match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -43,33 +90,36 @@ pub async fn serve(
                     drop(connect_timer);
                     let _ = client.set_nodelay(true);
                     let _ = broker.set_nodelay(true);
-                    if let Some(connection_age) = connection_age {
-                        match tokio::time::timeout(
-                            connection_age,
-                            tokio::io::copy_bidirectional(&mut client, &mut broker),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                tracing::debug!(%peer, %error, "producer TCP proxy closed")
-                            }
-                            Err(_) => {
-                                metrics
-                                    .tcp_connection_rotations
-                                    .fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(
-                                    %peer,
-                                    node_id = _backend_lease.node_id,
-                                    max_age_seconds = connection_age.as_secs(),
-                                    "rotating producer TCP connection"
-                                );
+                    let tunnel = tokio::io::copy_bidirectional(&mut client, &mut broker);
+                    tokio::select! {
+                        result = tunnel => {
+                            if let Err(error) = result {
+                                tracing::debug!(%peer, %error, "producer TCP proxy closed");
                             }
                         }
-                    } else if let Err(error) =
-                        tokio::io::copy_bidirectional(&mut client, &mut broker).await
-                    {
-                        tracing::debug!(%peer, %error, "producer TCP proxy closed");
+                        _ = invalidation.changed() => {
+                            metrics.tcp_connection_rotations.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                %peer,
+                                node_id = _backend_lease.node_id,
+                                "closing producer tunnel because backend left discovery"
+                            );
+                        }
+                        _ = async {
+                            if let Some(connection_age) = connection_age {
+                                tokio::time::sleep(connection_age).await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            metrics.tcp_connection_rotations.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                %peer,
+                                node_id = _backend_lease.node_id,
+                                max_age_seconds = connection_age.map_or(0, |age| age.as_secs()),
+                                "rotating producer TCP connection"
+                            );
+                        }
                     }
                 }
                 Ok(Err(error)) => {
@@ -82,6 +132,31 @@ pub async fn serve(
                 }
             }
         });
+    }
+    tracing::info!("producer TCP proxy stopped accepting new connections");
+    if tokio::time::timeout(shutdown_grace, drain_sessions(&mut sessions))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            active_sessions = sessions.len(),
+            "producer TCP proxy shutdown grace expired"
+        );
+        sessions.abort_all();
+        drain_sessions(&mut sessions).await;
+    }
+    Ok(())
+}
+
+async fn drain_sessions(sessions: &mut JoinSet<()>) {
+    while let Some(result) = sessions.join_next().await {
+        log_session_result(Some(result));
+    }
+}
+
+fn log_session_result(result: Option<Result<(), tokio::task::JoinError>>) {
+    if let Some(Err(error)) = result {
+        tracing::warn!(%error, "producer proxy session task failed");
     }
 }
 

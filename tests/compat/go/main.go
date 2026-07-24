@@ -12,6 +12,22 @@ import (
 
 func main() {
 	mode := argument(1, "core")
+	if mode == "fake-discovery" {
+		if err := runFakeDiscovery(); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if mode == "kodo-gateway" {
+		if len(os.Args) != 4 {
+			log.Fatal("kodo-gateway mode requires lookup HTTP and Gateway metrics addresses")
+		}
+		if err := runKodoGatewayAcceptance(os.Args[2], os.Args[3]); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("Kodo Gateway maximum-size PUB/DPUB and Broker failover acceptance: ok")
+		return
+	}
 	if mode == "operational-ledger" {
 		if len(os.Args) != 6 {
 			log.Fatal("operational-ledger mode requires proxy HTTP, lookup HTTP, duration seconds, and minimum brokers")

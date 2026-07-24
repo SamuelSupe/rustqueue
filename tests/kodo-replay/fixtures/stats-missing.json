@@ -1,0 +1,15 @@
+{
+  "version": "0.8.0",
+  "health": "OK",
+  "start_time": 1700000001,
+  "topics": [{
+    "topic_name": "events",
+    "name": "events",
+    "depth": 0,
+    "memory_depth": 0,
+    "backend_depth": 0,
+    "message_count": 10,
+    "paused": false,
+    "channels": []
+  }]
+}

@@ -7,6 +7,8 @@ pub struct ProxyMetrics {
     pub backend: Arc<LatencyHistogram>,
     pub discovery_poll: Arc<LatencyHistogram>,
     pub tcp_connection_rotations: Arc<AtomicU64>,
+    pub producer_retries: Arc<AtomicU64>,
+    pub producer_ambiguous_failures: Arc<AtomicU64>,
 }
 
 impl ProxyMetrics {
@@ -28,6 +30,22 @@ impl ProxyMetrics {
         output.push_str(&format!(
             "rustqueue_proxy_tcp_connection_rotations_total {}\n",
             self.tcp_connection_rotations.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP rustqueue_proxy_producer_retries_total Publish commands retried after an explicit pre-commit Broker rejection.\n\
+# TYPE rustqueue_proxy_producer_retries_total counter\n",
+        );
+        output.push_str(&format!(
+            "rustqueue_proxy_producer_retries_total {}\n",
+            self.producer_retries.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP rustqueue_proxy_producer_ambiguous_failures_total Publish commands failed without retry because the Broker commit outcome was ambiguous.\n\
+# TYPE rustqueue_proxy_producer_ambiguous_failures_total counter\n",
+        );
+        output.push_str(&format!(
+            "rustqueue_proxy_producer_ambiguous_failures_total {}\n",
+            self.producer_ambiguous_failures.load(Ordering::Relaxed)
         ));
         output
     }

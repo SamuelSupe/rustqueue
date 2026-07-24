@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/nsqio/go-nsq"
@@ -32,6 +34,7 @@ func runDefaultLookupBootstrap(lookupHTTP, seedHTTP, newOwnerHTTP string) error 
 	if err != nil {
 		return err
 	}
+	consumer.SetLogger(log.New(os.Stderr, "nsq: ", log.LstdFlags|log.Lmicroseconds), nsq.LogLevelInfo)
 	consumer.AddHandler(nsq.HandlerFunc(func(message *nsq.Message) error {
 		delivery <- append([]byte(nil), message.Body...)
 		return nil
@@ -40,7 +43,10 @@ func runDefaultLookupBootstrap(lookupHTTP, seedHTTP, newOwnerHTTP string) error 
 		return err
 	}
 	defer stopConsumer(consumer)
-	if err := waitForConnections(consumer, 1, 15*time.Second); err != nil {
+	// Either Discovery replica may answer the first request while it is still
+	// one refresh behind. The unchanged client deliberately recovers on its next
+	// jittered 60-second poll, which the bootstrap-retention contract covers.
+	if err := waitForConnections(consumer, 1, 90*time.Second); err != nil {
 		return err
 	}
 

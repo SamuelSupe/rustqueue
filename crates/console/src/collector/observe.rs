@@ -263,12 +263,12 @@ mod tests {
             registry_revision: 9,
             ..Default::default()
         };
-        observation.node.version = "0.7.2".into();
+        observation.node.version = "0.8.0".into();
         let mut head = BrokerObservationHead {
             registry_revision: 9,
             ..Default::default()
         };
-        head.node.version = "0.7.2".into();
+        head.node.version = "0.8.0".into();
         let cached = CachedObservation {
             pod_uid: broker.uid.clone(),
             pod_ip: broker.pod_ip.clone(),

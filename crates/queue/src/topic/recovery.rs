@@ -14,6 +14,7 @@ pub(super) struct Summary {
     pub count: u64,
     pub first: MessageMeta,
     pub last: MessageMeta,
+    pub scheduled: Vec<(i64, u64)>,
 }
 
 pub(super) fn encode<'a>(messages: impl Iterator<Item = &'a MessageMeta> + Clone) -> Vec<u8> {
@@ -37,7 +38,10 @@ pub(super) fn encode<'a>(messages: impl Iterator<Item = &'a MessageMeta> + Clone
     bytes
 }
 
-pub(super) fn inspect(reference: &RecoveryMetadataRef) -> Result<Summary, BrokerError> {
+pub(super) fn inspect(
+    reference: &RecoveryMetadataRef,
+    now_ms: i64,
+) -> Result<Summary, BrokerError> {
     let header = reference.read_range(0, HEADER_LEN)?;
     let count = decode_header(&header)?;
     if count == 0 {
@@ -54,14 +58,34 @@ pub(super) fn inspect(reference: &RecoveryMetadataRef) -> Result<Summary, Broker
             "topic recovery index length mismatch".into(),
         ));
     }
-    let first = read_entry(reference, 0)?;
-    let last = read_entry(reference, count - 1)?;
-    if last.position != first.position.saturating_add(count - 1) || last.id < first.id {
-        return Err(BrokerError::InvalidRecord(
-            "topic recovery index range is invalid".into(),
-        ));
+    let mut scheduled = Vec::new();
+    let mut first = None;
+    let mut last: Option<MessageMeta> = None;
+    let mut ordinal = 0;
+    while ordinal < count {
+        let page = read_page(reference, ordinal, (count - ordinal).min(1024) as usize)?;
+        for message in page {
+            if last.as_ref().is_some_and(|previous| {
+                message.position != previous.position.saturating_add(1) || message.id < previous.id
+            }) {
+                return Err(BrokerError::InvalidRecord(
+                    "topic recovery index range is invalid".into(),
+                ));
+            }
+            if message.available_at_ms > now_ms {
+                scheduled.push((message.available_at_ms, message.position));
+            }
+            first.get_or_insert_with(|| message.clone());
+            last = Some(message);
+        }
+        ordinal += (count - ordinal).min(1024);
     }
-    Ok(Summary { count, first, last })
+    Ok(Summary {
+        count,
+        first: first.expect("non-empty recovery index"),
+        last: last.expect("non-empty recovery index"),
+        scheduled,
+    })
 }
 
 pub(super) fn read_page(
@@ -90,19 +114,6 @@ pub(super) fn read_page(
         )?);
     }
     Ok(messages)
-}
-
-fn read_entry(reference: &RecoveryMetadataRef, ordinal: u64) -> Result<MessageMeta, BrokerError> {
-    let offset = HEADER_LEN as u64
-        + ordinal
-            .checked_mul(MESSAGE_LEN as u64)
-            .ok_or_else(|| BrokerError::InvalidRecord("topic index offset overflow".into()))?;
-    let bytes = reference.read_range(offset, MESSAGE_LEN)?;
-    decode_entry(
-        Arc::new(reference.segment_path().to_path_buf()),
-        reference.segment_len(),
-        &bytes,
-    )
 }
 
 fn decode_header(bytes: &[u8]) -> Result<u64, BrokerError> {

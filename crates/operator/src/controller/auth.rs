@@ -45,6 +45,12 @@ pub(super) async fn ensure(
                 "console-token".into(),
                 Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
             );
+            if cluster.spec.kodo_compatibility.effective_cleanup_enabled() {
+                string_data.insert(
+                    "kodo-cleanup-token".into(),
+                    Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
+                );
+            }
             api.create(
                 &PostParams::default(),
                 &Secret {
@@ -71,17 +77,30 @@ pub(super) async fn ensure(
         .data
         .as_ref()
         .is_some_and(|data| data.contains_key("observer-token"));
-    if generated && (missing_console || has_observer) {
-        let patch = if missing_console {
-            json!({
-                "stringData": {
-                    "console-token": Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
-                },
-                "data": {"observer-token": null},
-            })
-        } else {
-            json!({"data": {"observer-token": null}})
-        };
+    let missing_cleanup = secret
+        .data
+        .as_ref()
+        .is_none_or(|data| !data.contains_key("kodo-cleanup-token"));
+    let needs_cleanup =
+        cluster.spec.kodo_compatibility.effective_cleanup_enabled() && missing_cleanup;
+    if generated && (missing_console || needs_cleanup || has_observer) {
+        let mut additions = BTreeMap::new();
+        if missing_console {
+            additions.insert(
+                "console-token",
+                Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
+            );
+        }
+        if needs_cleanup {
+            additions.insert(
+                "kodo-cleanup-token",
+                Alphanumeric.sample_string(&mut rand::thread_rng(), 48),
+            );
+        }
+        let patch = json!({
+            "stringData": additions,
+            "data": {"observer-token": null},
+        });
         secret = api
             .patch(&name, &PatchParams::default(), &Patch::Merge(patch))
             .await?;
@@ -98,13 +117,38 @@ pub(super) async fn ensure(
         }
         Ok(value.trim().into())
     };
-    let _ = read("console-token")?;
+    let admin_token = read("admin-token")?;
+    let registry_token = read("registry-token")?;
+    let console_token = read("console-token")?;
+    let mut tokens = vec![
+        ("admin-token", admin_token.as_str()),
+        ("registry-token", registry_token.as_str()),
+        ("console-token", console_token.as_str()),
+    ];
+    let cleanup_token = if cluster.spec.kodo_compatibility.effective_cleanup_enabled() {
+        Some(read("kodo-cleanup-token")?)
+    } else {
+        None
+    };
+    if let Some(cleanup_token) = cleanup_token.as_deref() {
+        tokens.push(("kodo-cleanup-token", cleanup_token));
+    }
+    validate_distinct_tokens(&tokens)?;
     Ok(AuthSecret {
         name,
-        admin_token: read("admin-token")?,
-        registry_token: read("registry-token")?,
+        admin_token,
+        registry_token,
         revision: secret.resource_version().unwrap_or_default(),
     })
+}
+
+fn validate_distinct_tokens(tokens: &[(&str, &str)]) -> anyhow::Result<()> {
+    for (index, (left_name, left)) in tokens.iter().enumerate() {
+        if let Some((right_name, _)) = tokens[index + 1..].iter().find(|(_, right)| left == right) {
+            bail!("auth Secret {left_name} and {right_name} must be distinct");
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn mounted_secret_revision(
@@ -134,4 +178,29 @@ pub(super) async fn mounted_secret_revision(
         auth.revision,
         secret.resource_version().unwrap_or_default()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_distinct_tokens;
+
+    #[test]
+    fn auth_roles_require_pairwise_distinct_tokens() {
+        assert!(validate_distinct_tokens(&[
+            ("admin-token", "admin"),
+            ("registry-token", "registry"),
+            ("console-token", "console"),
+            ("kodo-cleanup-token", "cleanup"),
+        ])
+        .is_ok());
+        let error = validate_distinct_tokens(&[
+            ("admin-token", "shared"),
+            ("registry-token", "registry"),
+            ("console-token", "shared"),
+        ])
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("admin-token and console-token must be distinct"));
+    }
 }

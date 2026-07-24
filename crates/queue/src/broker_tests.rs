@@ -1,7 +1,10 @@
 use super::io::SEQUENCE_RESERVATION;
 use super::*;
 use crate::outbox::OutboxEntry;
-use crate::{ManagementFenceSnapshot, TopicManagementAction};
+use crate::{
+    ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot,
+    TopicManagementAction,
+};
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -125,6 +128,174 @@ async fn startup_replays_dlq_outbox_before_finishing_the_source() {
         .unwrap()
         .unwrap();
     assert_eq!(&*dlq.body, b"poison");
+}
+
+#[tokio::test]
+async fn stats_settle_expired_in_flight_messages_without_another_fetch() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"body".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(broker
+        .next_message("events", "workers", Some(Duration::ZERO))
+        .await
+        .unwrap()
+        .is_some());
+
+    broker.expire_in_flight().await.unwrap();
+    let stats = broker.stats();
+    let channel = &stats.topics[0].channels[0];
+    assert_eq!(channel.in_flight_count, 0);
+    assert_eq!(channel.timeout_count, 1);
+    assert_eq!(channel.depth, 1);
+}
+
+#[tokio::test]
+async fn kodo_channel_counters_are_monotonic_across_empty_and_restart() {
+    if rustqueue_storage::MAX_WRITER_FEATURE_LEVEL < 2 {
+        return;
+    }
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        storage_feature_level: 2,
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![b"one".to_vec(), b"two".to_vec()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    let delivery = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    broker
+        .requeue("events", "workers", delivery.id, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(broker
+        .next_message("events", "workers", Some(Duration::ZERO))
+        .await
+        .unwrap()
+        .is_some());
+    broker.expire_in_flight().await.unwrap();
+    broker.empty_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"three".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    let channel = &broker.stats().topics[0].channels[0];
+    assert_eq!(channel.message_count, 3);
+    assert_eq!(channel.requeue_count, 1);
+    assert_eq!(channel.timeout_count, 1);
+    drop(broker);
+
+    let reopened = Broker::open(config).unwrap();
+    let channel = &reopened.stats().topics[0].channels[0];
+    assert_eq!(channel.message_count, 3);
+    assert_eq!(channel.requeue_count, 1);
+    assert_eq!(channel.timeout_count, 1);
+}
+
+#[tokio::test]
+async fn durable_batch_accepts_the_full_protocol_message_count() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    let messages = vec![vec![b'x']; rustqueue_protocol::MAX_MPUB_MESSAGES];
+    let ids = broker
+        .publish("events", messages, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), rustqueue_protocol::MAX_MPUB_MESSAGES);
+    assert_eq!(
+        broker.stats().topics[0].published_count,
+        rustqueue_protocol::MAX_MPUB_MESSAGES as u64
+    );
+}
+
+#[tokio::test]
+async fn startup_replays_a_large_dlq_outbox_after_lowering_the_publish_limit() {
+    if rustqueue_storage::MAX_WRITER_FEATURE_LEVEL < 2 {
+        return;
+    }
+    let root = tempdir().unwrap();
+    let original = BrokerConfig {
+        data_path: root.path().into(),
+        max_segment_bytes: 256 * 1024 * 1024,
+        max_message_bytes: 100 * 1024 * 1024,
+        storage_feature_level: 2,
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(original.clone()).unwrap();
+    let body = bytes::Bytes::from(vec![0x6b; 100 * 1024 * 1024]);
+    let entry = OutboxEntry {
+        source_topic: "missing-source".into(),
+        source_channel: "missing-channel".into(),
+        message_id: 1,
+        target_topic: "events.DLQ".into(),
+        body: body.clone(),
+    };
+    crate::outbox::store(&root.path().join("dlq-outbox"), &entry).unwrap();
+    drop(broker);
+
+    let broker = Broker::open(BrokerConfig {
+        max_message_bytes: 20 * 1024 * 1024,
+        ..original
+    })
+    .unwrap();
+    broker
+        .create_channel("events.DLQ", "inspect")
+        .await
+        .unwrap();
+    let delivery = broker
+        .next_message("events.DLQ", "inspect", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.body.as_ref(), body.as_ref());
+    assert_eq!(
+        std::fs::read_dir(root.path().join("dlq-outbox"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn feature_level_two_rejects_a_delivery_budget_that_cannot_read_retained_messages() {
+    let root = tempdir().unwrap();
+    let error = match Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        max_message_bytes: 20 * 1024 * 1024,
+        delivery_inflight_bytes: 40 * 1024 * 1024,
+        storage_feature_level: 2,
+        ..BrokerConfig::default()
+    }) {
+        Ok(_) => panic!("undersized delivery budget was accepted"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("every message readable at the active storage feature level"));
 }
 
 #[tokio::test]
@@ -464,6 +635,64 @@ async fn idle_gc_does_not_seal_a_channel_blocked_active_segment() {
 }
 
 #[tokio::test]
+async fn deferred_stats_are_exact_without_a_consumer_and_after_restart() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        max_ack_gap: 2,
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    broker
+        .publish(
+            "events",
+            vec![b"deferred".to_vec()],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let channel = &broker.stats().topics[0].channels[0];
+    assert_eq!((channel.depth, channel.deferred_count), (4, 1));
+    drop(broker);
+
+    let reopened = Broker::open(config).unwrap();
+    let channel = &reopened.stats().topics[0].channels[0];
+    assert_eq!((channel.depth, channel.deferred_count), (4, 1));
+}
+
+#[tokio::test]
+async fn deferred_stats_promote_messages_when_the_deadline_passes() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![b"deferred".to_vec()],
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+    assert_eq!(broker.stats().topics[0].channels[0].deferred_count, 1);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let channel = &broker.stats().topics[0].channels[0];
+    assert_eq!((channel.depth, channel.deferred_count), (1, 0));
+}
+
+#[tokio::test]
 async fn bounded_gc_rotates_across_topics() {
     let root = tempdir().unwrap();
     let broker = Broker::open(BrokerConfig {
@@ -790,6 +1019,121 @@ async fn management_rejects_stale_registry_revisions() {
 }
 
 #[tokio::test]
+async fn delete_if_idle_rejects_backlog_without_leaving_a_management_block() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"one".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    let revision = broker.registry_revision();
+    let deadline = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+        + 60_000;
+    let error = broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "delete-idle-test-0001",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: revision,
+            tombstone_until_ms: Some(deadline),
+            require_idle: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BrokerError::ChannelNotIdle {
+            depth: 1,
+            in_flight: 0,
+            deferred: 0
+        }
+    ));
+
+    broker
+        .publish("events", vec![b"two".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    broker.empty_channel("events", "workers").await.unwrap();
+    broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "delete-idle-test-0002",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: broker.registry_revision(),
+            tombstone_until_ms: Some(deadline),
+            require_idle: true,
+        })
+        .await
+        .unwrap();
+    assert!(broker.channel_names("events").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delete_if_idle_reports_missing_topics_and_channels() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    let deadline = now_ms() + 60_000;
+
+    let missing_topic = broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "delete-missing-topic-0001",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: broker.registry_revision(),
+            tombstone_until_ms: Some(deadline),
+            require_idle: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_topic, BrokerError::TopicNotFound));
+
+    broker.create_channel("events", "workers").await.unwrap();
+    broker.empty_channel("events", "workers").await.unwrap();
+    broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "delete-existing-channel-0001",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: broker.registry_revision(),
+            tombstone_until_ms: Some(deadline),
+            require_idle: true,
+        })
+        .await
+        .unwrap();
+
+    let missing_channel = broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "delete-missing-channel-0001",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: broker.registry_revision(),
+            tombstone_until_ms: Some(deadline),
+            require_idle: true,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(missing_channel, BrokerError::ChannelNotFound));
+}
+
+#[tokio::test]
 async fn management_operation_results_are_idempotent_across_restart() {
     let root = tempdir().unwrap();
     let config = BrokerConfig {
@@ -885,6 +1229,110 @@ async fn expired_pending_tombstone_can_finish_and_unblock_the_topic() {
 
     broker
         .publish("orders", vec![b"accepted".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn changed_cleanup_operation_id_adopts_a_pending_delete_after_restart() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let fingerprint = serde_json::to_string(&(
+        "channel",
+        "events",
+        "workers",
+        ChannelManagementAction::Delete,
+        true,
+    ))
+    .unwrap();
+    broker
+        .inner
+        .management_ops
+        .lock()
+        .prepare(
+            &broker.inner.management_ops_path,
+            "kodo-delete-old-0001",
+            fingerprint,
+            "events".into(),
+        )
+        .unwrap();
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "kodo-delete-new-0001",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: 0,
+            tombstone_until_ms: Some(now_ms() + 60_000),
+            require_idle: true,
+        })
+        .await
+        .unwrap();
+    assert!(broker.channel_names("events").unwrap().is_empty());
+    assert!(!broker.inner.management_ops.lock().blocks_topic("events"));
+}
+
+#[tokio::test]
+async fn pending_idle_delete_completes_when_the_channel_was_already_removed() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let fingerprint = serde_json::to_string(&(
+        "channel",
+        "events",
+        "workers",
+        ChannelManagementAction::Delete,
+        true,
+    ))
+    .unwrap();
+    broker
+        .inner
+        .management_ops
+        .lock()
+        .prepare(
+            &broker.inner.management_ops_path,
+            "kodo-delete-old-0002",
+            fingerprint,
+            "events".into(),
+        )
+        .unwrap();
+    broker
+        .topic("events")
+        .unwrap()
+        .state
+        .lock()
+        .delete_channel("workers")
+        .unwrap();
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    broker
+        .manage_channel(ChannelManagementCommand {
+            operation_id: "kodo-delete-new-0002",
+            topic: "events",
+            channel: "workers",
+            action: ChannelManagementAction::Delete,
+            expected_revision: 0,
+            tombstone_until_ms: Some(now_ms() + 60_000),
+            require_idle: true,
+        })
+        .await
+        .unwrap();
+    assert!(!broker.inner.management_ops.lock().blocks_topic("events"));
+    broker
+        .publish("events", vec![b"accepted".to_vec()], Duration::ZERO)
         .await
         .unwrap();
 }

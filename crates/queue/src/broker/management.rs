@@ -1,6 +1,7 @@
 use super::*;
 use crate::management::{
-    ChannelManagementAction, ManagementFenceSnapshot, ManagementResult, TopicManagementAction,
+    ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot, ManagementResult,
+    TopicManagementAction,
 };
 use crate::management_ops::OperationLookup;
 
@@ -43,15 +44,15 @@ impl Broker {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             let fingerprint = serde_json::to_string(&("topic", &topic, action))
                 .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
-            let replayed = match broker.prepare_management_operation(
+            let (replayed, operation_id) = match broker.prepare_management_operation(
                 &operation_id,
                 &fingerprint,
                 &topic,
                 expected_revision,
             )? {
                 PreparedOperation::Completed(result) => return Ok(result),
-                PreparedOperation::New => false,
-                PreparedOperation::Pending => true,
+                PreparedOperation::New(id) => (false, id),
+                PreparedOperation::Pending(id) => (true, id),
             };
             let mut changed = false;
             match action {
@@ -106,13 +107,17 @@ impl Broker {
 
     pub async fn manage_channel(
         &self,
-        operation_id: &str,
-        topic: &str,
-        channel: &str,
-        action: ChannelManagementAction,
-        expected_revision: u64,
-        tombstone_until_ms: Option<i64>,
+        command: ChannelManagementCommand<'_>,
     ) -> Result<ManagementResult, BrokerError> {
+        let ChannelManagementCommand {
+            operation_id,
+            topic,
+            channel,
+            action,
+            expected_revision,
+            tombstone_until_ms,
+            require_idle,
+        } = command;
         validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
         validate_channel(channel)?;
         let broker = self.clone();
@@ -121,17 +126,61 @@ impl Broker {
         let channel = channel.to_owned();
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
-            let fingerprint = serde_json::to_string(&("channel", &topic, &channel, action))
-                .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
-            let replayed = match broker.prepare_management_operation(
-                &operation_id,
-                &fingerprint,
-                &topic,
-                expected_revision,
-            )? {
-                PreparedOperation::Completed(result) => return Ok(result),
-                PreparedOperation::New => false,
-                PreparedOperation::Pending => true,
+            let fingerprint =
+                serde_json::to_string(&("channel", &topic, &channel, action, require_idle))
+                    .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
+            let pending_operation = {
+                let operations = broker.inner.management_ops.lock();
+                match operations
+                    .lookup(&operation_id, &fingerprint)
+                    .map_err(operation_catalog_error)?
+                {
+                    OperationLookup::Completed(result) => return Ok(result),
+                    OperationLookup::Pending => Some(operation_id.clone()),
+                    OperationLookup::New => operations.pending_id(&topic, &fingerprint),
+                }
+            };
+            let idle_handle = if action == ChannelManagementAction::Delete && require_idle {
+                match broker.topic(&topic) {
+                    Ok(handle) => Some(handle),
+                    Err(BrokerError::TopicNotFound) if pending_operation.is_some() => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            let mut idle_state = idle_handle.as_ref().map(|handle| handle.state.lock());
+            if let Some(topic_state) = idle_state.as_mut() {
+                let channel_exists = topic_state
+                    .channel_names()
+                    .iter()
+                    .any(|name| name == &channel);
+                if !channel_exists && pending_operation.is_none() {
+                    return Err(BrokerError::ChannelNotFound);
+                }
+                if channel_exists {
+                    let (depth, in_flight, deferred) = topic_state.channel_counts(&channel)?;
+                    if depth != 0 || in_flight != 0 || deferred != 0 {
+                        return Err(BrokerError::ChannelNotIdle {
+                            depth,
+                            in_flight,
+                            deferred,
+                        });
+                    }
+                }
+            }
+            let (replayed, operation_id) = match pending_operation {
+                Some(id) => (true, id),
+                None => match broker.prepare_management_operation(
+                    &operation_id,
+                    &fingerprint,
+                    &topic,
+                    expected_revision,
+                )? {
+                    PreparedOperation::Completed(result) => return Ok(result),
+                    PreparedOperation::New(id) => (false, id),
+                    PreparedOperation::Pending(id) => (true, id),
+                },
             };
             let mut changed = false;
             match action {
@@ -162,24 +211,44 @@ impl Broker {
                 }
                 ChannelManagementAction::Delete | ChannelManagementAction::Tombstone => {
                     let until = valid_tombstone(tombstone_until_ms, replayed)?;
-                    let mut fences = broker.inner.fences.lock();
-                    if fences.set_channel(&topic, &channel, until) {
-                        fences.store(&broker.inner.fences_path)?;
-                        changed = true;
-                    }
-                    drop(fences);
-                    if action == ChannelManagementAction::Delete {
-                        if let Ok(handle) = broker.topic(&topic) {
-                            if handle
-                                .state
-                                .lock()
+                    if let Some(mut topic_state) = idle_state.take() {
+                        let mut fences = broker.inner.fences.lock();
+                        if set_channel_fence(&mut fences, &topic, &channel, until, require_idle) {
+                            fences.store(&broker.inner.fences_path)?;
+                            changed = true;
+                        }
+                        drop(fences);
+                        if action == ChannelManagementAction::Delete
+                            && topic_state
                                 .channel_names()
                                 .iter()
                                 .any(|name| name == &channel)
-                            {
-                                handle.state.lock().delete_channel(&channel)?;
-                                changed = true;
-                            }
+                        {
+                            topic_state.delete_channel(&channel)?;
+                            changed = true;
+                        }
+                    } else if let Ok(handle) = broker.topic(&topic) {
+                        let mut topic_state = handle.state.lock();
+                        let mut fences = broker.inner.fences.lock();
+                        if set_channel_fence(&mut fences, &topic, &channel, until, require_idle) {
+                            fences.store(&broker.inner.fences_path)?;
+                            changed = true;
+                        }
+                        drop(fences);
+                        if action == ChannelManagementAction::Delete
+                            && topic_state
+                                .channel_names()
+                                .iter()
+                                .any(|name| name == &channel)
+                        {
+                            topic_state.delete_channel(&channel)?;
+                            changed = true;
+                        }
+                    } else {
+                        let mut fences = broker.inner.fences.lock();
+                        if set_channel_fence(&mut fences, &topic, &channel, until, require_idle) {
+                            fences.store(&broker.inner.fences_path)?;
+                            changed = true;
                         }
                     }
                 }
@@ -241,8 +310,11 @@ impl Broker {
             .map_err(operation_catalog_error)?
         {
             OperationLookup::Completed(result) => Ok(PreparedOperation::Completed(result)),
-            OperationLookup::Pending => Ok(PreparedOperation::Pending),
+            OperationLookup::Pending => Ok(PreparedOperation::Pending(operation_id.to_owned())),
             OperationLookup::New => {
+                if let Some(pending_id) = operations.pending_id(topic, fingerprint) {
+                    return Ok(PreparedOperation::Pending(pending_id));
+                }
                 self.check_revision(expected_revision)?;
                 operations
                     .prepare(
@@ -252,7 +324,7 @@ impl Broker {
                         topic.to_owned(),
                     )
                     .map_err(operation_catalog_error)?;
-                Ok(PreparedOperation::New)
+                Ok(PreparedOperation::New(operation_id.to_owned()))
             }
         }
     }
@@ -272,8 +344,8 @@ impl Broker {
 }
 
 enum PreparedOperation {
-    New,
-    Pending,
+    New(String),
+    Pending(String),
     Completed(ManagementResult),
 }
 
@@ -281,6 +353,20 @@ fn valid_tombstone(value: Option<i64>, replayed: bool) -> Result<i64, BrokerErro
     value
         .filter(|until| replayed || *until > now_ms())
         .ok_or_else(|| BrokerError::InvalidRecord("active tombstone deadline is required".into()))
+}
+
+fn set_channel_fence(
+    fences: &mut crate::management::FenceCatalog,
+    topic: &str,
+    channel: &str,
+    until_ms: i64,
+    local: bool,
+) -> bool {
+    if local {
+        fences.set_local_channel(topic, channel, until_ms)
+    } else {
+        fences.set_channel(topic, channel, until_ms)
+    }
 }
 
 fn operation_catalog_error(error: std::io::Error) -> BrokerError {

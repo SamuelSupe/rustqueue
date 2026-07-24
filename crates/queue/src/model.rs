@@ -139,6 +139,8 @@ pub struct ChannelGroupCommitStats {
 pub struct TopicStats {
     pub name: String,
     pub paused: bool,
+    #[serde(default)]
+    pub published_count: u64,
     pub message_count: u64,
     #[serde(default)]
     pub segment_count: u64,
@@ -151,8 +153,14 @@ pub struct TopicStats {
 pub struct ChannelStats {
     pub name: String,
     pub depth: u64,
+    #[serde(default)]
+    pub message_count: u64,
     pub in_flight_count: u64,
     pub deferred_count: u64,
+    #[serde(default)]
+    pub requeue_count: u64,
+    #[serde(default)]
+    pub timeout_count: u64,
     pub paused: bool,
     pub ephemeral: bool,
     pub ack_cursor: u64,

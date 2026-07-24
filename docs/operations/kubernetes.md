@@ -8,6 +8,9 @@ predictable; they do not turn a Broker into a replicated shard.
 
 - Use Kubernetes 1.28 or newer.
 - Label only SSD-capable nodes with `rustqueue.io/eligible=true`.
+- Treat that label as persistent membership intent. Cordon and Node NotReady
+  do not reduce the Broker target; remove the label only for an intentional,
+  drain-aware scale-down.
 - Use an RWO StorageClass with `allowVolumeExpansion: true` and working
   `fsGroup` ownership.
 - Keep at least two eligible nodes if image rolling is required. A one-Broker
@@ -73,7 +76,7 @@ Canary approval is optional:
 ```sh
 helm upgrade rustqueue deploy/helm/rustqueue \
   --namespace rustqueue \
-  --set queue.image=registry.example/rustqueue:0.7.2 \
+  --set queue.image=registry.example/rustqueue:0.8.0 \
   --set queue.rollout.requireCanaryApproval=true
 
 rustqueuectl -n rustqueue rollout approve
@@ -85,7 +88,7 @@ Useful controls:
 rustqueuectl -n rustqueue rollout pause
 rustqueuectl -n rustqueue rollout resume
 rustqueuectl -n rustqueue rollout retry
-rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.7.2
+rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.8.0
 rustqueuectl -n rustqueue rollout forward
 ```
 
@@ -130,8 +133,17 @@ Operator CRDs are installed. Treat these default alerts as follows:
   removed old messages to keep the disk operable;
 - `RustQueueOperatorHasNoLeader`: deployment changes are frozen, but existing
   Broker traffic remains independent;
+- `RustQueueBrokerMetricsMissing`, `RustQueueDiscoverySourceUnavailable`, or
+  `RustQueueProxyHasNoPublishBackend`: treat missing telemetry as a runtime
+  outage until the corresponding Service endpoints are verified;
+- `RustQueueKodoGatewayMetricsMissing` or
+  `RustQueueKodoStatsInventoryIncomplete`: restore all three Gateway and Broker
+  Stats shards before trusting Kodo depth or channel-idleness observations;
 - sustained throttling or high fsync p99: investigate PVC latency/capacity and
   producer arrival rate.
+
+The bundled rules select the current Helm namespace and queue Services, so a
+healthy RustQueue release cannot mask a failed release in the same Prometheus.
 
 PDBs affect voluntary Eviction API calls only. Node loss, `kubectl delete pod`,
 and the Operator's already-drained replacement are not prevented by a PDB.

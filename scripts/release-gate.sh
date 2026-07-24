@@ -4,6 +4,7 @@ set -euo pipefail
 FULL="${FULL:-1}"
 K8S_ACCEPTANCE="${K8S_ACCEPTANCE:-0}"
 FUZZ_SECONDS="${FUZZ_SECONDS:-1}"
+KODO_ACCEPTANCE="${KODO_ACCEPTANCE:-0}"
 
 make fmt
 make check
@@ -27,6 +28,11 @@ if [[ "$K8S_ACCEPTANCE" == "1" ]]; then
   make k8s-acceptance
   make k8s-console-management-acceptance
   make k8s-multi-acceptance
+fi
+
+if [[ "$KODO_ACCEPTANCE" == "1" ]]; then
+  make kodo-replay
+  BUILD_IMAGES=1 make kodo-gateway-acceptance
 fi
 
 echo "RustQueue release gate passed"

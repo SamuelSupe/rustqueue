@@ -1,6 +1,7 @@
 use super::auth::AuthSecret;
 use super::ContextData;
 use crate::RustQueue;
+use futures::{stream, StreamExt};
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
@@ -82,6 +83,48 @@ pub(super) async fn resume_current(
     Ok(())
 }
 
+pub(super) async fn resume_all(
+    context: &ContextData,
+    cluster: &RustQueue,
+    namespace: &str,
+    auth: &AuthSecret,
+) -> anyhow::Result<Vec<String>> {
+    let api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
+    let checks = broker_pods(&api, cluster)
+        .await?
+        .into_iter()
+        .filter_map(|pod| {
+            let name = pod.name_any();
+            let ip = pod.status?.pod_ip?;
+            Some((name, ip))
+        });
+    let mut resumed: Vec<_> = stream::iter(checks)
+        .map(|(name, ip)| async move {
+            match drain_status(context, &ip, auth).await {
+                Ok(status) if status.draining => {
+                    match set_drain(context, &ip, auth, false, false).await {
+                        Ok(()) => Some(name),
+                        Err(error) => {
+                            tracing::warn!(broker = %name, %error, "could not resume drained Broker");
+                            None
+                        }
+                    }
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(broker = %name, %error, "could not inspect Broker drain state");
+                    None
+                }
+            }
+        })
+        .buffer_unordered(32)
+        .filter_map(async move |name| name)
+        .collect()
+        .await;
+    resumed.sort();
+    Ok(resumed)
+}
+
 pub(super) async fn scale_down_one(
     context: &ContextData,
     cluster: &RustQueue,
@@ -91,6 +134,21 @@ pub(super) async fn scale_down_one(
 ) -> anyhow::Result<Progress> {
     let next = current - 1;
     let pod_name = format!("{}-{next}", cluster.name_any());
+    let pods = broker_pods(
+        &Api::<Pod>::namespaced(context.client.clone(), namespace),
+        cluster,
+    )
+    .await?;
+    if !other_brokers_ready(&pods, &pod_name, current) {
+        resume_one(context, namespace, &pod_name, auth).await?;
+        return Ok(Progress {
+            target: Some(pod_name.clone()),
+            phase: "WaitingForReady",
+            message: format!(
+                "resumed scale-down target {pod_name}; waiting for every other Broker to become Ready"
+            ),
+        });
+    }
     if drain_pod(context, namespace, &pod_name, DrainGoal::Empty, auth).await? {
         Api::<StatefulSet>::namespaced(context.client.clone(), namespace)
             .patch(
@@ -122,7 +180,9 @@ pub(super) async fn rollout_one(
 ) -> anyhow::Result<Progress> {
     let api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
     let pods = broker_pods(&api, cluster).await?;
-    let decision = rollout_decision(&pods, &options);
+    let draining =
+        intentionally_draining_pods(context, &pods, options.desired_revision, auth).await;
+    let decision = rollout_decision(&pods, &options, &draining);
     match decision {
         Decision::Completed => Ok(Progress {
             target: None,
@@ -152,6 +212,16 @@ pub(super) async fn rollout_one(
             phase: "Blocked",
             message,
         }),
+        Decision::Resume(names, message) => {
+            for name in names {
+                resume_one(context, namespace, &name, auth).await?;
+            }
+            Ok(Progress {
+                target: None,
+                phase: "WaitingForReady",
+                message,
+            })
+        }
         Decision::Replace(name) => {
             if drain_pod(context, namespace, &name, DrainGoal::Quiesced, auth).await? {
                 api.delete(&name, &DeleteParams::default()).await?;
@@ -171,6 +241,28 @@ pub(super) async fn rollout_one(
     }
 }
 
+pub(super) async fn resume_one(
+    context: &ContextData,
+    namespace: &str,
+    broker: &str,
+    auth: &AuthSecret,
+) -> anyhow::Result<()> {
+    let Some(pod) = Api::<Pod>::namespaced(context.client.clone(), namespace)
+        .get_opt(broker)
+        .await?
+    else {
+        return Ok(());
+    };
+    let Some(ip) = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.pod_ip.as_deref())
+    else {
+        return Ok(());
+    };
+    set_drain(context, ip, auth, false, false).await
+}
+
 pub(super) async fn maintenance(
     context: &ContextData,
     cluster: &RustQueue,
@@ -186,10 +278,29 @@ pub(super) async fn maintenance(
         cluster.name_any()
     );
     let api: Api<Pod> = Api::namespaced(context.client.clone(), namespace);
-    let pod = api
-        .get_opt(broker)
-        .await?
+    let pods = broker_pods(&api, cluster).await?;
+    let pod = pods
+        .iter()
+        .find(|pod| pod.name_any() == broker)
         .ok_or_else(|| anyhow::anyhow!("maintenance target {broker} does not exist"))?;
+    if enabled {
+        let replicas = Api::<StatefulSet>::namespaced(context.client.clone(), namespace)
+            .get(&cluster.name_any())
+            .await?
+            .spec
+            .and_then(|spec| spec.replicas)
+            .unwrap_or_default();
+        if !other_brokers_ready(&pods, broker, replicas) {
+            resume_one(context, namespace, broker, auth).await?;
+            return Ok(Progress {
+                target: Some(broker.into()),
+                phase: "Blocked",
+                message: format!(
+                    "resumed maintenance target {broker}; maintenance is blocked until every other Broker is Ready"
+                ),
+            });
+        }
+    }
     let ip = pod
         .status
         .as_ref()
@@ -232,6 +343,21 @@ pub(super) async fn previous_image(
         .map(ToOwned::to_owned))
 }
 
+pub(super) async fn brokers_current_and_ready(
+    context: &ContextData,
+    cluster: &RustQueue,
+    namespace: &str,
+    desired_revision: &str,
+    replicas: i32,
+) -> anyhow::Result<bool> {
+    let api = Api::<Pod>::namespaced(context.client.clone(), namespace);
+    Ok(broker_set_current_and_ready(
+        &broker_pods(&api, cluster).await?,
+        desired_revision,
+        replicas,
+    ))
+}
+
 async fn broker_pods(api: &Api<Pod>, cluster: &RustQueue) -> anyhow::Result<Vec<Pod>> {
     let selector = format!(
         "app.kubernetes.io/instance={},app.kubernetes.io/component=broker",
@@ -243,41 +369,92 @@ async fn broker_pods(api: &Api<Pod>, cluster: &RustQueue) -> anyhow::Result<Vec<
         .items)
 }
 
+fn broker_set_current_and_ready(pods: &[Pod], desired_revision: &str, replicas: i32) -> bool {
+    if !exact_broker_pod_set(pods, replicas) {
+        return false;
+    }
+    let ordinals: std::collections::BTreeSet<_> = pods
+        .iter()
+        .filter(|pod| pod_revision(pod) == Some(desired_revision) && pod_ready(pod))
+        .filter_map(|pod| pod_ordinal(&pod.name_any()))
+        .collect();
+    ordinals == (0..replicas as u32).collect()
+}
+
 enum Decision {
     Completed,
     Wait(String),
     Paused,
     AwaitingApproval,
     Blocked(String),
+    Resume(Vec<String>, String),
     Replace(String),
 }
 
-fn rollout_decision(pods: &[Pod], options: &RolloutOptions<'_>) -> Decision {
-    if pods.len() < options.replicas as usize {
+fn rollout_decision(
+    pods: &[Pod],
+    options: &RolloutOptions<'_>,
+    intentionally_draining: &std::collections::BTreeSet<String>,
+) -> Decision {
+    if !exact_broker_pod_set(pods, options.replicas) {
         return Decision::Wait(format!(
-            "waiting for {} of {} broker Pods to exist",
+            "waiting for the exact {}-Pod Broker ordinal set; observed {} Pods",
+            options.replicas,
             pods.len(),
-            options.replicas
         ));
     }
     let current: Vec<_> = pods
         .iter()
         .filter(|pod| pod_revision(pod) == Some(options.desired_revision))
         .collect();
-    if let Some(pod) = current.iter().find(|pod| !pod_ready(pod)) {
-        return Decision::Wait(format!(
-            "waiting for replacement broker {} to become Ready",
-            pod.name_any()
-        ));
-    }
     let mut outdated: Vec<_> = pods
         .iter()
         .filter(|pod| pod_revision(pod) != Some(options.desired_revision))
         .collect();
     if outdated.is_empty() {
-        return Decision::Completed;
+        return current
+            .iter()
+            .find(|pod| !pod_ready(pod))
+            .map_or(Decision::Completed, |pod| {
+                Decision::Wait(format!(
+                    "waiting for current broker {} to become Ready",
+                    pod.name_any()
+                ))
+            });
     }
-    if let Some(pod) = outdated.iter().find(|pod| !pod_ready(pod)) {
+    let draining: Vec<_> = outdated
+        .iter()
+        .filter(|pod| !pod_ready(pod) && intentionally_draining.contains(&pod.name_any()))
+        .map(|pod| pod.name_any())
+        .collect();
+    if let Some(pod) = current.iter().find(|pod| !pod_ready(pod)) {
+        if !draining.is_empty() {
+            return Decision::Resume(
+                draining,
+                format!(
+                    "resumed an in-progress drain because current broker {} is unavailable",
+                    pod.name_any()
+                ),
+            );
+        }
+        return Decision::Wait(format!(
+            "waiting for replacement broker {} to become Ready",
+            pod.name_any()
+        ));
+    }
+    if let Some(pod) = outdated
+        .iter()
+        .find(|pod| !pod_ready(pod) && !intentionally_draining.contains(&pod.name_any()))
+    {
+        if !draining.is_empty() {
+            return Decision::Resume(
+                draining,
+                format!(
+                    "resumed an in-progress drain because outdated broker {} is also unavailable",
+                    pod.name_any()
+                ),
+            );
+        }
         return Decision::Wait(format!(
             "outdated broker {} is not Ready; refusing to make another broker unavailable",
             pod.name_any()
@@ -285,6 +462,15 @@ fn rollout_decision(pods: &[Pod], options: &RolloutOptions<'_>) -> Decision {
     }
     if options.replicas < 2 {
         return Decision::Blocked("rolling replacement needs at least two brokers".into());
+    }
+    if draining.len() > 1 {
+        return Decision::Resume(
+            draining,
+            "resumed multiple in-progress drains; only one Broker may be disrupted".into(),
+        );
+    }
+    if let Some(name) = draining.into_iter().next() {
+        return Decision::Replace(name);
     }
     if options.paused {
         return Decision::Paused;
@@ -297,6 +483,41 @@ fn rollout_decision(pods: &[Pod], options: &RolloutOptions<'_>) -> Decision {
     }
     outdated.sort_by_key(|pod| pod_ordinal(&pod.name_any()).unwrap_or_default());
     Decision::Replace(outdated.pop().expect("non-empty outdated set").name_any())
+}
+
+async fn intentionally_draining_pods(
+    context: &ContextData,
+    pods: &[Pod],
+    desired_revision: &str,
+    auth: &AuthSecret,
+) -> std::collections::BTreeSet<String> {
+    let mut draining = std::collections::BTreeSet::new();
+    for pod in pods
+        .iter()
+        .filter(|pod| !pod_ready(pod) && pod_revision(pod) != Some(desired_revision))
+    {
+        let Some(ip) = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.pod_ip.as_deref())
+        else {
+            continue;
+        };
+        match drain_status(context, ip, auth).await {
+            Ok(status) if status.draining => {
+                draining.insert(pod.name_any());
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    broker = %pod.name_any(),
+                    %error,
+                    "could not verify whether unavailable Broker is intentionally draining"
+                );
+            }
+        }
+    }
+    draining
 }
 
 async fn drain_pod(
@@ -389,6 +610,41 @@ fn pod_ready(pod: &Pod) -> bool {
             })
 }
 
+fn other_brokers_ready(pods: &[Pod], target: &str, replicas: i32) -> bool {
+    if !exact_broker_pod_set(pods, replicas) {
+        return false;
+    }
+    let Some(replicas) = u32::try_from(replicas).ok() else {
+        return false;
+    };
+    let Some(target_ordinal) = pod_ordinal(target).filter(|ordinal| *ordinal < replicas) else {
+        return false;
+    };
+    let ready: std::collections::BTreeSet<_> = pods
+        .iter()
+        .filter(|pod| pod.name_any() != target && pod_ready(pod))
+        .filter_map(|pod| pod_ordinal(&pod.name_any()))
+        .collect();
+    ready
+        == (0..replicas)
+            .filter(|ordinal| *ordinal != target_ordinal)
+            .collect()
+}
+
+fn exact_broker_pod_set(pods: &[Pod], replicas: i32) -> bool {
+    let Ok(replicas) = u32::try_from(replicas) else {
+        return false;
+    };
+    if replicas == 0 || pods.len() != replicas as usize {
+        return false;
+    }
+    let ordinals: std::collections::BTreeSet<_> = pods
+        .iter()
+        .filter_map(|pod| pod_ordinal(&pod.name_any()))
+        .collect();
+    ordinals.len() == pods.len() && ordinals == (0..replicas).collect()
+}
+
 fn origin(ip: &str) -> String {
     if ip.contains(':') {
         format!("http://[{ip}]:4151")
@@ -446,7 +702,7 @@ mod tests {
             pod("queue-2", "new", false),
         ];
         assert!(matches!(
-            rollout_decision(&pods, &options("new")),
+            rollout_decision(&pods, &options("new"), &Default::default()),
             Decision::Wait(_)
         ));
     }
@@ -459,8 +715,102 @@ mod tests {
             pod("queue-2", "old", true),
         ];
         assert!(matches!(
-            rollout_decision(&pods, &options("new")),
+            rollout_decision(&pods, &options("new"), &Default::default()),
             Decision::Wait(message) if message.contains("refusing")
+        ));
+    }
+
+    #[test]
+    fn rollout_continues_the_one_intentionally_draining_broker() {
+        let pods = vec![
+            pod("queue-0", "old", true),
+            pod("queue-1", "old", true),
+            pod("queue-2", "old", false),
+        ];
+        assert!(matches!(
+            rollout_decision(
+                &pods,
+                &options("new"),
+                &["queue-2".into()].into_iter().collect()
+            ),
+            Decision::Replace(name) if name == "queue-2"
+        ));
+    }
+
+    #[test]
+    fn rollout_resumes_its_drain_if_another_broker_becomes_unavailable() {
+        let pods = vec![
+            pod("queue-0", "old", false),
+            pod("queue-1", "old", true),
+            pod("queue-2", "old", false),
+        ];
+        assert!(matches!(
+            rollout_decision(
+                &pods,
+                &options("new"),
+                &["queue-2".into()].into_iter().collect()
+            ),
+            Decision::Resume(names, _) if names == ["queue-2"]
+        ));
+    }
+
+    #[test]
+    fn rollout_resumes_its_drain_if_a_current_broker_becomes_unavailable() {
+        let pods = vec![
+            pod("queue-0", "new", false),
+            pod("queue-1", "old", true),
+            pod("queue-2", "old", false),
+        ];
+        assert!(matches!(
+            rollout_decision(
+                &pods,
+                &options("new"),
+                &["queue-2".into()].into_iter().collect()
+            ),
+            Decision::Resume(names, _) if names == ["queue-2"]
+        ));
+    }
+
+    #[test]
+    fn maintenance_and_scale_down_require_every_other_broker_to_be_ready() {
+        let pods = vec![
+            pod("queue-0", "current", true),
+            pod("queue-1", "current", true),
+            pod("queue-2", "current", false),
+        ];
+        assert!(other_brokers_ready(&pods, "queue-2", 3));
+        assert!(!other_brokers_ready(&pods, "queue-1", 3));
+        assert!(!other_brokers_ready(
+            &[pods[0].clone(), pods[2].clone()],
+            "queue-2",
+            3
+        ));
+        let mut with_stale = pods.clone();
+        with_stale.push(pod("queue-3", "old", true));
+        assert!(!other_brokers_ready(&with_stale, "queue-2", 3));
+    }
+
+    #[test]
+    fn rollout_waits_for_stale_or_malformed_broker_pods_to_disappear() {
+        let mut extra = vec![
+            pod("queue-0", "old", true),
+            pod("queue-1", "old", true),
+            pod("queue-2", "old", true),
+        ];
+        extra.push(pod("queue-3", "old", true));
+        assert!(matches!(
+            rollout_decision(&extra, &options("new"), &Default::default()),
+            Decision::Wait(message) if message.contains("exact")
+        ));
+
+        let duplicate = vec![
+            pod("queue-0", "old", true),
+            pod("another-0", "old", true),
+            pod("queue-2", "old", true),
+        ];
+        assert!(matches!(
+            rollout_decision(&duplicate, &options("new"), &Default::default()),
+            Decision::Wait(message) if message.contains("exact")
         ));
     }
 
@@ -474,12 +824,12 @@ mod tests {
         let mut options = options("new");
         options.require_canary_approval = true;
         assert!(matches!(
-            rollout_decision(&pods, &options),
+            rollout_decision(&pods, &options, &Default::default()),
             Decision::AwaitingApproval
         ));
         options.approved_revision = Some("new");
         assert!(matches!(
-            rollout_decision(&pods, &options),
+            rollout_decision(&pods, &options, &Default::default()),
             Decision::Replace(_)
         ));
     }
@@ -490,8 +840,21 @@ mod tests {
         let mut options = options("current");
         options.replicas = 1;
         assert!(matches!(
-            rollout_decision(&pods, &options),
+            rollout_decision(&pods, &options, &Default::default()),
             Decision::Completed
+        ));
+    }
+
+    #[test]
+    fn current_revision_is_not_complete_until_every_broker_is_ready() {
+        let pods = vec![
+            pod("queue-0", "current", true),
+            pod("queue-1", "current", false),
+            pod("queue-2", "current", true),
+        ];
+        assert!(matches!(
+            rollout_decision(&pods, &options("current"), &Default::default()),
+            Decision::Wait(message) if message.contains("queue-1")
         ));
     }
 
@@ -500,6 +863,25 @@ mod tests {
         let mut names = vec!["queue-9", "queue-10", "queue-499", "queue-100"];
         names.sort_by_key(|name| pod_ordinal(name).unwrap());
         assert_eq!(names.pop(), Some("queue-499"));
+    }
+
+    #[test]
+    fn target_broker_readiness_requires_the_complete_current_revision() {
+        let ready = vec![
+            pod("queue-0", "current", true),
+            pod("queue-1", "current", true),
+            pod("queue-2", "current", true),
+        ];
+        assert!(broker_set_current_and_ready(&ready, "current", 3));
+
+        let mut outdated = ready.clone();
+        outdated[1] = pod("queue-1", "old", true);
+        assert!(!broker_set_current_and_ready(&outdated, "current", 3));
+
+        let mut unready = ready.clone();
+        unready[2] = pod("queue-2", "current", false);
+        assert!(!broker_set_current_and_ready(&unready, "current", 3));
+        assert!(!broker_set_current_and_ready(&ready[..2], "current", 3));
     }
 
     #[test]

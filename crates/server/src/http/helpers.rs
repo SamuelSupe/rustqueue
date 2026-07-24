@@ -1,3 +1,4 @@
+use super::tokens::TokenSource;
 use super::*;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ pub(super) async fn publish_write(
         return Err(ApiError::unavailable("E_DRAINING", "broker is draining"));
     }
     if !state.broker.storage_healthy() {
+        state.metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
         return Err(ApiError::unavailable(
             "E_STORAGE",
             "local storage is isolated; broker restart is required",
@@ -36,7 +38,7 @@ pub(super) async fn publish_write(
             "local disk is above its publish watermark",
         ));
     }
-    Ok(state
+    let result = state
         .broker
         .publish_guarded(
             topic,
@@ -44,23 +46,11 @@ pub(super) async fn publish_write(
             Duration::from_millis(defer_ms),
             reservation,
         )
-        .await?)
-}
-
-pub(super) fn filter_stats(
-    mut stats: BrokerStats,
-    topic: Option<&str>,
-    channel: Option<&str>,
-) -> BrokerStats {
-    if let Some(topic) = topic {
-        stats.topics.retain(|candidate| candidate.name == topic);
+        .await;
+    if result.as_ref().is_err_and(crate::tcp::broker_storage_error) {
+        state.metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
     }
-    if let Some(channel) = channel {
-        for topic in &mut stats.topics {
-            topic.channels.retain(|candidate| candidate.name == channel);
-        }
-    }
-    stats
+    Ok(result?)
 }
 
 pub(super) async fn read_publish_body(
@@ -136,9 +126,15 @@ pub(super) fn parse_text_mpub(body: Bytes, max: usize) -> Result<Vec<Bytes>, Api
 
 pub(super) fn authorize(
     headers: &HeaderMap,
-    expected: Option<&str>,
+    expected: &TokenSource,
     scope: &'static str,
 ) -> Result<(), ApiError> {
+    let expected = expected.expected().map_err(|unavailable| {
+        ApiError::unavailable(
+            "E_AUTH_UNAVAILABLE",
+            format!("{unavailable} authorization token is unavailable"),
+        )
+    })?;
     let Some(expected) = expected else {
         return Ok(());
     };
@@ -164,10 +160,23 @@ pub(super) fn authorize(
 
 pub(super) fn authorize_any(
     headers: &HeaderMap,
-    expected: &[Option<&str>],
+    expected: &[&TokenSource],
     scope: &'static str,
 ) -> Result<(), ApiError> {
-    let expected: Vec<_> = expected.iter().flatten().copied().collect();
+    let expected: Vec<_> = expected
+        .iter()
+        .map(|source| {
+            source.expected().map_err(|unavailable| {
+                ApiError::unavailable(
+                    "E_AUTH_UNAVAILABLE",
+                    format!("{unavailable} authorization token is unavailable"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     if expected.is_empty() {
         return Ok(());
     }

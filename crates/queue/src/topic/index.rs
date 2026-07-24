@@ -4,7 +4,7 @@ use super::recovery;
 use crate::model::MessageMeta;
 use crate::BrokerError;
 use rustqueue_storage::RecoveryMetadataRef;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -32,6 +32,7 @@ struct SealedMessages {
 pub(crate) struct MessageIndex {
     sealed: VecDeque<SealedMessages>,
     active: VecDeque<MessageMeta>,
+    scheduled: BTreeMap<i64, BTreeSet<u64>>,
     total_count: u64,
     cache: Arc<MessageIndexCache>,
 }
@@ -41,6 +42,7 @@ impl MessageIndex {
         Self {
             sealed: VecDeque::new(),
             active: VecDeque::new(),
+            scheduled: BTreeMap::new(),
             total_count: 0,
             cache,
         }
@@ -50,8 +52,11 @@ impl MessageIndex {
         &mut self,
         metadata: RecoveryMetadataRef,
     ) -> Result<(), BrokerError> {
-        let summary = recovery::inspect(&metadata)?;
-        self.push_sealed(SealedMessages::from_summary(metadata, summary))
+        let summary = recovery::inspect(&metadata, unix_ms())?;
+        let scheduled = summary.scheduled.clone();
+        self.push_sealed(SealedMessages::from_summary(metadata, summary))?;
+        self.extend_scheduled(scheduled);
+        Ok(())
     }
 
     pub(crate) fn recover_active(&mut self, messages: Vec<MessageMeta>) -> Result<(), BrokerError> {
@@ -194,6 +199,14 @@ impl MessageIndex {
         self.total_count
     }
 
+    pub(crate) fn deferred_positions(&mut self, now_ms: i64) -> BTreeSet<u64> {
+        self.scheduled = self.scheduled.split_off(&now_ms.saturating_add(1));
+        self.scheduled
+            .values()
+            .flat_map(|positions| positions.iter().copied())
+            .collect()
+    }
+
     pub(crate) fn active_count(&self) -> usize {
         self.active.len()
     }
@@ -302,12 +315,27 @@ impl MessageIndex {
             .sealed
             .iter()
             .filter(|segment| !existing.contains(segment.metadata.segment_path()))
-            .map(|segment| (segment.metadata.segment_path().to_path_buf(), segment.count))
+            .map(|segment| {
+                (
+                    segment.metadata.segment_path().to_path_buf(),
+                    segment.count,
+                    segment.first_position,
+                    segment.last_position,
+                )
+            })
             .collect();
-        for (path, count) in &removed {
+        for (path, count, _, _) in &removed {
             self.total_count = self.total_count.saturating_sub(*count);
             self.cache.invalidate(path);
         }
+        self.scheduled.retain(|_, positions| {
+            positions.retain(|position| {
+                !removed
+                    .iter()
+                    .any(|(_, _, first, last)| (*first..=*last).contains(position))
+            });
+            !positions.is_empty()
+        });
         self.sealed
             .retain(|segment| existing.contains(segment.metadata.segment_path()));
     }
@@ -340,8 +368,24 @@ impl MessageIndex {
             expected = Some(message.position.saturating_add(1));
         }
         self.total_count = self.total_count.saturating_add(messages.len() as u64);
+        let now_ms = unix_ms();
+        self.extend_scheduled(
+            messages
+                .iter()
+                .filter(|message| message.available_at_ms > now_ms)
+                .map(|message| (message.available_at_ms, message.position)),
+        );
         self.active.extend(messages);
         Ok(())
+    }
+
+    fn extend_scheduled(&mut self, scheduled: impl IntoIterator<Item = (i64, u64)>) {
+        for (available_at_ms, position) in scheduled {
+            self.scheduled
+                .entry(available_at_ms)
+                .or_default()
+                .insert(position);
+        }
     }
 
     fn load_ordinal(
@@ -387,6 +431,14 @@ impl MessageIndex {
         self.sealed.push_back(segment);
         Ok(())
     }
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 impl Drop for MessageIndex {

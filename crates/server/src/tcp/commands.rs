@@ -9,6 +9,7 @@ pub(super) async fn process_command(
     metrics: &Metrics,
     authenticator: Option<&Authenticator>,
     ephemeral_consumers: &EphemeralConsumers,
+    subscriptions: &SubscriptionRegistry,
     state: &mut SessionState,
     writer: &mut ClientWriter,
 ) -> anyhow::Result<bool> {
@@ -53,6 +54,7 @@ pub(super) async fn process_command(
                     });
                     state.auth = Some(session);
                     state.auth_secret = Some(secret.to_vec());
+                    state.client_identity.authed = true;
                     write_frame(writer, FrameType::Response, &serde_json::to_vec(&response)?)
                         .await?;
                 }
@@ -91,6 +93,15 @@ pub(super) async fn process_command(
             {
                 return Ok(false);
             }
+            let lease =
+                match subscriptions.register(&topic, &channel, state.client_identity.clone()) {
+                    Ok(lease) => lease,
+                    Err(_) => {
+                        write_error(writer, "E_SUB_FAILED", "channel deletion is in progress")
+                            .await?;
+                        return Ok(false);
+                    }
+                };
             let create_result = if channel.ends_with("#ephemeral") {
                 ephemeral_consumers.register(broker, &topic, &channel).await
             } else {
@@ -98,7 +109,11 @@ pub(super) async fn process_command(
             };
             match create_result {
                 Ok(()) => {
-                    state.subscription = Some(Subscription { topic, channel });
+                    state.subscription = Some(Subscription {
+                        topic,
+                        channel,
+                        lease,
+                    });
                     write_frame(writer, FrameType::Response, OK).await?;
                 }
                 Err(error) => {
@@ -120,6 +135,7 @@ pub(super) async fn process_command(
                 vec![body.unwrap_or_default()],
                 Duration::ZERO,
                 publish_reservation,
+                config.limits.disconnect_on_retriable_publish_error,
             )
             .await?
             {
@@ -147,6 +163,7 @@ pub(super) async fn process_command(
                 messages,
                 Duration::ZERO,
                 publish_reservation,
+                config.limits.disconnect_on_retriable_publish_error,
             )
             .await?
             {
@@ -170,6 +187,7 @@ pub(super) async fn process_command(
                 vec![body.unwrap_or_default()],
                 Duration::from_millis(delay_ms),
                 publish_reservation,
+                config.limits.disconnect_on_retriable_publish_error,
             )
             .await?
             {
@@ -185,6 +203,7 @@ pub(super) async fn process_command(
                 return Ok(false);
             } else {
                 state.rdy = count;
+                state.update_subscription_flow();
             }
         }
         Command::Finish(id) => {
@@ -201,6 +220,10 @@ pub(super) async fn process_command(
             match finish_result {
                 Ok(()) => {
                     state.in_flight.remove(&id);
+                    if let Some(subscription) = &state.subscription {
+                        subscription.lease.observe_finish();
+                    }
+                    state.update_subscription_flow();
                     metrics.finished_messages.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(error) => write_broker_error(writer, "E_FIN_FAILED", error).await?,
@@ -227,6 +250,10 @@ pub(super) async fn process_command(
             match requeue_result {
                 Ok(()) => {
                     state.in_flight.remove(&id);
+                    if let Some(subscription) = &state.subscription {
+                        subscription.lease.observe_requeue();
+                    }
+                    state.update_subscription_flow();
                     metrics.requeued_messages.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(error) => write_broker_error(writer, "E_REQ_FAILED", error).await?,
@@ -263,6 +290,7 @@ pub(super) async fn process_command(
             }
             state.closing = true;
             state.rdy = 0;
+            state.update_subscription_flow();
             write_frame(writer, FrameType::Response, CLOSE_WAIT).await?;
         }
         Command::Noop => {}
@@ -280,6 +308,7 @@ async fn publish_tcp(
     messages: Vec<Bytes>,
     delay: Duration,
     reservation: Option<PublishReservation>,
+    disconnect_on_retriable_error: bool,
 ) -> anyhow::Result<bool> {
     let message_count = messages.len() as u64;
     let byte_count = messages.iter().map(Bytes::len).sum::<usize>() as u64;
@@ -296,11 +325,33 @@ async fn publish_tcp(
             Ok(true)
         }
         Err(error) => {
-            metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
-            write_broker_error(writer, error_code, error).await?;
+            if broker_storage_error(&error) {
+                metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            let retryable = precommit_retryable_publish_error(&error);
+            if disconnect_on_retriable_error && retryable {
+                return Ok(false);
+            }
+            write_broker_error(
+                writer,
+                if retryable { "E_PUB_RETRY" } else { error_code },
+                error,
+            )
+            .await?;
             Ok(false)
         }
     }
+}
+
+fn precommit_retryable_publish_error(error: &BrokerError) -> bool {
+    matches!(
+        error,
+        BrokerError::TopicRetiring
+            | BrokerError::ManagementUnavailable
+            | BrokerError::TopicLimit
+            | BrokerError::PublishWorkerLimit
+            | BrokerError::SequenceExhausted
+    )
 }
 
 pub(super) async fn publish_messages(
@@ -327,4 +378,45 @@ pub(super) async fn finish_message(
     id: u64,
 ) -> Result<(), BrokerError> {
     broker.finish(topic, channel, id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{broker_storage_error, precommit_retryable_publish_error};
+    use rustqueue_queue::BrokerError;
+
+    #[test]
+    fn only_guaranteed_precommit_failures_are_retryable() {
+        assert!(precommit_retryable_publish_error(
+            &BrokerError::TopicRetiring
+        ));
+        assert!(precommit_retryable_publish_error(
+            &BrokerError::PublishWorkerLimit
+        ));
+        assert!(precommit_retryable_publish_error(
+            &BrokerError::SequenceExhausted
+        ));
+        assert!(!precommit_retryable_publish_error(
+            &BrokerError::StorageUnavailable
+        ));
+        assert!(!precommit_retryable_publish_error(
+            &BrokerError::InvalidRecord("corrupt local state".into())
+        ));
+        assert!(!precommit_retryable_publish_error(
+            &BrokerError::MessageTooLarge
+        ));
+        assert!(!precommit_retryable_publish_error(
+            &BrokerError::TopicTombstoned
+        ));
+    }
+
+    #[test]
+    fn only_storage_failures_increment_the_storage_error_metric() {
+        assert!(broker_storage_error(&BrokerError::StorageUnavailable));
+        assert!(broker_storage_error(&BrokerError::InvalidRecord(
+            "corrupt local state".into()
+        )));
+        assert!(!broker_storage_error(&BrokerError::TopicLimit));
+        assert!(!broker_storage_error(&BrokerError::TopicRetiring));
+    }
 }

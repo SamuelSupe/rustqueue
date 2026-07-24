@@ -28,6 +28,17 @@ pub enum ChannelManagementAction {
     Tombstone,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelManagementCommand<'a> {
+    pub operation_id: &'a str,
+    pub topic: &'a str,
+    pub channel: &'a str,
+    pub action: ChannelManagementAction,
+    pub expected_revision: u64,
+    pub tombstone_until_ms: Option<i64>,
+    pub require_idle: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ManagementFenceSnapshot {
     #[serde(default)]
@@ -60,6 +71,8 @@ pub(crate) struct FenceCatalog {
     topics: BTreeMap<String, i64>,
     #[serde(default)]
     channels: BTreeMap<String, i64>,
+    #[serde(default)]
+    local_channels: BTreeMap<String, i64>,
 }
 
 impl Default for FenceCatalog {
@@ -69,6 +82,7 @@ impl Default for FenceCatalog {
             revision: String::new(),
             topics: BTreeMap::new(),
             channels: BTreeMap::new(),
+            local_channels: BTreeMap::new(),
         }
     }
 }
@@ -95,9 +109,12 @@ impl FenceCatalog {
     }
 
     pub(crate) fn channel_blocked(&self, topic: &str, channel: &str, now_ms: i64) -> bool {
-        self.channels
-            .get(&channel_key(topic, channel))
-            .is_some_and(|until| *until > now_ms)
+        let key = channel_key(topic, channel);
+        self.channels.get(&key).is_some_and(|until| *until > now_ms)
+            || self
+                .local_channels
+                .get(&key)
+                .is_some_and(|until| *until > now_ms)
     }
 
     pub(crate) fn set_topic(&mut self, topic: &str, until_ms: i64) -> bool {
@@ -112,11 +129,22 @@ impl FenceCatalog {
         self.channels.insert(channel_key(topic, channel), until_ms) != Some(until_ms)
     }
 
+    pub(crate) fn set_local_channel(&mut self, topic: &str, channel: &str, until_ms: i64) -> bool {
+        self.local_channels
+            .insert(channel_key(topic, channel), until_ms)
+            != Some(until_ms)
+    }
+
     pub(crate) fn clear_channel(&mut self, topic: &str, channel: &str) -> bool {
-        self.channels.remove(&channel_key(topic, channel)).is_some()
+        let key = channel_key(topic, channel);
+        let removed_global = self.channels.remove(&key).is_some();
+        let removed_local = self.local_channels.remove(&key).is_some();
+        removed_global || removed_local
     }
 
     pub(crate) fn replace(&mut self, snapshot: ManagementFenceSnapshot) {
+        let now_ms = unix_millis();
+        self.local_channels.retain(|_, until_ms| *until_ms > now_ms);
         self.revision = snapshot.revision;
         self.topics = snapshot.topics;
         self.channels = snapshot
@@ -125,6 +153,14 @@ impl FenceCatalog {
             .map(|fence| (channel_key(&fence.topic, &fence.channel), fence.until_ms))
             .collect();
     }
+}
+
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn channel_key(topic: &str, channel: &str) -> String {
@@ -145,5 +181,33 @@ mod tests {
         let mut catalog = FenceCatalog::default();
         catalog.set_topic("orders", 9);
         assert!(!catalog.topic_blocked("orders", 9));
+    }
+
+    #[test]
+    fn snapshot_sync_preserves_only_active_kodo_fences() {
+        let mut catalog = FenceCatalog::default();
+        let active = unix_millis() + 60_000;
+        catalog.set_local_channel("events", "kodo", active);
+        catalog.set_local_channel("events", "expired", unix_millis() - 1);
+        catalog.set_channel("events", "console", active);
+        catalog.replace(ManagementFenceSnapshot {
+            revision: "console-2".into(),
+            topics: BTreeMap::new(),
+            channels: Vec::new(),
+        });
+        assert!(catalog.channel_blocked("events", "kodo", unix_millis()));
+        assert!(!catalog.channel_blocked("events", "expired", unix_millis()));
+        assert!(!catalog.channel_blocked("events", "console", unix_millis()));
+    }
+
+    #[test]
+    fn kodo_fences_survive_catalog_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let (path, mut catalog) = FenceCatalog::load(root.path()).unwrap();
+        catalog.set_local_channel("events", "workers", unix_millis() + 60_000);
+        catalog.store(&path).unwrap();
+
+        let (_, reopened) = FenceCatalog::load(root.path()).unwrap();
+        assert!(reopened.channel_blocked("events", "workers", unix_millis()));
     }
 }

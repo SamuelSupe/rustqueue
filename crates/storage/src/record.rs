@@ -1,9 +1,10 @@
 use std::io;
 
 pub const HEADER_LEN: usize = 48;
-// Public publish payload is capped at 64 MiB. The durable envelope also needs
-// room for per-message IDs, timestamps, lengths and checksums.
-pub const MAX_RECORD_BYTES: usize = 72 * 1024 * 1024;
+pub const LEGACY_MAX_RECORD_BYTES: usize = 72 * 1024 * 1024;
+// A 128 MiB command body can grow by 20 bytes per message in the durable
+// envelope. Keep enough bounded headroom for the maximum supported batch.
+pub const MAX_RECORD_BYTES: usize = 160 * 1024 * 1024;
 const MAGIC: &[u8; 4] = b"RQV7";
 const VERSION: u8 = 7;
 
@@ -32,8 +33,9 @@ impl TryFrom<u8> for RecordKind {
 }
 
 impl RecordKind {
-    pub const fn required_writer_feature_level(self) -> u32 {
+    pub const fn required_writer_feature_level(self, payload_len: usize) -> u32 {
         match self {
+            Self::PublishBatch if payload_len > LEGACY_MAX_RECORD_BYTES => 2,
             Self::PublishBatch | Self::EvictionGap | Self::Noop => 1,
         }
     }
@@ -85,12 +87,7 @@ impl Record {
     }
 
     pub fn decode(header: &[u8; HEADER_LEN], payload: Vec<u8>) -> io::Result<Self> {
-        if &header[0..4] != MAGIC || header[4] != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid record magic or version",
-            ));
-        }
+        let decoded = RecordHeader::decode(header)?;
         let expected_len = u32::from_be_bytes(header[40..44].try_into().unwrap()) as usize;
         if expected_len != payload.len() || expected_len > MAX_RECORD_BYTES {
             return Err(io::Error::new(
@@ -107,12 +104,12 @@ impl Record {
             ));
         }
         Ok(Self {
-            kind: RecordKind::try_from(header[5])?,
-            flags: u16::from_be_bytes(header[6..8].try_into().unwrap()),
-            index: u64::from_be_bytes(header[8..16].try_into().unwrap()),
-            timestamp_ns: i64::from_be_bytes(header[16..24].try_into().unwrap()),
-            message_id: u64::from_be_bytes(header[24..32].try_into().unwrap()),
-            available_at_ms: i64::from_be_bytes(header[32..40].try_into().unwrap()),
+            kind: decoded.kind,
+            flags: decoded.flags,
+            index: decoded.index,
+            timestamp_ns: decoded.timestamp_ns,
+            message_id: decoded.message_id,
+            available_at_ms: decoded.available_at_ms,
             payload,
         })
     }
@@ -136,6 +133,23 @@ impl Record {
 }
 
 impl RecordHeader {
+    pub fn decode(header: &[u8; HEADER_LEN]) -> io::Result<Self> {
+        if &header[0..4] != MAGIC || header[4] != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid record magic or version",
+            ));
+        }
+        Ok(Self {
+            kind: RecordKind::try_from(header[5])?,
+            flags: u16::from_be_bytes(header[6..8].try_into().unwrap()),
+            index: u64::from_be_bytes(header[8..16].try_into().unwrap()),
+            timestamp_ns: i64::from_be_bytes(header[16..24].try_into().unwrap()),
+            message_id: u64::from_be_bytes(header[24..32].try_into().unwrap()),
+            available_at_ms: i64::from_be_bytes(header[32..40].try_into().unwrap()),
+        })
+    }
+
     pub fn encode(&self, payload: &[&[u8]]) -> io::Result<[u8; HEADER_LEN]> {
         let payload_len = payload
             .iter()
@@ -166,5 +180,27 @@ impl RecordHeader {
             });
         header[44..48].copy_from_slice(&checksum.to_be_bytes());
         Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_v7_publish_records_require_feature_level_two() {
+        assert_eq!(
+            RecordKind::PublishBatch.required_writer_feature_level(LEGACY_MAX_RECORD_BYTES),
+            1
+        );
+        assert_eq!(
+            RecordKind::PublishBatch
+                .required_writer_feature_level(LEGACY_MAX_RECORD_BYTES.saturating_add(1)),
+            2
+        );
+        assert_eq!(
+            RecordKind::EvictionGap.required_writer_feature_level(MAX_RECORD_BYTES),
+            1
+        );
     }
 }

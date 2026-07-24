@@ -23,7 +23,7 @@ pub(super) async fn publish(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.publish_token.as_deref(), "publish")?;
+    authorize(&headers, &state.tokens.publish, "publish")?;
     validate_defer(query.defer, &state.config)?;
     let (body, reservation) = read_publish_body(
         &state,
@@ -54,7 +54,7 @@ pub(super) async fn multi_publish(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.publish_token.as_deref(), "publish")?;
+    authorize(&headers, &state.tokens.publish, "publish")?;
     validate_defer(query.defer, &state.config)?;
     let (body, reservation) = read_publish_body(
         &state,
@@ -85,31 +85,6 @@ pub(super) async fn multi_publish(
         .publish_bytes
         .fetch_add(bytes as u64, Ordering::Relaxed);
     Ok("OK")
-}
-
-pub(super) async fn stats(
-    State(state): State<AppState>,
-    Query(query): Query<StatsQuery>,
-) -> Response {
-    let filtered = filter_stats(
-        state.broker.stats(),
-        query.topic.as_deref(),
-        query.channel.as_deref(),
-    );
-    if query.format.as_deref() == Some("json") {
-        return Json(json!({"version": env!("CARGO_PKG_VERSION"), "health": "OK", "topics": filtered.topics})).into_response();
-    }
-    let mut output = String::new();
-    for topic in filtered.topics {
-        output.push_str(&format!("[{}] depth={}\n", topic.name, topic.message_count));
-        for channel in topic.channels {
-            output.push_str(&format!(
-                "   [{}] depth={} in-flight={} deferred={}\n",
-                channel.name, channel.depth, channel.in_flight_count, channel.deferred_count
-            ));
-        }
-    }
-    output.into_response()
 }
 
 pub(super) async fn lookup(
@@ -153,6 +128,9 @@ pub(super) async fn nodes(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn metrics_handler(State(state): State<AppState>) -> Response {
+    if let Err(error) = state.broker.expire_in_flight().await {
+        return ApiError::from(error).into_response();
+    }
     let mut output = state.metrics.render();
     let queue_stats = state.broker.metrics_stats(
         state.config.metrics.detailed_queue_metrics,
@@ -174,7 +152,7 @@ pub(super) async fn create_topic(
     Query(query): Query<TopicQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state.broker.create_topic(&query.topic).await?;
     Ok("OK")
 }
@@ -184,7 +162,7 @@ pub(super) async fn delete_topic(
     Query(query): Query<TopicQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state.broker.delete_topic(&query.topic).await?;
     Ok("OK")
 }
@@ -194,7 +172,7 @@ pub(super) async fn empty_topic(
     Query(query): Query<TopicQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state.broker.empty_topic(&query.topic).await?;
     Ok("OK")
 }
@@ -204,7 +182,7 @@ pub(super) async fn pause_topic(
     Query(query): Query<TopicQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state.broker.set_topic_paused(&query.topic, true).await?;
     Ok("OK")
 }
@@ -214,7 +192,7 @@ pub(super) async fn unpause_topic(
     Query(query): Query<TopicQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state.broker.set_topic_paused(&query.topic, false).await?;
     Ok("OK")
 }
@@ -224,7 +202,7 @@ pub(super) async fn create_channel(
     Query(query): Query<ChannelQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state
         .broker
         .create_channel(&query.topic, &query.channel)
@@ -237,7 +215,7 @@ pub(super) async fn delete_channel(
     Query(query): Query<ChannelQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state
         .broker
         .delete_channel(&query.topic, &query.channel)
@@ -250,7 +228,7 @@ pub(super) async fn empty_channel(
     Query(query): Query<ChannelQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state
         .broker
         .empty_channel(&query.topic, &query.channel)
@@ -263,7 +241,7 @@ pub(super) async fn pause_channel(
     Query(query): Query<ChannelQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state
         .broker
         .set_channel_paused(&query.topic, &query.channel, true)
@@ -276,7 +254,7 @@ pub(super) async fn unpause_channel(
     Query(query): Query<ChannelQuery>,
     headers: HeaderMap,
 ) -> Result<&'static str, ApiError> {
-    authorize(&headers, state.admin_token.as_deref(), "admin")?;
+    authorize(&headers, &state.tokens.admin, "admin")?;
     state
         .broker
         .set_channel_paused(&query.topic, &query.channel, false)

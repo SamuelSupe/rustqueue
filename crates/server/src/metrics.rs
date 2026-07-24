@@ -381,14 +381,18 @@ mod tests {
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,
+                published_count: 7,
                 message_count: 7,
                 segment_count: 1,
                 segment_bytes: 100,
                 channels: vec![ChannelStats {
                     name: "workers".into(),
                     depth: 3,
+                    message_count: 7,
                     in_flight_count: 2,
                     deferred_count: 1,
+                    requeue_count: 0,
+                    timeout_count: 0,
                     paused: false,
                     ephemeral: false,
                     ack_cursor: 4,

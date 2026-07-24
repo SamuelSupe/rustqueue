@@ -43,7 +43,7 @@ pub struct RustQueueSpec {
     pub disk_high_watermark_percent: u8,
     #[serde(default = "default_disk_low_watermark")]
     pub disk_low_watermark_percent: u8,
-    #[serde(default = "enabled")]
+    #[serde(default)]
     pub protective_eviction_enabled: bool,
     #[serde(default = "default_disk_pressure_grace")]
     pub disk_pressure_grace_seconds: u64,
@@ -74,6 +74,8 @@ pub struct RustQueueSpec {
     #[serde(default = "default_discovery_replicas")]
     pub discovery_replicas: i32,
     #[serde(default)]
+    pub kodo_compatibility: KodoCompatibility,
+    #[serde(default)]
     pub maintenance: Option<BrokerMaintenance>,
     #[serde(default)]
     pub rollout: RolloutPolicy,
@@ -81,6 +83,57 @@ pub struct RustQueueSpec {
     pub broker_scheduling: BrokerScheduling,
     #[serde(default)]
     pub broker_resources: WorkloadResources,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KodoCompatibility {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub decommission_confirmed: bool,
+    #[serde(default)]
+    pub producer_restart_nonce: String,
+    #[serde(default)]
+    pub cleanup_enabled: bool,
+    #[serde(default = "default_kodo_cutover_grace")]
+    pub cutover_grace_seconds: u64,
+    #[serde(default = "default_kodo_allowed_pod_selector")]
+    pub allowed_pod_selector: BTreeMap<String, String>,
+    #[serde(default)]
+    pub allowed_namespace_selector: BTreeMap<String, String>,
+}
+
+impl Default for KodoCompatibility {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            decommission_confirmed: false,
+            producer_restart_nonce: String::new(),
+            cleanup_enabled: false,
+            cutover_grace_seconds: default_kodo_cutover_grace(),
+            allowed_pod_selector: default_kodo_allowed_pod_selector(),
+            allowed_namespace_selector: BTreeMap::new(),
+        }
+    }
+}
+
+impl KodoCompatibility {
+    pub(crate) fn effective_cleanup_enabled(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn effective_allowed_pod_selector(&self) -> BTreeMap<String, String> {
+        if self.allowed_pod_selector.is_empty() {
+            default_kodo_allowed_pod_selector()
+        } else {
+            self.allowed_pod_selector.clone()
+        }
+    }
+}
+
+fn default_kodo_allowed_pod_selector() -> BTreeMap<String, String> {
+    BTreeMap::from([("app.kubernetes.io/name".into(), "kodo".into())])
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -195,6 +248,8 @@ pub struct RustQueueStatus {
     pub orphaned_pvcs: Vec<String>,
     #[serde(default)]
     pub desired_storage_size: String,
+    #[serde(default)]
+    pub kodo_producer_restart_baseline_nonce: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -267,6 +322,9 @@ fn default_bootstrap_retention() -> u64 {
 fn default_proxy_tcp_connection_age() -> u64 {
     300
 }
+fn default_kodo_cutover_grace() -> u64 {
+    630
+}
 fn default_max_message_bytes() -> usize {
     20 * 1024 * 1024
 }
@@ -323,7 +381,31 @@ mod tests {
         assert!(schema
             .to_string()
             .contains("proxyTcpMaxConnectionAgeSeconds"));
+        assert!(schema.to_string().contains("kodoCompatibility"));
+        assert!(schema.to_string().contains("decommissionConfirmed"));
+        assert!(schema.to_string().contains("producerRestartNonce"));
         assert!(!schema.to_string().contains("replicationFactor"));
         assert!(!schema.to_string().contains("cell"));
+    }
+
+    #[test]
+    fn disabling_kodo_also_disables_a_stale_cleanup_request() {
+        let mut compatibility = KodoCompatibility {
+            cleanup_enabled: true,
+            ..KodoCompatibility::default()
+        };
+        assert!(!compatibility.effective_cleanup_enabled());
+        compatibility.enabled = true;
+        assert!(!compatibility.effective_cleanup_enabled());
+    }
+
+    #[test]
+    fn empty_kodo_selector_falls_back_to_the_fail_closed_default() {
+        let mut compatibility = KodoCompatibility::default();
+        compatibility.allowed_pod_selector.clear();
+        assert_eq!(
+            compatibility.effective_allowed_pod_selector(),
+            BTreeMap::from([("app.kubernetes.io/name".into(), "kodo".into())])
+        );
     }
 }

@@ -1,11 +1,14 @@
 use crate::model::MessageMeta;
 use crate::BrokerError;
 use bytes::Bytes;
-use rustqueue_storage::{PayloadRef, Record, RecordLocation, HEADER_LEN};
+#[cfg(test)]
+use rustqueue_storage::Record;
+use rustqueue_storage::{PayloadRef, RecordLocation, HEADER_LEN};
+use std::io::{self, Read};
 use std::sync::Arc;
 
 const ITEM_HEADER: usize = 20;
-pub(crate) const MAX_MESSAGES: usize = 10_000;
+pub(crate) const MAX_MESSAGES: usize = rustqueue_protocol::MAX_MPUB_MESSAGES;
 
 pub(crate) struct EncodedBatch<'a> {
     count: [u8; 4],
@@ -67,6 +70,7 @@ impl EncodedBatch<'_> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn metas(
     record: &Record,
     location: &RecordLocation,
@@ -141,6 +145,86 @@ pub(crate) fn metas(
         ));
     }
     Ok(output)
+}
+
+pub(crate) fn metas_from_reader(
+    header: rustqueue_storage::RecordHeader,
+    payload_len: usize,
+    reader: &mut dyn Read,
+    location: &RecordLocation,
+) -> io::Result<Vec<MessageMeta>> {
+    if payload_len < 4 {
+        return Err(invalid_data("publish batch is truncated"));
+    }
+    let mut count = [0u8; 4];
+    reader.read_exact(&mut count)?;
+    let count = u32::from_be_bytes(count) as usize;
+    let maximum_count = payload_len.saturating_sub(4) / ITEM_HEADER;
+    if count == 0 || count > MAX_MESSAGES || count > maximum_count {
+        return Err(invalid_data("publish batch count is invalid"));
+    }
+    let mut cursor = 4usize;
+    let mut first_position = None;
+    let mut output = Vec::with_capacity(count);
+    let mut body_buffer = [0u8; 64 * 1024];
+    for ordinal in 0..count {
+        let mut item = [0u8; ITEM_HEADER];
+        reader.read_exact(&mut item)?;
+        cursor = cursor.saturating_add(ITEM_HEADER);
+        let position = u64::from_be_bytes(item[0..8].try_into().unwrap());
+        let id = u64::from_be_bytes(item[8..16].try_into().unwrap());
+        let len = u32::from_be_bytes(item[16..20].try_into().unwrap());
+        let end = cursor
+            .checked_add(len as usize)
+            .ok_or_else(|| invalid_data("publish batch length overflow"))?;
+        if end > payload_len {
+            return Err(invalid_data("publish batch body is truncated"));
+        }
+        let base_position = *first_position.get_or_insert(position);
+        let expected_position = base_position
+            .checked_add(ordinal as u64)
+            .ok_or_else(|| invalid_data("publish batch position overflow"))?;
+        let expected_id = header
+            .message_id
+            .checked_add(ordinal as u64)
+            .ok_or_else(|| invalid_data("publish batch message ID overflow"))?;
+        if position != expected_position || id != expected_id {
+            return Err(invalid_data(
+                "publish batch positions or message IDs are not contiguous",
+            ));
+        }
+        let body_offset = cursor;
+        let mut remaining = len as usize;
+        let mut body_crc = 0u32;
+        while remaining > 0 {
+            let wanted = remaining.min(body_buffer.len());
+            reader.read_exact(&mut body_buffer[..wanted])?;
+            body_crc = crc32c::crc32c_append(body_crc, &body_buffer[..wanted]);
+            remaining -= wanted;
+        }
+        output.push(MessageMeta {
+            position,
+            id,
+            timestamp_ns: header.timestamp_ns,
+            available_at_ms: header.available_at_ms,
+            log_index: location.index,
+            payload: PayloadRef {
+                path: Arc::clone(&location.segment),
+                offset: location.offset + HEADER_LEN as u64 + body_offset as u64,
+                len,
+                crc32c: body_crc,
+            },
+        });
+        cursor = end;
+    }
+    if cursor != payload_len {
+        return Err(invalid_data("publish batch has trailing bytes"));
+    }
+    Ok(output)
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 pub(crate) fn metas_after_append(

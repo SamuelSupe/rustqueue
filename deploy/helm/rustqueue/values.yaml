@@ -5,7 +5,7 @@ operator:
   replicas: 2
   image:
     repository: rustqueue-operator
-    tag: "0.7.2"
+    tag: "0.8.0"
     pullPolicy: IfNotPresent
   log: rustqueue_operator=info
   resources:
@@ -20,7 +20,7 @@ operator:
 queue:
   create: true
   name: rustqueue
-  image: rustqueue:0.7.2
+  image: rustqueue:0.8.0
   imagePullPolicy: IfNotPresent
   minBrokers: 1
   maxBrokers: 500
@@ -35,8 +35,12 @@ queue:
   minFreeBytes: 10737418240
   diskHighWatermarkPercent: 85
   diskLowWatermarkPercent: 75
-  protectiveEvictionEnabled: true
+  # Explicit opt-in only: eviction permanently removes the oldest durable
+  # messages after sustained disk pressure.
+  protectiveEvictionEnabled: false
   diskPressureGraceSeconds: 60
+  # Kodo compatibility overrides this to 180 seconds so one failed default
+  # go-nsq Lookupd poll cannot age out a newly discovered owner's messages.
   bootstrapRetentionSeconds: 90
   maxMessageBytes: 20971520
   maxTopics: 10000
@@ -51,6 +55,32 @@ queue:
   # Rotate opaque TCP tunnels so a small producer pool is redistributed as the
   # Broker fleet changes. Set to 0 to keep connections pinned indefinitely.
   proxyTcpMaxConnectionAgeSeconds: 300
+  # Kodo compatibility is opt-in. Enabling it pins the managed profile to
+  # three Brokers and three publish Gateway Pods behind one highly available
+  # Service with a 100 MiB message cap.
+  kodoCompatibility:
+    enabled: false
+    # Set true only after every Kodo workload using this Discovery service has
+    # stopped. Required to remove an existing Gateway deployment.
+    decommissionConfirmed: false
+    # After KodoGatewaysAdvertised=True, restart every Kodo publisher and then
+    # change this value. Broker disruption remains blocked until it changes.
+    producerRestartNonce: ""
+    # Kodo refreshes /nodes every 300s by default. Keep this at least two
+    # nsq.refresh_at intervals plus 30s so one failed refresh remains safe.
+    cutoverGraceSeconds: 630
+    # Hard-disabled until RustQueue has a cluster-wide atomic, authenticated
+    # deletion transaction. Setting this to true makes chart rendering fail.
+    cleanupEnabled: false
+    brokerMemoryRequest: 2Gi
+    brokerCpuRequest: "1"
+    # Gateway access is fail-closed to Kodo Pods. Match these labels on the
+    # Kodo workload, or override the selector for your deployment.
+    allowedPodSelector:
+      app.kubernetes.io/name: kodo
+    # Empty means the RustQueue namespace. Set labels here when Kodo runs in a
+    # separately labelled namespace.
+    allowedNamespaceSelector: {}
   rollout:
     paused: false
     requireCanaryApproval: false

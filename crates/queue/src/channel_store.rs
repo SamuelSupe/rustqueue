@@ -373,12 +373,16 @@ fn encode_command(command: &ChannelCommand) -> Vec<u8> {
             message_id,
             available_at_ms,
             attempts,
+            cumulative_count,
         } => {
-            body.push(2);
+            body.push(if cumulative_count.is_some() { 7 } else { 2 });
             body.extend_from_slice(&position.to_be_bytes());
             body.extend_from_slice(&message_id.to_be_bytes());
             body.extend_from_slice(&available_at_ms.to_be_bytes());
             body.extend_from_slice(&attempts.to_be_bytes());
+            if let Some(count) = cumulative_count {
+                body.extend_from_slice(&count.to_be_bytes());
+            }
         }
         ChannelCommand::Pause { paused } => {
             body.extend_from_slice(&[3, paused as u8]);
@@ -390,6 +394,10 @@ fn encode_command(command: &ChannelCommand) -> Vec<u8> {
         ChannelCommand::Evict { through_position } => {
             body.push(5);
             body.extend_from_slice(&through_position.to_be_bytes());
+        }
+        ChannelCommand::Timeout { cumulative_count } => {
+            body.push(6);
+            body.extend_from_slice(&cumulative_count.to_be_bytes());
         }
     }
     body
@@ -407,6 +415,7 @@ fn decode_command(body: &[u8]) -> Result<ChannelCommand, BrokerError> {
             message_id: u64::from_be_bytes(body[9..17].try_into().unwrap()),
             available_at_ms: i64::from_be_bytes(body[17..25].try_into().unwrap()),
             attempts: u16::from_be_bytes(body[25..27].try_into().unwrap()),
+            cumulative_count: None,
         }),
         Some(3) if body.len() == 2 && body[1] <= 1 => Ok(ChannelCommand::Pause {
             paused: body[1] == 1,
@@ -416,6 +425,16 @@ fn decode_command(body: &[u8]) -> Result<ChannelCommand, BrokerError> {
         }),
         Some(5) if body.len() == 9 => Ok(ChannelCommand::Evict {
             through_position: u64::from_be_bytes(body[1..9].try_into().unwrap()),
+        }),
+        Some(6) if body.len() == 9 => Ok(ChannelCommand::Timeout {
+            cumulative_count: u64::from_be_bytes(body[1..9].try_into().unwrap()),
+        }),
+        Some(7) if body.len() == 35 => Ok(ChannelCommand::Requeue {
+            position: u64::from_be_bytes(body[1..9].try_into().unwrap()),
+            message_id: u64::from_be_bytes(body[9..17].try_into().unwrap()),
+            available_at_ms: i64::from_be_bytes(body[17..25].try_into().unwrap()),
+            attempts: u16::from_be_bytes(body[25..27].try_into().unwrap()),
+            cumulative_count: Some(u64::from_be_bytes(body[27..35].try_into().unwrap())),
         }),
         _ => Err(invalid()),
     }
@@ -451,6 +470,80 @@ mod tests {
         let (state, _) = ChannelStore::open(&checkpoint, 65_536).unwrap();
         assert_eq!(state.ack_floor_position, 1);
         assert_eq!(fs::metadata(wal).unwrap().len(), (HEADER_LEN + 17) as u64);
+    }
+
+    #[test]
+    fn requeue_and_timeout_counters_survive_wal_recovery() {
+        let root = tempdir().unwrap();
+        let state = ChannelState::new("workers".into(), 0, false, 65_536);
+        let mut store = ChannelStore::create(root.path(), &state).unwrap();
+        store
+            .append(&ChannelCommand::Requeue {
+                position: 1,
+                message_id: 7,
+                available_at_ms: 0,
+                attempts: 1,
+                cumulative_count: Some(1),
+            })
+            .unwrap();
+        store
+            .append(&ChannelCommand::Timeout {
+                cumulative_count: 2,
+            })
+            .unwrap();
+        drop(store);
+
+        let checkpoint = root
+            .path()
+            .join(format!("{}.checkpoint", hex::encode("workers")));
+        let (state, _) = ChannelStore::open(&checkpoint, 65_536).unwrap();
+        let stats = state.stats(1, &Default::default(), i64::MAX);
+        assert_eq!(stats.requeue_count, 1);
+        assert_eq!(stats.timeout_count, 2);
+    }
+
+    #[test]
+    fn checkpoint_before_wal_reset_does_not_double_absolute_counters() {
+        let root = tempdir().unwrap();
+        let mut state = ChannelState::new("workers".into(), 0, false, 65_536);
+        let mut store = ChannelStore::create(root.path(), &state).unwrap();
+        let requeue = ChannelCommand::Requeue {
+            position: 1,
+            message_id: 7,
+            available_at_ms: 1_000,
+            attempts: 1,
+            cumulative_count: Some(1),
+        };
+        store.append(&requeue).unwrap();
+        state.apply(&requeue);
+        let timeout = ChannelCommand::Timeout {
+            cumulative_count: 2,
+        };
+        store.append(&timeout).unwrap();
+        state.apply(&timeout);
+
+        // Simulate a crash after the checkpoint rename but before the old WAL
+        // is reset. Recovery must tolerate replaying both absolute commands.
+        write_checkpoint(&store.checkpoint_path, &state.checkpoint()).unwrap();
+        drop(store);
+
+        let checkpoint = root
+            .path()
+            .join(format!("{}.checkpoint", hex::encode("workers")));
+        let (mut recovered, _) = ChannelStore::open(&checkpoint, 65_536).unwrap();
+        let stats = recovered.stats(1, &Default::default(), 0);
+        assert_eq!(stats.requeue_count, 1);
+        assert_eq!(stats.timeout_count, 2);
+        assert!(matches!(
+            recovered.next_candidate(0, 1, |_| crate::channel::MessageAvailability::Ready(0)),
+            crate::channel::NextCandidate::None
+        ));
+        assert!(matches!(
+            recovered.next_candidate(1_000, 1, |_| {
+                crate::channel::MessageAvailability::Ready(0)
+            }),
+            crate::channel::NextCandidate::Ready(1)
+        ));
     }
 
     #[test]
@@ -493,6 +586,38 @@ mod tests {
         let mut encoded = encode_command(&command);
         encoded.push(0);
         assert!(decode_command(&encoded).is_err());
+    }
+
+    #[test]
+    fn feature_one_requeue_keeps_the_legacy_wal_encoding() {
+        let legacy = ChannelCommand::Requeue {
+            position: 1,
+            message_id: 7,
+            available_at_ms: 10,
+            attempts: 1,
+            cumulative_count: None,
+        };
+        let encoded = encode_command(&legacy);
+        assert_eq!(encoded[0], 2);
+        assert_eq!(encoded.len(), 27);
+        assert!(matches!(
+            decode_command(&encoded).unwrap(),
+            ChannelCommand::Requeue {
+                cumulative_count: None,
+                ..
+            }
+        ));
+
+        let durable = ChannelCommand::Requeue {
+            position: 1,
+            message_id: 7,
+            available_at_ms: 10,
+            attempts: 1,
+            cumulative_count: Some(1),
+        };
+        let encoded = encode_command(&durable);
+        assert_eq!(encoded[0], 7);
+        assert_eq!(encoded.len(), 35);
     }
 
     #[test]
