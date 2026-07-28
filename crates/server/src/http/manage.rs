@@ -1,7 +1,8 @@
 use super::*;
+use crate::subscriptions::DeletePermit;
 use axum::extract::Path;
 use rustqueue_queue::{
-    ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot,
+    ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot, ManagementResult,
     TopicManagementAction,
 };
 
@@ -79,7 +80,7 @@ pub(super) async fn delete_idle_channel_compat(
         )
             .into_response();
     }
-    let _permit = match state
+    let permit = match state
         .subscriptions
         .begin_delete(&query.topic, &query.channel)
     {
@@ -94,18 +95,16 @@ pub(super) async fn delete_idle_channel_compat(
     };
     let revision = state.broker.registry_revision();
     let operation_id = kodo_compat_operation_id(revision, &query.topic, &query.channel);
-    let result = state
-        .broker
-        .manage_channel(ChannelManagementCommand {
-            operation_id: &operation_id,
-            topic: &query.topic,
-            channel: &query.channel,
-            action: ChannelManagementAction::Delete,
-            expected_revision: revision,
-            tombstone_until_ms: Some(kodo_cleanup_deadline()),
-            require_idle: true,
-        })
-        .await;
+    let result = manage_idle_channel(
+        Arc::clone(&state.broker),
+        permit,
+        operation_id,
+        query.topic.clone(),
+        query.channel.clone(),
+        revision,
+        kodo_cleanup_deadline(),
+    )
+    .await;
     match result {
         Ok(result) => {
             tracing::info!(
@@ -136,7 +135,7 @@ async fn apply_channel_management(
     } else {
         authorize(&headers, &state.tokens.console, "console")?;
     }
-    let _delete_permit = if require_idle {
+    let delete_permit = if require_idle {
         Some(
             state
                 .subscriptions
@@ -156,18 +155,31 @@ async fn apply_channel_management(
     } else {
         request.tombstone_until_ms
     };
-    let result = state
-        .broker
-        .manage_channel(ChannelManagementCommand {
-            operation_id: &request.operation_id,
-            topic: &request.topic,
-            channel: &request.channel,
-            action,
-            expected_revision: request.expected_revision,
-            tombstone_until_ms,
-            require_idle,
-        })
-        .await?;
+    let result = if let Some(permit) = delete_permit {
+        manage_idle_channel(
+            Arc::clone(&state.broker),
+            permit,
+            request.operation_id.clone(),
+            request.topic.clone(),
+            request.channel.clone(),
+            request.expected_revision,
+            tombstone_until_ms.expect("idle deletion always has a server deadline"),
+        )
+        .await?
+    } else {
+        state
+            .broker
+            .manage_channel(ChannelManagementCommand {
+                operation_id: &request.operation_id,
+                topic: &request.topic,
+                channel: &request.channel,
+                action,
+                expected_revision: request.expected_revision,
+                tombstone_until_ms,
+                require_idle,
+            })
+            .await?
+    };
     tracing::info!(
         target = %format!("{}/{}", request.topic, request.channel),
         action = ?action,
@@ -176,6 +188,39 @@ async fn apply_channel_management(
         "channel management applied"
     );
     Ok(Json(json!(result)))
+}
+
+async fn manage_idle_channel(
+    broker: Arc<Broker>,
+    delete_permit: DeletePermit,
+    operation_id: String,
+    topic: String,
+    channel: String,
+    expected_revision: u64,
+    tombstone_until_ms: i64,
+) -> Result<ManagementResult, BrokerError> {
+    let task = tokio::spawn(async move {
+        let result = broker
+            .manage_channel(ChannelManagementCommand {
+                operation_id: &operation_id,
+                topic: &topic,
+                channel: &channel,
+                action: ChannelManagementAction::Delete,
+                expected_revision,
+                tombstone_until_ms: Some(tombstone_until_ms),
+                require_idle: true,
+            })
+            .await;
+        drop(delete_permit);
+        result
+    });
+    match task.await {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "idle channel management task failed");
+            Err(BrokerError::StorageUnavailable)
+        }
+    }
 }
 
 fn kodo_cleanup_deadline() -> i64 {
@@ -242,6 +287,9 @@ fn parse_channel_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subscriptions::{ClientIdentity, RegisterBlocked, SubscriptionRegistry};
+    use rustqueue_queue::BrokerConfig;
+    use tempfile::tempdir;
 
     #[test]
     fn idle_delete_action_is_unavailable_until_kodo_cleanup_is_enabled() {
@@ -269,5 +317,59 @@ mod tests {
             kodo_compat_operation_id(7, "events", "workers"),
             kodo_compat_operation_id(8, "events", "workers")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_idle_delete_keeps_new_subscriptions_blocked_until_completion() {
+        let root = tempdir().unwrap();
+        let broker = Arc::new(
+            Broker::open(BrokerConfig {
+                data_path: root.path().to_path_buf(),
+                ..BrokerConfig::default()
+            })
+            .unwrap(),
+        );
+        broker.create_channel("events", "workers").await.unwrap();
+        let subscriptions = SubscriptionRegistry::default();
+        let permit = subscriptions.begin_delete("events", "workers").unwrap();
+        let revision = broker.registry_revision();
+        let mut deletion = Box::pin(manage_idle_channel(
+            Arc::clone(&broker),
+            permit,
+            "cancelled-idle-delete-0001".into(),
+            "events".into(),
+            "workers".into(),
+            revision,
+            kodo_cleanup_deadline(),
+        ));
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(deletion.as_mut(), context).is_pending(),
+                "the detached deletion must not complete in its first poll"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(deletion);
+
+        assert!(matches!(
+            subscriptions.register("events", "workers", ClientIdentity::default()),
+            Err(RegisterBlocked::DeleteInProgress)
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let channel_removed = broker
+                    .channel_names("events")
+                    .is_ok_and(|channels| channels.is_empty());
+                let barrier_released = subscriptions.begin_delete("events", "workers").is_ok();
+                if channel_removed && barrier_released {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

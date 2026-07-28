@@ -191,14 +191,13 @@ pub(super) async fn current_brokers(
             let Some(ip) = ip else {
                 return Ok::<_, anyhow::Error>((name, None));
             };
-            let report = http
+            let response = http
                 .get(format!("{}/v1/capabilities", origin(&ip)))
                 .bearer_auth(&token)
                 .send()
                 .await?
-                .error_for_status()?
-                .json::<CompatibilityReport>()
-                .await?;
+                .error_for_status()?;
+            let report = super::read_broker_json(response).await?;
             Ok((name, Some(report)))
         }
     }))

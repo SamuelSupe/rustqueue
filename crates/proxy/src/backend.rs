@@ -166,6 +166,22 @@ impl BackendPool {
         self.inner.read().backends.clone()
     }
 
+    pub fn matching_bounded(
+        &self,
+        maximum: usize,
+        mut predicate: impl FnMut(&Backend) -> bool,
+    ) -> Option<Vec<Backend>> {
+        let state = self.inner.read();
+        let mut matching = Vec::new();
+        for backend in state.backends.iter().filter(|backend| predicate(backend)) {
+            if matching.len() == maximum {
+                return None;
+            }
+            matching.push(backend.clone());
+        }
+        Some(matching)
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().backends.len()
     }

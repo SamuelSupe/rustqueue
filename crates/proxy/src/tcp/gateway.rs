@@ -4,7 +4,7 @@ use axum::body::Bytes;
 use rustqueue_protocol::{
     encode_frame, Command, FrameType, IdentifyRequest, IdentifyResponse, HEARTBEAT, MAGIC_V2, OK,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::BTreeSet;
 use std::io;
 use std::sync::atomic::Ordering;
@@ -16,7 +16,6 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, Sleep};
 
 const MAX_COMMAND_LINE_BYTES: usize = 1024;
-const MAX_CONTROL_BODY_BYTES: usize = 1024 * 1024;
 const MAX_BACKEND_FRAME_BYTES: usize = 1024 * 1024;
 const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const BACKEND_IDENTIFY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +34,7 @@ struct ClientCommand {
     command: Command,
     line: Vec<u8>,
     body: Option<Bytes>,
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 struct BrokerSession {
@@ -106,6 +105,7 @@ pub(super) async fn run(
     let mut heartbeat = Box::pin(tokio::time::sleep(DEFAULT_HEARTBEAT));
     let mut backend_identify = default_backend_identify();
     let mut backend_session = None;
+    let mut _identify_permit = None;
 
     loop {
         tokio::select! {
@@ -115,7 +115,7 @@ pub(super) async fn run(
                 let Some(command) = command else {
                     break;
                 };
-                let command = match command {
+                let mut command = match command {
                     Ok(command) => command,
                     Err(ReadError::RetryByReconnect(detail)) => {
                         tracing::debug!(
@@ -165,14 +165,16 @@ pub(super) async fn run(
                             }
                             None => Some(DEFAULT_HEARTBEAT),
                         };
-                        backend_identify = backend_identify_body(body)?;
+                        let msg_timeout = request.msg_timeout.unwrap_or(60_000).max(1_000);
+                        backend_identify = backend_identify_body(request)?;
                         identified = true;
+                        _identify_permit = command.permit.take();
                         reset_heartbeat(&mut heartbeat, heartbeat_interval);
                         let response = IdentifyResponse {
                             max_rdy_count: 2_500,
                             version: env!("CARGO_PKG_VERSION").into(),
                             max_msg_timeout: 900_000,
-                            msg_timeout: request.msg_timeout.unwrap_or(60_000).max(1_000),
+                            msg_timeout,
                             tls_v1: false,
                             deflate: false,
                             deflate_level: 0,
@@ -425,17 +427,13 @@ fn retriable_error(body: &[u8]) -> bool {
         || error.starts_with("E_PUB_RETRY")
 }
 
-fn backend_identify_body(body: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(body)?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("IDENTIFY body must be an object"))?;
-    object.insert("feature_negotiation".into(), json!(true));
-    object.insert("heartbeat_interval".into(), json!(-1));
-    object.insert("tls_v1".into(), json!(false));
-    object.insert("snappy".into(), json!(false));
-    object.insert("deflate".into(), json!(false));
-    Ok(serde_json::to_vec(&value)?)
+fn backend_identify_body(mut request: IdentifyRequest) -> anyhow::Result<Vec<u8>> {
+    request.feature_negotiation = true;
+    request.heartbeat_interval = Some(-1);
+    request.tls_v1 = false;
+    request.snappy = false;
+    request.deflate = false;
+    Ok(serde_json::to_vec(&request)?)
 }
 
 fn default_backend_identify() -> Vec<u8> {
@@ -508,7 +506,7 @@ where
     let command = Command::parse(&line)
         .map_err(|error| ReadError::Protocol("E_INVALID", error.to_string()))?;
     let limit = match command {
-        Command::Identify | Command::Auth => Some(("E_BAD_BODY", MAX_CONTROL_BODY_BYTES)),
+        Command::Identify | Command::Auth => Some(("E_BAD_BODY", super::MAX_CONTROL_BODY_BYTES)),
         Command::Publish { .. } | Command::DeferredPublish { .. } => {
             Some(("E_BAD_MESSAGE", max_message_bytes))
         }
@@ -520,7 +518,7 @@ where
             command,
             line,
             body: None,
-            _permit: None,
+            permit: None,
         });
     };
     let length = reader.read_u32().await? as usize;
@@ -530,8 +528,11 @@ where
             format!("command body size {length} is outside 1..={maximum}"),
         ));
     }
+    let working_set = super::command_working_set(&command, length);
+    let permits = u32::try_from(working_set)
+        .map_err(|_| ReadError::RetryByReconnect("publish Gateway byte budget is exhausted"))?;
     let permit = Arc::clone(inflight_bytes)
-        .try_acquire_many_owned(length as u32)
+        .try_acquire_many_owned(permits)
         .map_err(|_| ReadError::RetryByReconnect("publish Gateway byte budget is exhausted"))?;
     let mut body = vec![0; length];
     reader.read_exact(&mut body).await?;
@@ -544,7 +545,7 @@ where
         command,
         line,
         body: Some(body),
-        _permit: Some(permit),
+        permit: Some(permit),
     })
 }
 
@@ -730,7 +731,7 @@ mod tests {
             },
             line: b"PUB events\n".to_vec(),
             body: Some(Bytes::from_static(b"payload")),
-            _permit: None,
+            permit: None,
         };
         let mut current = None;
         assert_eq!(
@@ -765,7 +766,7 @@ mod tests {
             },
             line: b"PUB events\n".to_vec(),
             body: Some(Bytes::from_static(b"payload")),
-            _permit: None,
+            permit: None,
         };
         let mut current = None;
         assert_eq!(
@@ -852,6 +853,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identify_budget_is_retained_until_the_client_disconnects() {
+        let identify = b"{}";
+        let working_set = super::super::command_working_set(&Command::Identify, identify.len());
+        let budget = Arc::new(Semaphore::new(working_set));
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway_address = gateway_listener.local_addr().unwrap();
+        let task_budget = Arc::clone(&budget);
+        let gateway_task = tokio::spawn(async move {
+            let (client, _) = gateway_listener.accept().await.unwrap();
+            let (_shutdown_tx, shutdown) = watch::channel(false);
+            let _ = run(
+                client,
+                BackendPool::default(),
+                Limits {
+                    max_message_bytes: 1024,
+                    max_body_bytes: 1024,
+                    command_timeout: Duration::from_secs(1),
+                    inflight_bytes: task_budget,
+                },
+                ProxyMetrics::default(),
+                shutdown,
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(gateway_address).await.unwrap();
+        client.write_all(MAGIC_V2).await.unwrap();
+        client.write_all(b"IDENTIFY\n").await.unwrap();
+        client.write_u32(identify.len() as u32).await.unwrap();
+        client.write_all(identify).await.unwrap();
+        assert_eq!(read_frame(&mut client).await.unwrap().0, 0);
+        assert_eq!(budget.available_permits(), 0);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), gateway_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.available_permits(), working_set);
+    }
+
+    #[tokio::test]
     async fn single_message_limit_is_independent_from_the_batch_body_limit() {
         let (mut client, mut gateway) = tokio::io::duplex(1024);
         client
@@ -876,13 +919,41 @@ mod tests {
         client.write_all(b"MPUB events\n").await.unwrap();
         client.write_u32(body.len() as u32).await.unwrap();
         client.write_all(&body).await.unwrap();
-        let budget = Arc::new(Semaphore::new(64));
+        let working_set = super::super::command_working_set(
+            &Command::MultiPublish {
+                topic: "events".into(),
+            },
+            body.len(),
+        );
+        let budget = Arc::new(Semaphore::new(working_set));
         let error = match read_command(&mut gateway, 4, 64, Duration::from_secs(1), &budget).await {
             Ok(_) => panic!("MPUB entry above the message limit was accepted"),
             Err(error) => error,
         };
         assert!(matches!(error, ReadError::Protocol("E_BAD_MESSAGE", _)));
-        assert_eq!(budget.available_permits(), 64);
+        assert_eq!(budget.available_permits(), working_set);
+    }
+
+    #[tokio::test]
+    async fn mpub_metadata_is_admitted_before_parsing_a_malformed_count() {
+        let body = (rustqueue_protocol::MAX_MPUB_MESSAGES as u32).to_be_bytes();
+        let command = Command::MultiPublish {
+            topic: "events".into(),
+        };
+        let working_set = super::super::command_working_set(&command, body.len());
+        let (mut client, mut gateway) = tokio::io::duplex(1024);
+        client.write_all(b"MPUB events\n").await.unwrap();
+        client.write_u32(body.len() as u32).await.unwrap();
+        client.write_all(&body).await.unwrap();
+        let budget = Arc::new(Semaphore::new(working_set - 1));
+
+        let error =
+            match read_command(&mut gateway, 1024, 1024, Duration::from_secs(1), &budget).await {
+                Ok(_) => panic!("malformed MPUB bypassed its metadata budget"),
+                Err(error) => error,
+            };
+        assert!(matches!(error, ReadError::RetryByReconnect(_)));
+        assert_eq!(budget.available_permits(), working_set - 1);
     }
 
     #[tokio::test]
@@ -894,7 +965,7 @@ mod tests {
             },
             line: b"PUB events\n".to_vec(),
             body: Some(Bytes::from(vec![0x5a; 4096])),
-            _permit: None,
+            permit: None,
         };
         let error = send_before_commit(&mut gateway, &command, Duration::from_millis(10))
             .await
@@ -926,7 +997,7 @@ mod tests {
             },
             line: b"PUB events\n".to_vec(),
             body: Some(Bytes::from_static(b"payload")),
-            _permit: None,
+            permit: None,
         };
         let mut current = Some(first);
         publish(&pool, &identify, &command, &mut current, &metrics)
@@ -989,7 +1060,7 @@ mod tests {
                     max_message_bytes: 1024,
                     max_body_bytes: 1024,
                     command_timeout: Duration::from_secs(1),
-                    inflight_bytes: Arc::new(Semaphore::new(1024)),
+                    inflight_bytes: Arc::new(Semaphore::new(8192)),
                 },
                 ProxyMetrics::default(),
                 shutdown,

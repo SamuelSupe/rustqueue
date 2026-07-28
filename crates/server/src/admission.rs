@@ -25,6 +25,7 @@ pub struct ConnectionBudget {
 
 pub struct PublishReservation {
     bytes: usize,
+    publish_metrics: bool,
     metrics: Arc<Metrics>,
     _node: OwnedSemaphorePermit,
     _connection: Option<OwnedSemaphorePermit>,
@@ -57,7 +58,7 @@ impl PublishAdmission {
     }
 
     pub fn try_reserve(&self, bytes: usize) -> Option<PublishReservation> {
-        self.try_reserve_inner(bytes, None)
+        self.try_reserve_inner(bytes, None, true)
     }
 
     pub fn try_reserve_publish(
@@ -80,7 +81,7 @@ impl PublishAdmission {
                 return None;
             }
         };
-        self.try_reserve_inner(bytes, connection)
+        self.try_reserve_inner(bytes, connection, true)
     }
 
     pub fn try_reserve_connection_publish(
@@ -92,12 +93,23 @@ impl PublishAdmission {
         self.try_reserve_connection(working_set_bytes(bytes, shape), connection)
     }
 
+    pub fn try_reserve_control(
+        &self,
+        bytes: usize,
+        connection: &ConnectionBudget,
+    ) -> Option<PublishReservation> {
+        let bytes = bytes.saturating_mul(2);
+        let connection = connection.try_acquire(bytes)?;
+        self.try_reserve_inner(bytes, Some(connection), false)
+    }
+
     fn try_reserve_inner(
         &self,
         bytes: usize,
         connection: Option<OwnedSemaphorePermit>,
+        publish_metrics: bool,
     ) -> Option<PublishReservation> {
-        if !self.storage_ready() {
+        if publish_metrics && !self.storage_ready() {
             self.record_rejected(bytes);
             return None;
         }
@@ -105,15 +117,20 @@ impl PublishAdmission {
         let node = match Arc::clone(&self.permits).try_acquire_many_owned(count) {
             Ok(permit) => permit,
             Err(_) => {
-                self.record_rejected(bytes);
+                if publish_metrics {
+                    self.record_rejected(bytes);
+                }
                 return None;
             }
         };
-        self.metrics
-            .publish_inflight_bytes
-            .fetch_add(bytes as i64, Ordering::Relaxed);
+        if publish_metrics {
+            self.metrics
+                .publish_inflight_bytes
+                .fetch_add(bytes as i64, Ordering::Relaxed);
+        }
         Some(PublishReservation {
             bytes,
+            publish_metrics,
             metrics: Arc::clone(&self.metrics),
             _node: node,
             _connection: connection,
@@ -143,11 +160,19 @@ impl ConnectionBudget {
     }
 }
 
+pub(crate) fn capacity_is_supported(bytes: usize) -> bool {
+    bytes <= i64::MAX as usize
+        && units(bytes) <= tokio::sync::Semaphore::MAX_PERMITS
+        && units(bytes) <= u32::MAX as usize
+}
+
 impl Drop for PublishReservation {
     fn drop(&mut self) {
-        self.metrics
-            .publish_inflight_bytes
-            .fetch_sub(self.bytes as i64, Ordering::Relaxed);
+        if self.publish_metrics {
+            self.metrics
+                .publish_inflight_bytes
+                .fetch_sub(self.bytes as i64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -158,7 +183,10 @@ fn units(bytes: usize) -> usize {
 pub(crate) fn working_set_bytes(bytes: usize, shape: PublishShape) -> usize {
     let messages = match shape {
         PublishShape::Single => 1,
-        PublishShape::Multi => rustqueue_protocol::MAX_MPUB_MESSAGES.min(bytes.max(1)),
+        // A four-byte malformed MPUB body can still declare the maximum count,
+        // causing the parser to allocate its full message table before it can
+        // reject the truncated body.
+        PublishShape::Multi => rustqueue_protocol::MAX_MPUB_MESSAGES,
     };
     bytes
         .saturating_add(RECORD_FIXED_BYTES)
@@ -187,5 +215,37 @@ mod tests {
             20 * 1024 * 1024 + RECORD_FIXED_BYTES + MESSAGE_WORKING_BYTES
         );
         assert!(working_set_bytes(64 * 1024 * 1024, PublishShape::Multi) > 64 * 1024 * 1024);
+        assert_eq!(
+            working_set_bytes(4, PublishShape::Multi),
+            4 + RECORD_FIXED_BYTES + rustqueue_protocol::MAX_MPUB_MESSAGES * MESSAGE_WORKING_BYTES
+        );
+    }
+
+    #[test]
+    fn admission_capacity_must_fit_runtime_and_metrics_primitives() {
+        assert!(capacity_is_supported(512 * 1024 * 1024));
+        assert!(!capacity_is_supported(usize::MAX));
+    }
+
+    #[test]
+    fn control_bodies_share_the_node_budget_without_publish_metrics() {
+        let metrics = Arc::new(Metrics::default());
+        let admission = PublishAdmission::new(8192, Arc::clone(&metrics));
+        let first_connection = ConnectionBudget::new(8192);
+        let second_connection = ConnectionBudget::new(8192);
+        admission.set_storage_ready(false);
+
+        let first = admission
+            .try_reserve_control(4096, &first_connection)
+            .unwrap();
+        assert!(admission
+            .try_reserve_control(1, &second_connection)
+            .is_none());
+        assert_eq!(metrics.publish_inflight_bytes.load(Ordering::Relaxed), 0);
+
+        drop(first);
+        assert!(admission
+            .try_reserve_control(4096, &second_connection)
+            .is_some());
     }
 }

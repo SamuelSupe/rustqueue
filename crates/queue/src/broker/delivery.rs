@@ -40,6 +40,7 @@ impl Broker {
             .min(self.inner.delivery_budget.max_payload_bytes());
         let mut batch = self
             .reserve_deliveries(
+                topic,
                 Arc::clone(&handle),
                 channel,
                 max_messages.clamp(1, 64),
@@ -51,6 +52,7 @@ impl Broker {
             let _ = tokio::time::timeout(wait.min(Duration::from_secs(1)), wake.changed()).await;
             batch = self
                 .reserve_deliveries(
+                    topic,
                     Arc::clone(&handle),
                     channel,
                     max_messages.clamp(1, 64),
@@ -65,13 +67,19 @@ impl Broker {
         let bytes = batch.payload_bytes();
         let hold = self.inner.delivery_budget.acquire(bytes).await?;
         let lease = self.inner.payload_reader.retain(batch.payloads());
-        let bodies = match self.inner.payload_reader.read_retained(lease).await {
-            Ok(bodies) => bodies,
+        let (bodies, hold) = match self
+            .inner
+            .payload_reader
+            .read_retained(lease, Some(hold))
+            .await
+        {
+            Ok(result) => result,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(DeliveryBatch::new(Vec::new(), DeliveryGuard::empty()));
             }
             Err(error) => return self.observe_storage_result(Err(error.into())),
         };
+        let hold = hold.expect("delivery payload read returns its byte-budget hold");
         let handle = Arc::clone(&batch.handle);
         let channel = batch.channel.clone();
         let reservations = batch.disarm();
@@ -91,6 +99,7 @@ impl Broker {
 
     async fn reserve_deliveries(
         &self,
+        topic: &str,
         handle: Arc<TopicHandle>,
         channel: &str,
         max_messages: usize,
@@ -105,8 +114,9 @@ impl Broker {
             }
             let handle = Arc::clone(&batch.handle);
             let action = {
-                let mut topic = handle.state.lock();
-                let action = topic.reserve_batch(
+                let mut topic_state = handle.state.lock();
+                self.ensure_management_access(topic, Some(channel))?;
+                let action = topic_state.reserve_batch(
                     channel,
                     remaining_messages,
                     max_bytes.saturating_sub(batch.payload_bytes()).max(1),
@@ -153,7 +163,16 @@ impl Broker {
                     if batch.payload_bytes() >= max_bytes || batch.len() >= max_messages {
                         break;
                     }
-                    if let Err(error) = self.inner.message_index_cache.load(request).await {
+                    let read_lease = self
+                        .inner
+                        .payload_reader
+                        .retain_paths(vec![request.segment_path().to_path_buf()]);
+                    if let Err(error) = self
+                        .inner
+                        .message_index_cache
+                        .load(request, read_lease)
+                        .await
+                    {
                         if matches!(&error, BrokerError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
                         {
                             return Ok(ReservedBatch::new(Arc::clone(&batch.handle), channel));

@@ -189,6 +189,26 @@ fn truncates_uncommitted_suffix() {
 }
 
 #[test]
+fn multi_segment_suffix_truncation_reopens_and_accepts_replacement() {
+    let directory = tempdir().unwrap();
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    for value in 1..=5 {
+        log.append(record(0, &[value; 20]), true).unwrap();
+    }
+    assert_eq!(log.segment_paths().unwrap().len(), 5);
+
+    log.truncate_suffix(3).unwrap();
+    drop(log);
+
+    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
+    assert_eq!((log.first_index(), log.last_index()), (Some(1), Some(2)));
+    assert_eq!(log.read(2).unwrap().unwrap().payload, vec![2; 20]);
+    assert!(log.read(3).unwrap().is_none());
+    log.append(record(0, b"replacement"), true).unwrap();
+    assert_eq!(log.last_index(), Some(3));
+}
+
+#[test]
 fn refuses_middle_corruption() {
     let directory = tempdir().unwrap();
     let mut log = SegmentLog::open(directory.path(), 4096).unwrap();

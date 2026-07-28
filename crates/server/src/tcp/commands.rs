@@ -10,6 +10,7 @@ pub(super) async fn process_command(
     authenticator: Option<&Authenticator>,
     ephemeral_consumers: &EphemeralConsumers,
     subscriptions: &SubscriptionRegistry,
+    channel_ops: &ChannelOpSender,
     state: &mut SessionState,
     writer: &mut ClientWriter,
 ) -> anyhow::Result<bool> {
@@ -32,7 +33,7 @@ pub(super) async fn process_command(
                 write_error(writer, "E_AUTH_DISABLED", "AUTH disabled").await?;
                 return Ok(false);
             };
-            let secret = body.as_deref().unwrap_or_default();
+            let secret = body.unwrap_or_default();
             if secret.is_empty() {
                 write_error(writer, "E_BAD_BODY", "AUTH invalid body size 0").await?;
                 return Ok(false);
@@ -42,18 +43,19 @@ pub(super) async fn process_command(
                     &peer.ip().to_string(),
                     state.encrypted,
                     &state.tls_common_name,
-                    secret,
+                    &secret,
                 )
                 .await
             {
                 Ok(session) => {
                     let response = json!({
-                        "identity": session.identity,
-                        "identity_url": session.identity_url,
+                        "identity": session.identity(),
+                        "identity_url": session.identity_url(),
                         "permission_count": session.permission_count(),
                     });
                     state.auth = Some(session);
-                    state.auth_secret = Some(secret.to_vec());
+                    state.auth_secret = Some(secret);
+                    state._auth_reservation = publish_reservation;
                     state.client_identity.authed = true;
                     write_frame(writer, FrameType::Response, &serde_json::to_vec(&response)?)
                         .await?;
@@ -211,22 +213,41 @@ pub(super) async fn process_command(
                 write_error(writer, "E_INVALID", "client is not subscribed").await?;
                 return Ok(false);
             };
-            if !state.in_flight.contains_key(&id) {
+            let Some(delivery) = state.delivery_for_operation(id) else {
                 write_error(writer, "E_FIN_FAILED", "message is not in flight").await?;
                 return Ok(true);
-            }
-            let finish_result =
-                finish_message(broker, &subscription.topic, &subscription.channel, id).await;
-            match finish_result {
-                Ok(()) => {
-                    state.in_flight.remove(&id);
-                    if let Some(subscription) = &state.subscription {
-                        subscription.lease.observe_finish();
-                    }
-                    state.update_subscription_flow();
-                    metrics.finished_messages.fetch_add(1, Ordering::Relaxed);
+            };
+            let deadline = match renew_delivery_lease(
+                broker,
+                &subscription.topic,
+                &subscription.channel,
+                id,
+                delivery.token,
+                state.message_timeout,
+            ) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    write_broker_error(writer, "E_FIN_FAILED", error).await?;
+                    return Ok(true);
                 }
-                Err(error) => write_broker_error(writer, "E_FIN_FAILED", error).await?,
+            };
+            let result = channel_ops.finish(
+                subscription.topic.clone(),
+                subscription.channel.clone(),
+                id,
+                delivery.token,
+            );
+            if let Err(error) = result {
+                write_broker_error(writer, "E_FIN_FAILED", error).await?;
+            } else {
+                state.in_flight.insert(
+                    id,
+                    InFlightDelivery {
+                        deadline,
+                        ..delivery
+                    },
+                );
+                state.pending_channel_ops.insert(id);
             }
         }
         Command::Requeue { id, delay_ms } => {
@@ -235,28 +256,42 @@ pub(super) async fn process_command(
                 write_error(writer, "E_INVALID", "client is not subscribed").await?;
                 return Ok(false);
             };
-            if !state.in_flight.contains_key(&id) {
+            let Some(delivery) = state.delivery_for_operation(id) else {
                 write_error(writer, "E_REQ_FAILED", "message is not in flight").await?;
                 return Ok(true);
-            }
-            let requeue_result = broker
-                .requeue(
-                    &subscription.topic,
-                    &subscription.channel,
-                    id,
-                    Duration::from_millis(delay_ms),
-                )
-                .await;
-            match requeue_result {
-                Ok(()) => {
-                    state.in_flight.remove(&id);
-                    if let Some(subscription) = &state.subscription {
-                        subscription.lease.observe_requeue();
-                    }
-                    state.update_subscription_flow();
-                    metrics.requeued_messages.fetch_add(1, Ordering::Relaxed);
+            };
+            let deadline = match renew_delivery_lease(
+                broker,
+                &subscription.topic,
+                &subscription.channel,
+                id,
+                delivery.token,
+                state.message_timeout,
+            ) {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    write_broker_error(writer, "E_REQ_FAILED", error).await?;
+                    return Ok(true);
                 }
-                Err(error) => write_broker_error(writer, "E_REQ_FAILED", error).await?,
+            };
+            let result = channel_ops.requeue(
+                subscription.topic.clone(),
+                subscription.channel.clone(),
+                id,
+                delivery.token,
+                Duration::from_millis(delay_ms),
+            );
+            if let Err(error) = result {
+                write_broker_error(writer, "E_REQ_FAILED", error).await?;
+            } else {
+                state.in_flight.insert(
+                    id,
+                    InFlightDelivery {
+                        deadline,
+                        ..delivery
+                    },
+                );
+                state.pending_channel_ops.insert(id);
             }
         }
         Command::Touch(id) => {
@@ -264,21 +299,27 @@ pub(super) async fn process_command(
                 write_error(writer, "E_INVALID", "client is not subscribed").await?;
                 return Ok(false);
             };
-            if !state.in_flight.contains_key(&id) {
+            let Some(delivery) = state.delivery_for_operation(id) else {
                 write_error(writer, "E_TOUCH_FAILED", "message is not in flight").await?;
                 return Ok(true);
-            }
-            let touch_result = broker.touch(
+            };
+            let touch_result = renew_delivery_lease(
+                broker,
                 &subscription.topic,
                 &subscription.channel,
                 id,
-                Some(state.message_timeout),
+                delivery.token,
+                state.message_timeout,
             );
             match touch_result {
-                Ok(()) => {
-                    state
-                        .in_flight
-                        .insert(id, Instant::now() + state.message_timeout);
+                Ok(deadline) => {
+                    state.in_flight.insert(
+                        id,
+                        InFlightDelivery {
+                            deadline,
+                            ..delivery
+                        },
+                    );
                 }
                 Err(error) => write_broker_error(writer, "E_TOUCH_FAILED", error).await?,
             }
@@ -369,15 +410,6 @@ pub(super) async fn publish_messages(
         }
         None => broker.publish(topic, messages, delay).await,
     }
-}
-
-pub(super) async fn finish_message(
-    broker: &Broker,
-    topic: &str,
-    channel: &str,
-    id: u64,
-) -> Result<(), BrokerError> {
-    broker.finish(topic, channel, id).await
 }
 
 #[cfg(test)]

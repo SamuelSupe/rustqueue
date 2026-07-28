@@ -1,12 +1,25 @@
 use crate::config::Config;
 use parking_lot::Mutex;
-use regex::Regex;
+use regex_automata::{meta::Regex, nfa::thompson::WhichCaptures};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::mem::size_of;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const AUTH_MEMORY_UNIT_BYTES: usize = 4 * 1024;
+const AUTH_RESPONSE_WORKING_SET_MULTIPLIER: usize = 3;
+const AUTH_REGEX_NFA_LIMIT_BYTES: usize = 256 * 1024;
+const AUTH_REGEX_ENGINE_LIMIT_BYTES: usize = 64 * 1024;
+const AUTH_REGEX_SEARCH_HEADROOM_BYTES: usize = 64 * 1024;
+const MAX_AUTHORIZATIONS: usize = 256;
+const MAX_AUTH_REGEX_PATTERNS: usize = 256;
+const MAX_AUTH_PATTERN_BYTES: usize = 4 * 1024;
+const MAX_AUTH_PATTERN_SOURCE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -16,6 +29,8 @@ pub enum AuthError {
     InvalidResponse,
     #[error("no permissions found")]
     Unauthorized,
+    #[error("authorization memory budget is exhausted")]
+    Overloaded,
 }
 
 pub struct Authenticator {
@@ -24,17 +39,22 @@ pub struct Authenticator {
     max_response_bytes: usize,
     max_ttl_seconds: u64,
     cache: Mutex<AuthCache>,
+    memory: Arc<Semaphore>,
 }
 
 #[derive(Clone)]
 pub struct AuthSession {
-    pub identity: String,
-    pub identity_url: String,
-    expires_at: Instant,
-    grants: Vec<Grant>,
+    inner: Arc<AuthSessionInner>,
 }
 
-#[derive(Clone)]
+struct AuthSessionInner {
+    identity: String,
+    identity_url: String,
+    expires_at: Instant,
+    grants: Vec<Grant>,
+    _memory: Vec<AuthMemoryReservation>,
+}
+
 struct Grant {
     publish: bool,
     subscribe: bool,
@@ -46,6 +66,10 @@ struct AuthCache {
     values: HashMap<[u8; 32], AuthSession>,
     order: VecDeque<[u8; 32]>,
     max_entries: usize,
+}
+
+struct AuthMemoryReservation {
+    _permit: OwnedSemaphorePermit,
 }
 
 #[derive(Deserialize)]
@@ -95,6 +119,8 @@ impl Authenticator {
                 format!("{}/auth", address.trim_end_matches('/'))
             })
             .collect();
+        let memory_units =
+            auth_memory_units(config.limits.auth_memory_bytes).ok_or(AuthError::InvalidResponse)?;
         Ok(Some(Self {
             client,
             endpoints,
@@ -105,6 +131,7 @@ impl Authenticator {
                 order: VecDeque::new(),
                 max_entries: config.limits.auth_cache_max_entries,
             }),
+            memory: Arc::new(Semaphore::new(memory_units as usize)),
         }))
     }
 
@@ -120,6 +147,10 @@ impl Authenticator {
         if let Some(session) = self.cache.lock().get(&cache_key) {
             return Ok(session);
         }
+        let response_working_set = self
+            .max_response_bytes
+            .saturating_mul(AUTH_RESPONSE_WORKING_SET_MULTIPLIER);
+        let response_memory = self.reserve_memory(response_working_set)?;
         let mut last_error = AuthError::Service;
         for endpoint in &self.endpoints {
             match self
@@ -127,10 +158,12 @@ impl Authenticator {
                 .await
             {
                 Ok(session) => {
+                    drop(response_memory);
                     self.cache.lock().insert(cache_key, session.clone());
                     return Ok(session);
                 }
                 Err(AuthError::Unauthorized) => return Err(AuthError::Unauthorized),
+                Err(AuthError::Overloaded) => return Err(AuthError::Overloaded),
                 Err(error) => last_error = error,
             }
         }
@@ -187,7 +220,24 @@ impl Authenticator {
         }
         let response: AuthResponse =
             serde_json::from_slice(&body).map_err(|_| AuthError::InvalidResponse)?;
-        AuthSession::try_from_response(response, self.max_ttl_seconds)
+        self.build_session(response)
+    }
+
+    fn build_session(&self, response: AuthResponse) -> Result<AuthSession, AuthError> {
+        AuthSession::try_from_response_with_memory(response, self.max_ttl_seconds, |bytes| {
+            self.reserve_memory(bytes)
+        })
+    }
+
+    fn reserve_memory(&self, bytes: usize) -> Result<AuthMemoryReservation, AuthError> {
+        let units = auth_memory_units(bytes).ok_or(AuthError::Overloaded)?;
+        loop {
+            match Arc::clone(&self.memory).try_acquire_many_owned(units) {
+                Ok(permit) => return Ok(AuthMemoryReservation { _permit: permit }),
+                Err(_) if self.cache.lock().evict_oldest() => {}
+                Err(_) => return Err(AuthError::Overloaded),
+            }
+        }
     }
 }
 
@@ -210,11 +260,24 @@ impl AuthCache {
         self.order.retain(|candidate| candidate != &key);
         self.order.push_back(key);
         while self.values.len() > self.max_entries {
-            if let Some(oldest) = self.order.pop_front() {
-                self.values.remove(&oldest);
+            if !self.evict_oldest() {
+                break;
             }
         }
     }
+
+    fn evict_oldest(&mut self) -> bool {
+        while let Some(oldest) = self.order.pop_front() {
+            if self.values.remove(&oldest).is_some() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn auth_memory_units(bytes: usize) -> Option<u32> {
+    u32::try_from(bytes.max(1).div_ceil(AUTH_MEMORY_UNIT_BYTES)).ok()
 }
 
 fn auth_cache_key(remote_ip: &str, tls: bool, common_name: &str, secret: &[u8]) -> [u8; 32] {
@@ -232,8 +295,43 @@ fn auth_cache_key(remote_ip: &str, tls: bool, common_name: &str, secret: &[u8]) 
 }
 
 impl AuthSession {
+    #[cfg(test)]
     fn try_from_response(response: AuthResponse, max_ttl_seconds: u64) -> Result<Self, AuthError> {
-        let mut grants = Vec::with_capacity(response.authorizations.len());
+        Self::build(response, max_ttl_seconds, |_| Ok(None))
+    }
+
+    fn try_from_response_with_memory(
+        response: AuthResponse,
+        max_ttl_seconds: u64,
+        mut reserve: impl FnMut(usize) -> Result<AuthMemoryReservation, AuthError>,
+    ) -> Result<Self, AuthError> {
+        Self::build(response, max_ttl_seconds, |bytes| reserve(bytes).map(Some))
+    }
+
+    fn build(
+        response: AuthResponse,
+        max_ttl_seconds: u64,
+        mut reserve: impl FnMut(usize) -> Result<Option<AuthMemoryReservation>, AuthError>,
+    ) -> Result<Self, AuthError> {
+        let shape = validate_auth_response(&response)?;
+        let base_bytes = size_of::<AuthSessionInner>()
+            .saturating_add(2 * size_of::<usize>())
+            .saturating_add(response.identity.capacity())
+            .saturating_add(response.identity_url.capacity())
+            .saturating_add(shape.grants.saturating_mul(size_of::<Grant>()))
+            .saturating_add(shape.channel_patterns.saturating_mul(size_of::<Regex>()))
+            .saturating_add(
+                shape
+                    .patterns
+                    .saturating_add(1)
+                    .saturating_mul(size_of::<AuthMemoryReservation>()),
+            );
+        let mut memory = Vec::with_capacity(shape.patterns.saturating_add(1));
+        if let Some(reservation) = reserve(base_bytes)? {
+            memory.push(reservation);
+        }
+
+        let mut grants = Vec::with_capacity(shape.grants);
         for authorization in response.authorizations {
             let publish = authorization
                 .permissions
@@ -246,12 +344,18 @@ impl AuthSession {
             if !publish && !subscribe {
                 continue;
             }
-            let topic = Regex::new(&authorization.topic).map_err(|_| AuthError::InvalidResponse)?;
-            let channels = authorization
-                .channels
-                .iter()
-                .map(|channel| Regex::new(channel).map_err(|_| AuthError::InvalidResponse))
-                .collect::<Result<_, _>>()?;
+            let topic = compile_auth_pattern(&authorization.topic)?;
+            if let Some(reservation) = reserve(auth_regex_memory_bytes(&topic))? {
+                memory.push(reservation);
+            }
+            let mut channels = Vec::with_capacity(authorization.channels.len());
+            for channel in authorization.channels {
+                let pattern = compile_auth_pattern(&channel)?;
+                if let Some(reservation) = reserve(auth_regex_memory_bytes(&pattern))? {
+                    memory.push(reservation);
+                }
+                channels.push(pattern);
+            }
             grants.push(Grant {
                 publish,
                 subscribe,
@@ -259,36 +363,37 @@ impl AuthSession {
                 channels,
             });
         }
-        if grants.is_empty() {
-            return Err(AuthError::Unauthorized);
-        }
         let ttl_seconds = response.ttl.min(max_ttl_seconds);
         Ok(Self {
-            identity: response.identity,
-            identity_url: response.identity_url,
-            expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
-            grants,
+            inner: Arc::new(AuthSessionInner {
+                identity: response.identity,
+                identity_url: response.identity_url,
+                expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
+                grants,
+                _memory: memory,
+            }),
         })
     }
 
     pub fn can_publish(&self, topic: &str) -> bool {
-        if Instant::now() >= self.expires_at {
+        if self.is_expired() {
             return false;
         }
-        self.grants
+        self.inner
+            .grants
             .iter()
             .any(|grant| grant.publish && grant.topic.is_match(topic))
     }
 
     pub fn is_expired(&self) -> bool {
-        Instant::now() >= self.expires_at
+        Instant::now() >= self.inner.expires_at
     }
 
     pub fn can_subscribe(&self, topic: &str, channel: &str) -> bool {
-        if Instant::now() >= self.expires_at {
+        if self.is_expired() {
             return false;
         }
-        self.grants.iter().any(|grant| {
+        self.inner.grants.iter().any(|grant| {
             grant.subscribe
                 && grant.topic.is_match(topic)
                 && grant
@@ -299,8 +404,90 @@ impl AuthSession {
     }
 
     pub fn permission_count(&self) -> usize {
-        self.grants.len()
+        self.inner.grants.len()
     }
+
+    pub fn identity(&self) -> &str {
+        &self.inner.identity
+    }
+
+    pub fn identity_url(&self) -> &str {
+        &self.inner.identity_url
+    }
+}
+
+struct AuthResponseShape {
+    grants: usize,
+    patterns: usize,
+    channel_patterns: usize,
+}
+
+fn validate_auth_response(response: &AuthResponse) -> Result<AuthResponseShape, AuthError> {
+    if response.ttl == 0 || response.authorizations.len() > MAX_AUTHORIZATIONS {
+        return Err(AuthError::InvalidResponse);
+    }
+    let mut grants = 0usize;
+    let mut patterns = 0usize;
+    let mut channel_patterns = 0usize;
+    let mut pattern_bytes = 0usize;
+    for authorization in &response.authorizations {
+        let relevant = authorization
+            .permissions
+            .iter()
+            .any(|permission| permission == "publish" || permission == "subscribe");
+        if !relevant {
+            continue;
+        }
+        grants = grants.checked_add(1).ok_or(AuthError::InvalidResponse)?;
+        patterns = patterns
+            .checked_add(authorization.channels.len().saturating_add(1))
+            .ok_or(AuthError::InvalidResponse)?;
+        channel_patterns = channel_patterns
+            .checked_add(authorization.channels.len())
+            .ok_or(AuthError::InvalidResponse)?;
+        if patterns > MAX_AUTH_REGEX_PATTERNS {
+            return Err(AuthError::InvalidResponse);
+        }
+        for pattern in std::iter::once(&authorization.topic).chain(&authorization.channels) {
+            if pattern.len() > MAX_AUTH_PATTERN_BYTES {
+                return Err(AuthError::InvalidResponse);
+            }
+            pattern_bytes = pattern_bytes
+                .checked_add(pattern.len())
+                .ok_or(AuthError::InvalidResponse)?;
+            if pattern_bytes > MAX_AUTH_PATTERN_SOURCE_BYTES {
+                return Err(AuthError::InvalidResponse);
+            }
+        }
+    }
+    if grants == 0 {
+        return Err(AuthError::Unauthorized);
+    }
+    Ok(AuthResponseShape {
+        grants,
+        patterns,
+        channel_patterns,
+    })
+}
+
+fn compile_auth_pattern(pattern: &str) -> Result<Regex, AuthError> {
+    Regex::builder()
+        .configure(
+            Regex::config()
+                .which_captures(WhichCaptures::None)
+                .nfa_size_limit(Some(AUTH_REGEX_NFA_LIMIT_BYTES))
+                .onepass_size_limit(Some(AUTH_REGEX_ENGINE_LIMIT_BYTES))
+                .hybrid_cache_capacity(AUTH_REGEX_ENGINE_LIMIT_BYTES)
+                .dfa_size_limit(Some(AUTH_REGEX_ENGINE_LIMIT_BYTES)),
+        )
+        .build(pattern)
+        .map_err(|_| AuthError::InvalidResponse)
+}
+
+fn auth_regex_memory_bytes(pattern: &Regex) -> usize {
+    size_of::<Regex>()
+        .saturating_add(pattern.memory_usage())
+        .saturating_add(AUTH_REGEX_SEARCH_HEADROOM_BYTES)
 }
 
 #[cfg(test)]
@@ -329,7 +516,8 @@ mod tests {
         assert!(session.can_publish("orders"));
         assert!(session.can_subscribe("orders", "workers-2"));
         assert!(!session.can_subscribe("orders", "admin"));
-        assert!(session.expires_at > Instant::now());
+        assert!(session.inner.expires_at > Instant::now());
+        assert!(Arc::ptr_eq(&session.inner, &session.clone().inner));
     }
 
     #[test]
@@ -361,7 +549,7 @@ mod tests {
         assert!(cache.get(&[2; 32]).is_some());
 
         let mut expired = session();
-        expired.expires_at = Instant::now();
+        Arc::get_mut(&mut expired.inner).unwrap().expires_at = Instant::now();
         cache.insert([3; 32], expired);
         assert!(cache.get(&[3; 32]).is_none());
         assert_eq!(cache.order.len(), cache.values.len());
@@ -377,19 +565,92 @@ mod tests {
         for ordinal in 0..1_000u16 {
             let key = [(ordinal % 251) as u8; 32];
             let session = AuthSession {
-                identity: "worker".into(),
-                identity_url: String::new(),
-                expires_at: Instant::now() + Duration::from_millis(1),
-                grants: Vec::new(),
+                inner: Arc::new(AuthSessionInner {
+                    identity: "worker".into(),
+                    identity_url: String::new(),
+                    expires_at: Instant::now() + Duration::from_millis(1),
+                    grants: Vec::new(),
+                    _memory: Vec::new(),
+                }),
             };
             cache.insert(key, session);
             if let Some(value) = cache.values.get_mut(&key) {
-                value.expires_at = Instant::now();
+                Arc::get_mut(&mut value.inner).unwrap().expires_at = Instant::now();
             }
             assert!(cache.get(&key).is_none());
         }
         assert!(cache.order.is_empty());
         assert!(cache.values.is_empty());
+    }
+
+    #[test]
+    fn rejects_auth_responses_that_amplify_regex_compilation() {
+        let channels = (0..MAX_AUTH_REGEX_PATTERNS)
+            .map(|ordinal| format!("^worker-{ordinal}$"))
+            .collect();
+        let response = AuthResponse {
+            ttl: 60,
+            identity: "worker".into(),
+            identity_url: String::new(),
+            authorizations: vec![Authorization {
+                permissions: vec!["subscribe".into()],
+                topic: "^orders$".into(),
+                channels,
+            }],
+        };
+        assert!(matches!(
+            AuthSession::try_from_response(response, 60),
+            Err(AuthError::InvalidResponse)
+        ));
+
+        let response = AuthResponse {
+            ttl: 0,
+            identity: "worker".into(),
+            identity_url: String::new(),
+            authorizations: vec![Authorization {
+                permissions: vec!["publish".into()],
+                topic: ".*".into(),
+                channels: Vec::new(),
+            }],
+        };
+        assert!(matches!(
+            AuthSession::try_from_response(response, 60),
+            Err(AuthError::InvalidResponse)
+        ));
+    }
+
+    #[test]
+    fn auth_memory_budget_bounds_cached_and_live_sessions() {
+        let budget = 2 * 1024 * 1024;
+        let mut config = Config::default();
+        config.security.auth_http_addresses = vec!["http://127.0.0.1:1".into()];
+        config.limits.auth_memory_bytes = budget;
+        let authenticator = Authenticator::new(&config).unwrap().unwrap();
+
+        for ordinal in 0..100u8 {
+            let session = authenticator
+                .build_session(AuthResponse {
+                    ttl: 60,
+                    identity: format!("worker-{ordinal}"),
+                    identity_url: String::new(),
+                    authorizations: vec![Authorization {
+                        permissions: vec!["publish".into()],
+                        topic: format!("^orders-{ordinal}$"),
+                        channels: Vec::new(),
+                    }],
+                })
+                .unwrap();
+            authenticator.cache.lock().insert([ordinal; 32], session);
+        }
+        assert!(authenticator.cache.lock().values.len() < 100);
+
+        let held = authenticator.reserve_memory(budget).unwrap();
+        assert!(matches!(
+            authenticator.reserve_memory(1),
+            Err(AuthError::Overloaded)
+        ));
+        drop(held);
+        assert!(authenticator.reserve_memory(1).is_ok());
     }
 
     #[tokio::test]

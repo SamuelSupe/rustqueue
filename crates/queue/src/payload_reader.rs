@@ -1,3 +1,4 @@
+use crate::delivery_budget::DeliveryHold;
 use parking_lot::Mutex;
 use rustqueue_storage::PayloadRef;
 use rustqueue_telemetry::LatencyHistogram;
@@ -7,17 +8,20 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 type ReadFailure = (io::ErrorKind, String);
 type ReadResult = Result<Vec<Vec<u8>>, ReadFailure>;
+type ReadResponse = (ReadResult, Option<DeliveryHold>);
 
 struct ReadJob {
     payloads: Vec<PayloadRef>,
     _lease: PayloadLease,
-    response: oneshot::Sender<ReadResult>,
+    hold: Option<DeliveryHold>,
+    response: oneshot::Sender<ReadResponse>,
 }
 
 pub(crate) struct PayloadLease {
@@ -60,6 +64,7 @@ impl PayloadReader {
         workers: usize,
         queue_depth: usize,
         latency: Arc<LatencyHistogram>,
+        storage_healthy: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let (sender, receiver) = sync_channel(queue_depth.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
@@ -80,9 +85,10 @@ impl PayloadReader {
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
             let files = Arc::clone(&files);
+            let storage_healthy = Arc::clone(&storage_healthy);
             std::thread::Builder::new()
                 .name(format!("rustqueue-payload-{index}"))
-                .spawn(move || worker(receiver, files))
+                .spawn(move || worker(receiver, files, storage_healthy))
                 .expect("payload reader worker must start");
         }
         Arc::new(Self {
@@ -102,7 +108,9 @@ impl PayloadReader {
     #[cfg(test)]
     pub async fn read_many(&self, payloads: &[PayloadRef]) -> io::Result<Vec<Arc<[u8]>>> {
         let lease = self.retain(payloads.to_vec());
-        self.read_retained(lease).await
+        self.read_retained(lease, None)
+            .await
+            .map(|(bodies, _)| bodies)
     }
 
     pub fn retain(&self, payloads: Vec<PayloadRef>) -> PayloadLease {
@@ -131,7 +139,11 @@ impl PayloadReader {
         }
     }
 
-    pub async fn read_retained(&self, lease: PayloadLease) -> io::Result<Vec<Arc<[u8]>>> {
+    pub async fn read_retained(
+        &self,
+        lease: PayloadLease,
+        hold: Option<DeliveryHold>,
+    ) -> io::Result<(Vec<Arc<[u8]>>, Option<DeliveryHold>)> {
         let _timer = self.latency.timer();
         let payloads = lease.payloads.clone();
         let mut output = vec![None; payloads.len()];
@@ -147,7 +159,7 @@ impl PayloadReader {
             }
         }
         if missing.is_empty() {
-            return Ok(output.into_iter().flatten().collect());
+            return Ok((output.into_iter().flatten().collect(), hold));
         }
         let (sender, receiver) = oneshot::channel();
         let job = ReadJob {
@@ -156,6 +168,7 @@ impl PayloadReader {
                 .map(|index| payloads[*index].clone())
                 .collect(),
             _lease: lease,
+            hold,
             response: sender,
         };
         match self.sender.try_send(job) {
@@ -173,10 +186,10 @@ impl PayloadReader {
                 ));
             }
         }
-        let bodies = receiver
+        let (bodies, hold) = receiver
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "payload reader stopped"))?
-            .map_err(|(kind, message)| io::Error::new(kind, message))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "payload reader stopped"))?;
+        let bodies = bodies.map_err(|(kind, message)| io::Error::new(kind, message))?;
         let mut cache = self.cache.lock();
         for ((index, payload), body) in missing
             .into_iter()
@@ -187,10 +200,13 @@ impl PayloadReader {
             cache.insert(payload, Arc::clone(&body));
             output[index] = Some(body);
         }
-        Ok(output
-            .into_iter()
-            .map(|body| body.expect("every payload read produced a body"))
-            .collect())
+        Ok((
+            output
+                .into_iter()
+                .map(|body| body.expect("every payload read produced a body"))
+                .collect(),
+            hold,
+        ))
     }
 
     pub fn retained_paths(&self) -> BTreeSet<std::path::PathBuf> {
@@ -275,13 +291,27 @@ impl PayloadCache {
     }
 }
 
-fn worker(receiver: Arc<Mutex<Receiver<ReadJob>>>, files: Arc<Mutex<FileCache>>) {
+fn worker(
+    receiver: Arc<Mutex<Receiver<ReadJob>>>,
+    files: Arc<Mutex<FileCache>>,
+    storage_healthy: Arc<AtomicBool>,
+) {
     loop {
         let job = receiver.lock().recv();
         let Ok(job) = job else { return };
+        let ReadJob {
+            payloads,
+            _lease: lease,
+            hold,
+            response,
+        } = job;
         let result =
-            read_payloads(&files, &job.payloads).map_err(|error| (error.kind(), error.to_string()));
-        let _ = job.response.send(result);
+            read_payloads(&files, &payloads).map_err(|error| (error.kind(), error.to_string()));
+        if result.is_err() {
+            storage_healthy.store(false, Ordering::Release);
+        }
+        drop(lease);
+        let _ = response.send((result, hold));
     }
 }
 
@@ -416,8 +446,23 @@ fn release_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery_budget::DeliveryBudget;
     use rustqueue_telemetry::LatencyHistogram;
     use tempfile::tempdir;
+
+    fn reader(cache_bytes: usize, queue_depth: usize) -> (Arc<PayloadReader>, Arc<AtomicBool>) {
+        let storage_healthy = Arc::new(AtomicBool::new(true));
+        (
+            PayloadReader::new(
+                cache_bytes,
+                1,
+                queue_depth,
+                Arc::new(LatencyHistogram::default()),
+                Arc::clone(&storage_healthy),
+            ),
+            storage_healthy,
+        )
+    }
 
     #[test]
     fn payload_lease_keeps_segment_visible_to_gc_until_drop() {
@@ -429,7 +474,7 @@ mod tests {
             len: 1,
             crc32c: 0,
         };
-        let reader = PayloadReader::new(1, 1, 1, Arc::new(LatencyHistogram::default()));
+        let (reader, _) = reader(1, 1);
         let lease = reader.retain(vec![payload]);
         assert!(reader.retained_paths().contains(&path));
         assert!(reader.has_active_under(root.path()));
@@ -449,7 +494,7 @@ mod tests {
             len: 7,
             crc32c: crc32c::crc32c(b"payload"),
         };
-        let reader = PayloadReader::new(1, 1, 4, Arc::new(LatencyHistogram::default()));
+        let (reader, _) = reader(1, 4);
         assert_eq!(
             &*reader
                 .read_many(std::slice::from_ref(&payload))
@@ -478,7 +523,7 @@ mod tests {
             len: 3,
             crc32c: crc32c::crc32c(b"old"),
         };
-        let reader = PayloadReader::new(1024, 1, 4, Arc::new(LatencyHistogram::default()));
+        let (reader, _) = reader(1024, 4);
         assert_eq!(&*reader.read_many(&[old]).await.unwrap()[0], b"old");
 
         std::fs::remove_file(&path).unwrap();
@@ -491,5 +536,66 @@ mod tests {
             crc32c: crc32c::crc32c(b"new"),
         };
         assert_eq!(&*reader.read_many(&[new]).await.unwrap()[0], b"new");
+    }
+
+    #[tokio::test]
+    async fn corrupt_payload_marks_the_reader_unhealthy_before_replying() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("payload");
+        std::fs::write(&path, b"bad").unwrap();
+        let payload = PayloadRef {
+            path: Arc::new(path),
+            offset: 0,
+            len: 3,
+            crc32c: crc32c::crc32c(b"good"),
+        };
+        let (reader, storage_healthy) = reader(1024, 4);
+
+        assert!(reader.read_many(&[payload]).await.is_err());
+        assert!(!storage_healthy.load(Ordering::Acquire));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_payload_read_keeps_its_byte_budget_until_the_worker_finishes() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("payload");
+        let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let payload = PayloadRef {
+            path: Arc::new(path.clone()),
+            offset: 0,
+            len: 1,
+            crc32c: 0,
+        };
+        let (reader, _) = reader(1, 1);
+        let lease = reader.retain(vec![payload]);
+        let budget = DeliveryBudget::new(2);
+        let hold = budget.acquire(1).await.unwrap();
+        assert_eq!(budget.snapshot().in_flight_bytes, 2);
+
+        let mut reading = Box::pin(reader.read_retained(lease, Some(hold)));
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(reading.as_mut(), context).is_pending(),
+                "the FIFO-backed payload read must remain pending"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(reading);
+        assert_eq!(budget.snapshot().in_flight_bytes, 2);
+
+        drop(std::fs::OpenOptions::new().write(true).open(path).unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while budget.snapshot().in_flight_bytes != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

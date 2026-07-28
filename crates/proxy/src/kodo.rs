@@ -10,7 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXPECTED_BROKERS: usize = 3;
 const MAX_STATS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STATS_AGGREGATE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_STATS_BACKENDS_PER_SHARD: usize = 16;
 const MAX_REGISTRY_HEAD_BYTES: usize = 64 * 1024;
+const MAX_BACKEND_ERROR_BYTES: usize = 64 * 1024;
+pub(crate) const STATS_WORKING_SET_BYTES: usize = 3 * MAX_STATS_AGGREGATE_BYTES;
 
 #[derive(Clone)]
 pub(crate) struct KodoConfig {
@@ -94,7 +98,10 @@ pub(crate) async fn stats(
     client: &reqwest::Client,
     path_and_query: &str,
 ) -> Response {
-    let backends = sharded_backends(pool, config.ordinal);
+    let Some(backends) = sharded_backends(pool, config.ordinal, MAX_STATS_BACKENDS_PER_SHARD)
+    else {
+        return unavailable("gateway stats shard has too many brokers");
+    };
     if backends.is_empty() {
         return unavailable("gateway stats shard has no broker");
     }
@@ -106,6 +113,7 @@ pub(crate) async fn stats(
         topics: Vec::new(),
     };
     let path = force_json_stats(path_and_query);
+    let mut aggregate_bytes = 0usize;
     for backend in backends {
         let response = match client
             .get(format!("{}{path}", backend.http_origin()))
@@ -119,11 +127,23 @@ pub(crate) async fn stats(
                 return unavailable("broker stats are unavailable");
             }
         };
-        let stats: StatsResponse = match read_json_bounded(response, MAX_STATS_BYTES).await {
+        let (stats, response_bytes): (StatsResponse, usize) = match read_json_bounded_with_size(
+            response,
+            MAX_STATS_BYTES,
+        )
+        .await
+        {
             Ok(stats) => stats,
             Err(error) => {
                 tracing::warn!(%error, node_id = backend.node_id, "Kodo stats backend was invalid");
                 return unavailable("broker stats are invalid");
+            }
+        };
+        aggregate_bytes = match aggregate_bytes.checked_add(response_bytes) {
+            Some(total) if total <= MAX_STATS_AGGREGATE_BYTES => total,
+            _ => {
+                tracing::warn!("Kodo stats aggregate exceeded its response budget");
+                return unavailable("broker stats aggregate is too large");
             }
         };
         if stats.start_time > 0 {
@@ -243,10 +263,11 @@ async fn delete_from_backend(
         return Ok(());
     }
     let status = response.status();
-    let detail = response
-        .text()
+    let detail = read_bytes_bounded(response, MAX_BACKEND_ERROR_BYTES)
         .await
-        .unwrap_or_else(|_| "broker cleanup failed".into());
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| "broker cleanup failed".into());
     let outward = if status == StatusCode::CONFLICT {
         StatusCode::CONFLICT
     } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -258,26 +279,21 @@ async fn delete_from_backend(
 }
 
 fn complete_broker_set(pool: &BackendPool) -> Option<Vec<Backend>> {
-    let backends = pool.all();
+    let backends = pool.matching_bounded(EXPECTED_BROKERS, |_| true)?;
     (backends.len() == EXPECTED_BROKERS).then_some(backends)
 }
 
 fn sharded_backend(pool: &BackendPool, ordinal: usize) -> Option<Backend> {
-    let mut matching = sharded_backends(pool, ordinal).into_iter();
-    let backend = matching.next()?;
-    matching.next().is_none().then_some(backend)
+    sharded_backends(pool, ordinal, 1)?.into_iter().next()
 }
 
-fn sharded_backends(pool: &BackendPool, ordinal: usize) -> Vec<Backend> {
+fn sharded_backends(pool: &BackendPool, ordinal: usize, maximum: usize) -> Option<Vec<Backend>> {
     if ordinal >= EXPECTED_BROKERS {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    pool.all()
-        .into_iter()
-        .filter(|backend| {
-            backend.node_id.saturating_sub(1) % EXPECTED_BROKERS as u64 == ordinal as u64
-        })
-        .collect()
+    pool.matching_bounded(maximum, |backend| {
+        backend.node_id.saturating_sub(1) % EXPECTED_BROKERS as u64 == ordinal as u64
+    })
 }
 
 fn complete_sharded_backend(pool: &BackendPool, ordinal: usize) -> Option<Backend> {
@@ -385,9 +401,27 @@ fn merge_channel(existing: &mut ChannelStats, mut incoming: ChannelStats) {
 }
 
 async fn read_json_bounded<T: serde::de::DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     maximum: usize,
 ) -> anyhow::Result<T> {
+    read_json_bounded_with_size(response, maximum)
+        .await
+        .map(|(value, _)| value)
+}
+
+async fn read_json_bounded_with_size<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    maximum: usize,
+) -> anyhow::Result<(T, usize)> {
+    let bytes = read_bytes_bounded(response, maximum).await?;
+    let length = bytes.len();
+    Ok((serde_json::from_slice(&bytes)?, length))
+}
+
+async fn read_bytes_bounded(
+    mut response: reqwest::Response,
+    maximum: usize,
+) -> anyhow::Result<Vec<u8>> {
     if response
         .content_length()
         .is_some_and(|length| length > maximum as u64)
@@ -401,7 +435,7 @@ async fn read_json_bounded<T: serde::de::DeserializeOwned>(
         }
         bytes.extend_from_slice(&chunk);
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
 }
 
 fn stable_hash(topic: &str, channel: &str) -> u64 {
@@ -521,12 +555,14 @@ mod tests {
                 .collect(),
         );
         assert_eq!(
-            sharded_backends(&pool, 0)
+            sharded_backends(&pool, 0, 3)
+                .unwrap()
                 .into_iter()
                 .map(|backend| backend.node_id)
                 .collect::<Vec<_>>(),
             vec![1, 4, 7]
         );
+        assert!(sharded_backends(&pool, 0, 2).is_none());
         assert!(sharded_backend(&pool, 0).is_none());
     }
 
@@ -566,6 +602,33 @@ mod tests {
         )
         .await
         .is_ok());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_error_body_is_bounded() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/error",
+                    get(|| async { vec![b'x'; MAX_BACKEND_ERROR_BYTES + 1] }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}/error"))
+            .await
+            .unwrap();
+
+        assert!(read_bytes_bounded(response, MAX_BACKEND_ERROR_BYTES)
+            .await
+            .is_err());
         task.abort();
     }
 }

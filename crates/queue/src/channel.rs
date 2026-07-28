@@ -342,6 +342,18 @@ impl ChannelState {
         self.in_flight_ids.get(&id).copied()
     }
 
+    pub fn in_flight_position_with_token(&self, id: u64, token: u64) -> Option<u64> {
+        let position = self.in_flight_position(id)?;
+        self.in_flight
+            .get(&position)
+            .is_some_and(|flight| flight.token == token)
+            .then_some(position)
+    }
+
+    pub fn is_unacknowledged(&self, position: u64) -> bool {
+        position > self.ack_floor_position && !self.acknowledged.contains(&position)
+    }
+
     pub fn delivery_attempts(&self, position: u64) -> u16 {
         self.attempts.get(&position).copied().unwrap_or_default()
     }
@@ -351,10 +363,14 @@ impl ChannelState {
     }
 
     pub fn touch(&mut self, position: u64, timeout: Duration) -> bool {
+        self.touch_until(position, Instant::now() + timeout)
+    }
+
+    pub fn touch_until(&mut self, position: u64, deadline: Instant) -> bool {
         let Some(flight) = self.in_flight.get_mut(&position) else {
             return false;
         };
-        flight.deadline = Instant::now() + timeout;
+        flight.deadline = deadline;
         true
     }
 

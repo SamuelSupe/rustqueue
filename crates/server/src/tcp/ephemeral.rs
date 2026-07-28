@@ -29,17 +29,28 @@ impl EphemeralConsumers {
     }
 
     pub async fn unregister(&self, broker: &Broker, topic: &str, channel: &str) {
-        let mut counts = self.counts.lock().await;
-        let key = (topic.to_owned(), channel.to_owned());
-        let Some(count) = counts.get_mut(&key) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count > 0 {
-            return;
+        let counts = Arc::clone(&self.counts);
+        let broker = broker.clone();
+        let topic = topic.to_owned();
+        let channel = channel.to_owned();
+        let task = tokio::spawn(async move {
+            let mut counts = counts.lock().await;
+            let key = (topic.clone(), channel.clone());
+            let Some(count) = counts.get_mut(&key) else {
+                return;
+            };
+            *count = count.saturating_sub(1);
+            if *count > 0 {
+                return;
+            }
+            counts.remove(&key);
+            let result = broker.delete_channel(&topic, &channel).await;
+            drop(counts);
+            let _ = result;
+        });
+        if let Err(error) = task.await {
+            tracing::error!(%error, "ephemeral consumer unregister task failed");
         }
-        counts.remove(&key);
-        let _ = broker.delete_channel(topic, channel).await;
     }
 }
 
@@ -150,5 +161,48 @@ mod tests {
 
         assert!(counts.is_empty());
         assert!(broker.channel_names("events").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_unregister_still_removes_the_ephemeral_channel() {
+        let root = tempdir().unwrap();
+        let broker = Broker::open(rustqueue_queue::BrokerConfig {
+            data_path: root.path().to_path_buf(),
+            ..rustqueue_queue::BrokerConfig::default()
+        })
+        .unwrap();
+        let consumers = EphemeralConsumers::default();
+        consumers
+            .register(&broker, "events", "live#ephemeral")
+            .await
+            .unwrap();
+
+        let blocker = consumers.counts.lock().await;
+        let mut unregister = Box::pin(consumers.unregister(&broker, "events", "live#ephemeral"));
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(unregister.as_mut(), context).is_pending(),
+                "the blocked unregister must not complete"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(unregister);
+        drop(blocker);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let counts_empty = consumers.counts.lock().await.is_empty();
+                let channel_removed = broker
+                    .channel_names("events")
+                    .is_ok_and(|channels| channels.is_empty());
+                if counts_empty && channel_removed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -176,27 +176,37 @@ where
             format!("{name} body too big {length} > {maximum}"),
         ));
     }
-    let reservation = if matches!(
-        command,
-        Command::Publish { .. } | Command::MultiPublish { .. } | Command::DeferredPublish { .. }
-    ) {
-        let shape = if matches!(command, Command::MultiPublish { .. }) {
-            crate::admission::PublishShape::Multi
-        } else {
-            crate::admission::PublishShape::Single
-        };
-        Some(
+    let reservation = match command {
+        Command::Identify | Command::Auth => Some(
             admission
-                .try_reserve_connection_publish(length, shape, connection_budget)
+                .try_reserve_control(length, connection_budget)
                 .ok_or_else(|| {
                     CommandReadError::protocol(
                         "E_THROTTLED",
-                        format!("{name} publish byte budget is exhausted; retry later"),
+                        format!("{name} control body byte budget is exhausted; retry later"),
                     )
                 })?,
-        )
-    } else {
-        None
+        ),
+        Command::Publish { .. }
+        | Command::MultiPublish { .. }
+        | Command::DeferredPublish { .. } => {
+            let shape = if matches!(command, Command::MultiPublish { .. }) {
+                crate::admission::PublishShape::Multi
+            } else {
+                crate::admission::PublishShape::Single
+            };
+            Some(
+                admission
+                    .try_reserve_connection_publish(length, shape, connection_budget)
+                    .ok_or_else(|| {
+                        CommandReadError::protocol(
+                            "E_THROTTLED",
+                            format!("{name} publish byte budget is exhausted; retry later"),
+                        )
+                    })?,
+            )
+        }
+        _ => None,
     };
     let mut body = vec![0; length];
     reader.read_exact(&mut body).await.map_err(|error| {
@@ -529,5 +539,38 @@ mod tests {
         assert!(matches!(command.command, Command::Publish { .. }));
         assert_eq!(command.body.as_deref(), Some(b"body".as_slice()));
         writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_bodies_are_admitted_against_the_node_byte_budget() {
+        let config = Config::default();
+        let metrics = Arc::new(Metrics::default());
+        let admission = PublishAdmission::new(8192, metrics);
+        let first_connection = ConnectionBudget::new(8192);
+        let (mut first_peer, mut first_server) = tokio::io::duplex(8192);
+        first_peer.write_all(b"AUTH\n").await.unwrap();
+        first_peer.write_u32(4096).await.unwrap();
+        first_peer.write_all(&vec![b'x'; 4096]).await.unwrap();
+
+        let first = read_initial_command(&mut first_server, &config, &admission, &first_connection)
+            .await
+            .unwrap();
+        assert!(first.publish_reservation.is_some());
+
+        let second_connection = ConnectionBudget::new(8192);
+        let (mut second_peer, mut second_server) = tokio::io::duplex(64);
+        second_peer.write_all(b"IDENTIFY\n").await.unwrap();
+        second_peer.write_u32(2).await.unwrap();
+        let error =
+            read_initial_command(&mut second_server, &config, &admission, &second_connection)
+                .await
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            CommandReadError::Protocol {
+                code: "E_THROTTLED",
+                ..
+            }
+        ));
     }
 }

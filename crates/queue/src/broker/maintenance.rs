@@ -15,6 +15,10 @@ impl Broker {
         let _timer = self.inner.metrics.gc.timer();
         let broker = self.clone();
         self.storage_task(move || {
+            {
+                let _lifecycle = broker.inner.topic_lifecycle.lock();
+                broker.cleanup_drained_retired_topics()?;
+            }
             let mut outbox_ids = HashMap::<String, BTreeSet<u64>>::new();
             for (source_topic, message_id) in
                 crate::outbox::retained_sources(&broker.inner.config.data_path.join("dlq-outbox"))?

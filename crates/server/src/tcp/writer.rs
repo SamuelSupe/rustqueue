@@ -47,6 +47,13 @@ pub(super) fn delivery_write_timeout(heartbeat: Option<Duration>) -> Duration {
         .max(Duration::from_secs(1))
 }
 
+pub(super) fn delivery_visibility_timeout(
+    message_timeout: Duration,
+    output_buffer_timeout: Option<Duration>,
+) -> Duration {
+    message_timeout.saturating_add(output_buffer_timeout.unwrap_or_default())
+}
+
 pub(super) fn connection_progress_timeout(heartbeat: Option<Duration>) -> Duration {
     heartbeat
         .map(|interval| interval.saturating_mul(2))
@@ -180,6 +187,18 @@ mod tests {
         assert_eq!(
             connection_progress_timeout(Some(Duration::from_millis(100))),
             Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn initial_delivery_lease_covers_output_buffering() {
+        assert_eq!(
+            delivery_visibility_timeout(Duration::from_secs(1), Some(Duration::from_secs(30))),
+            Duration::from_secs(31)
+        );
+        assert_eq!(
+            delivery_visibility_timeout(Duration::from_secs(1), None),
+            Duration::from_secs(1)
         );
     }
 }

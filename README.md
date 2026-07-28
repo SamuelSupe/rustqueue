@@ -1,16 +1,23 @@
 # RustQueue
 
+**Durable, NSQ-compatible messaging for Kubernetes — built in Rust.**
+
 [![CI](https://github.com/SamuelSupe/rustqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelSupe/rustqueue/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/SamuelSupe/rustqueue)](https://github.com/SamuelSupe/rustqueue/releases/latest)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Kubernetes](https://img.shields.io/badge/kubernetes-1.28%2B-326CE5.svg)](https://kubernetes.io/)
 
-RustQueue 0.8 is a Kubernetes-native, NSQ V2-compatible message queue for
+[Architecture](docs/architecture/share-nothing-v7.md) ·
+[Kubernetes operations](docs/operations/kubernetes.md) ·
+[Console operations](docs/operations/console.md) ·
+[v0.8.1 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.1)
+
+RustQueue 0.8.1 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.8.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.0).
+> Current release: [v0.8.1](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.1).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -36,31 +43,54 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.8
+## What's new in 0.8.1
 
-- **Kodo compatibility lives in RustQueue.** Discovery `/nodes` advertises
-  three stable Gateway identities for publishing, while `/lookup` continues to
-  return the real Broker owners used by consumers. Existing Kodo producer and
-  consumer behavior is preserved.
-- **Safe producer failover.** Gateways route only to publish-ready Brokers and
-  retry another Broker only after an explicit pre-commit rejection. A failure
-  after a full body write is reported as ambiguous and is never replayed
-  automatically.
-- **Accurate NSQ Stats.** `/stats` exposes standard `topic_name`,
-  `channel_name`, depth, client and cumulative-count fields. Topic and Channel
-  message, requeue and timeout counters remain durable and monotonic across
-  restart, empty and eviction.
-- **100 MiB large-message support.** The v7 storage format now has a stable
-  100 MiB protocol/storage ceiling. The Kodo profile raises the runtime limits
-  and release acceptance publishes and consumes Kodo's exact
-  104,857,500-byte maximum.
-- **Fail-closed administration and rollout.** Unauthenticated Kodo channel
-  cleanup stays disabled. Native management uses scoped tokens, and the
-  Operator blocks Broker maintenance until Gateway cutover and the explicit
-  Kodo producer-restart fence are complete.
+- **Truthful end-to-end benchmarks.** `rustqueue-bench` now starts durable,
+  isolated consumers before publishing, counts unique deliveries and
+  duplicates, reports publish and receive throughput separately, and fails if
+  the requested messages do not arrive before the drain deadline.
+- **Delivery-state correctness.** Generation tokens reject stale `FIN`, `REQ`
+  and `TOUCH` commands after redelivery. Initial leases cover buffered writes,
+  and disconnects no longer release messages while their durable channel
+  operation is still pending.
+- **Crash-safe DLQ and management operations.** Dead-letter transfers are
+  serialized as one durable transaction, recover without replaying a completed
+  copy, and respect Topic/Channel fences during concurrent administrative
+  changes.
+- **Cancellation-safe storage.** Payload and recovery-index workers retain
+  their guards and byte budgets until blocking I/O actually finishes.
+  Corruption marks storage unhealthy before a response can escape, while
+  retired Topics are reclaimed after their final reader drains.
+- **Bounded control planes.** AUTH responses, compiled authorization regexes,
+  Broker management bodies, Kodo Stats aggregation and proxy error bodies all
+  have explicit node-wide limits and timeouts. Invalid semaphore or timer
+  configurations fail during startup instead of panicking later.
 
-See the [v0.8.0 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.0)
-for the complete upgrade and validation record.
+The patch keeps disk format v7 and the NSQ/Kodo compatibility contract from
+0.8.0. See the
+[v0.8.1 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.1)
+for the complete fix and validation record.
+
+## Download 0.8.1
+
+Every release contains native Linux binaries, the Console UI, source, the Helm
+Chart and a checksum manifest:
+
+| Asset | Contents |
+| --- | --- |
+| `rustqueue-0.8.1-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.1-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.1-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.8.1.tgz` | Helm Chart |
+| `SHA256SUMS-0.8.1` | SHA-256 checksums for every downloadable artifact |
+
+```sh
+arch="$(uname -m)"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.1/rustqueue-0.8.1-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.1/SHA256SUMS-0.8.1"
+sha256sum --check --ignore-missing SHA256SUMS-0.8.1
+tar -xzf "rustqueue-0.8.1-linux-${arch}.tar.gz"
+```
 
 ## Architecture
 
@@ -193,7 +223,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.8.0 \
+  --set queue.image=registry.example/rustqueue:0.8.1 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -430,10 +460,12 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.8.0 release additionally passed the unmodified Kodo source replay,
-an exact 104,857,500-byte `PUB`/`DPUB` with one Gateway failover, and a
-three-Broker operational ledger with 3,239 expected and unique messages, zero
-missing, zero duplicates and zero publish errors.
+The v0.8.1 CI/CD workflow publishes a Release only after the non-Kubernetes
+release gate, both native Linux builds, packaging and checksum verification
+succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
+unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one
+Gateway failover, and a three-Broker operational ledger with 3,239 expected and
+unique messages, zero missing, zero duplicates and zero publish errors.
 
 ## Disk pressure
 

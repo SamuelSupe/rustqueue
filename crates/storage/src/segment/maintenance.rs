@@ -15,6 +15,7 @@ impl SegmentLog {
             return Ok(());
         };
         self.current.sync_all()?;
+        let directory = File::open(&self.directory)?;
         let paths = segment_paths(&self.directory)?;
         let target = paths
             .iter()
@@ -25,20 +26,23 @@ impl SegmentLog {
                     "truncate target segment disappeared",
                 ))
             })?;
-        OpenOptions::new()
-            .write(true)
-            .open(location.segment.as_ref())?
-            .set_len(location.offset)?;
-        recovery_index::remove(location.segment.as_ref())?;
-        self.sealed_indexes.remove(location.segment.as_ref());
-        for path in paths.into_iter().skip(target + 1) {
+        for path in paths.iter().skip(target + 1).rev() {
             if path.exists() {
-                fs::remove_file(&path)?;
+                fs::remove_file(path)?;
             }
-            recovery_index::remove(&path)?;
-            self.checksums.remove(&path);
-            self.sealed_indexes.remove(&path);
+            recovery_index::remove(path)?;
+            self.checksums.remove(path);
+            self.sealed_indexes.remove(path);
+            directory.sync_all()?;
         }
+        let target_file = OpenOptions::new()
+            .write(true)
+            .open(location.segment.as_ref())?;
+        target_file.set_len(location.offset)?;
+        target_file.sync_all()?;
+        recovery_index::remove(location.segment.as_ref())?;
+        directory.sync_all()?;
+        self.sealed_indexes.remove(location.segment.as_ref());
         self.resident_records
             .retain(|record| record.index < from_index);
         let (locations, _, bytes, crc32c) = scan_segment(location.segment.as_ref(), true)?;
@@ -57,7 +61,7 @@ impl SegmentLog {
         self.refresh_aggregates();
         self.start_index = self.first_index().unwrap_or(from_index);
         self.current.sync_all()?;
-        File::open(&self.directory)?.sync_all()?;
+        directory.sync_all()?;
         Ok(())
     }
 
@@ -101,6 +105,7 @@ impl SegmentLog {
             return Ok(0);
         }
         self.current.sync_all()?;
+        let directory = File::open(&self.directory)?;
         crash_failpoint("gc_before_segment_delete");
         let removed_through = removable
             .last()
@@ -109,6 +114,8 @@ impl SegmentLog {
         for path in &removable {
             fs::remove_file(path)?;
             recovery_index::remove(path)?;
+            crash_failpoint("gc_after_segment_delete_before_dir_fsync");
+            directory.sync_all()?;
             self.checksums.remove(path);
             self.sealed_indexes.remove(path);
         }
@@ -118,8 +125,7 @@ impl SegmentLog {
         self.start_index = self
             .first_index()
             .unwrap_or_else(|| through_index.saturating_add(1));
-        crash_failpoint("gc_after_segment_delete_before_dir_fsync");
-        File::open(&self.directory)?.sync_all()?;
+        directory.sync_all()?;
         Ok(removable.len())
     }
 

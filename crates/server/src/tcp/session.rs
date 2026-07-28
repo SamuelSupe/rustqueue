@@ -8,6 +8,8 @@ struct PendingFetch<'a> {
     future: FetchFuture<'a>,
 }
 
+const CHANNEL_OP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn poll_pending_fetch(
     pending: &mut Option<PendingFetch<'_>>,
 ) -> Result<FetchResponse, BrokerError> {
@@ -74,11 +76,15 @@ pub(super) async fn run_session(
     output_buffer_tick.tick().await;
     let mut last_command = Instant::now();
     let mut pending_fetch: Option<PendingFetch<'_>> = None;
-    let mut abandoned_deliveries = Vec::new();
+    let (channel_ops, mut channel_op_results, channel_ops_task) = start_channel_ops(broker.clone());
 
     let session_result: anyhow::Result<()> = async {
         loop {
-            let expired = expire_client_deadlines(&mut state.in_flight, Instant::now());
+            let expired = expire_client_deadlines(
+                &mut state.in_flight,
+                &state.pending_channel_ops,
+                Instant::now(),
+            );
             if expired {
                 if let Some(subscription) = state.subscription.as_ref() {
                     broker.expire_channel_in_flight(
@@ -153,6 +159,7 @@ pub(super) async fn run_session(
                         authenticator.as_deref(),
                         &ephemeral_consumers,
                         &subscriptions,
+                        &channel_ops,
                         &mut state,
                         &mut writer,
                     ),
@@ -189,7 +196,8 @@ pub(super) async fn run_session(
                     pending_fetch = Some(PendingFetch { request, future });
                 }
             }
-            let in_flight_deadline = state.in_flight.values().copied().min();
+            let in_flight_deadline =
+                next_client_deadline(&state.in_flight, &state.pending_channel_ops);
 
             tokio::select! {
                 command = command_rx.recv() => {
@@ -249,6 +257,7 @@ pub(super) async fn run_session(
                             authenticator.as_deref(),
                             &ephemeral_consumers,
                             &subscriptions,
+                            &channel_ops,
                             &mut state,
                             &mut writer,
                         ),
@@ -257,6 +266,16 @@ pub(super) async fn run_session(
                     .map_err(|_| anyhow::anyhow!("client command timed out"))??;
                     if !keep_open {
                         break;
+                    }
+                }
+                completion = channel_op_results.recv(), if !state.pending_channel_ops.is_empty() => {
+                    let Some(completion) = completion else {
+                        anyhow::bail!("channel operation pipeline stopped");
+                    };
+                    if let Err((code, error)) =
+                        apply_channel_op_completion(completion, &mut state, metrics)
+                    {
+                        write_broker_error(&mut writer, code, error).await?;
                     }
                 }
                 delivery_result = poll_pending_fetch(&mut pending_fetch), if pending_fetch.is_some() => {
@@ -292,6 +311,33 @@ pub(super) async fn run_session(
                                 flush_timed(&mut writer, state.heartbeat).await?;
                                 continue;
                             }
+                            let write_timeout = delivery_write_timeout(state.heartbeat);
+                            let visibility_timeout = delivery_visibility_timeout(
+                                state.message_timeout,
+                                state.output_buffer_timeout,
+                            );
+                            let handoff_timeout = write_timeout
+                                .saturating_mul(deliveries.len() as u32)
+                                .max(visibility_timeout);
+                            let handoff_deadline = Instant::now() + handoff_timeout;
+                            let delivery_tokens = deliveries
+                                .iter()
+                                .map(|delivery| {
+                                    delivery_guard
+                                        .token(delivery.id)
+                                        .map(|token| (delivery.id, token))
+                                        .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))
+                                })
+                                .collect::<anyhow::Result<Vec<_>>>()?;
+                            broker
+                                .touch_deliveries(
+                                    &delivery_topic,
+                                    &delivery_channel,
+                                    &delivery_tokens,
+                                    Some(handoff_timeout),
+                                )
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                            let mut handed_off = Vec::with_capacity(deliveries.len());
                             for delivery in deliveries {
                                 if delivery_is_outstanding(
                                     &state.in_flight,
@@ -314,14 +360,34 @@ pub(super) async fn run_session(
                                     continue;
                                 }
                                 if !state.accept_sample() {
-                                    finish_message(
+                                    let token = delivery_guard
+                                        .token(delivery.id)
+                                        .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
+                                    let deadline = renew_delivery_lease(
                                         broker,
                                         &delivery_topic,
                                         &delivery_channel,
                                         delivery.id,
+                                        token,
+                                        state.message_timeout,
                                     )
-                                    .await
                                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    channel_ops
+                                        .finish_sampled(
+                                            delivery_topic.clone(),
+                                            delivery_channel.clone(),
+                                            delivery.id,
+                                            token,
+                                        )
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    state.in_flight.insert(
+                                        delivery.id,
+                                        InFlightDelivery {
+                                            deadline,
+                                            token,
+                                        },
+                                    );
+                                    state.pending_channel_ops.insert(delivery.id);
                                     delivery_guard.accept(delivery.id);
                                     continue;
                                 }
@@ -331,20 +397,48 @@ pub(super) async fn run_session(
                                     delivery.id,
                                     delivery.body.len(),
                                 );
+                                let token = delivery_guard
+                                    .token(delivery.id)
+                                    .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
                                 tokio::time::timeout(
-                                    delivery_write_timeout(state.heartbeat),
+                                    write_timeout,
                                     writer.write_message_parts(&header, &delivery.body),
                                 )
                                 .await
                                 .map_err(|_| anyhow::anyhow!("consumer delivery write timed out"))??;
-                                state
-                                    .in_flight
-                                    .insert(delivery.id, Instant::now() + state.message_timeout);
+                                let accepted_token = delivery_guard
+                                    .accept_with_token(delivery.id)
+                                    .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
+                                debug_assert_eq!(accepted_token, token);
+                                state.in_flight.insert(
+                                    delivery.id,
+                                    InFlightDelivery {
+                                        deadline: handoff_deadline,
+                                        token,
+                                    },
+                                );
+                                handed_off.push((delivery.id, token));
                                 if let Some(subscription) = &state.subscription {
                                     subscription.lease.observe_delivery();
                                 }
-                                delivery_guard.accept(delivery.id);
                                 metrics.delivered_messages.fetch_add(1, Ordering::Relaxed);
+                            }
+                            if !handed_off.is_empty() {
+                                let deadline = Instant::now() + visibility_timeout;
+                                broker
+                                    .touch_deliveries(
+                                        &delivery_topic,
+                                        &delivery_channel,
+                                        &handed_off,
+                                        Some(visibility_timeout),
+                                    )
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                for (id, token) in handed_off {
+                                    if let Some(delivery) = state.in_flight.get_mut(&id) {
+                                        debug_assert_eq!(delivery.token, token);
+                                        delivery.deadline = deadline;
+                                    }
+                                }
                             }
                             state.update_subscription_flow();
                         }
@@ -384,21 +478,29 @@ pub(super) async fn run_session(
         Ok(())
     }
     .await;
-    if let Some(mut fetch) = pending_fetch.take() {
-        if let Ok(Ok(response)) =
-            tokio::time::timeout(Duration::from_secs(5), fetch.future.as_mut()).await
-        {
-            abandoned_deliveries
-                .extend(response.deliveries.into_iter().map(|delivery| delivery.id));
-        }
+    drop(channel_ops);
+    let channel_ops_drained = tokio::time::timeout(
+        CHANNEL_OP_CLEANUP_TIMEOUT,
+        settle_channel_op_results(&mut channel_op_results, &mut state, metrics),
+    )
+    .await
+    .unwrap_or(false);
+    if !channel_ops_drained {
+        warn!(
+            pending = state.pending_channel_ops.len(),
+            "channel operation cleanup did not finish before the connection deadline"
+        );
+        channel_ops_task.abort();
     }
+    let _ = channel_ops_task.await;
+    // Cancelling the fetch drops its reservation guard, which only releases
+    // the matching delivery tokens.
+    drop(pending_fetch.take());
     if let Some(subscription) = &state.subscription {
-        let mut ids: Vec<_> = state.in_flight.into_keys().collect();
-        ids.append(&mut abandoned_deliveries);
-        ids.sort_unstable();
-        ids.dedup();
-        if !ids.is_empty() {
-            broker.release(&subscription.topic, &subscription.channel, &ids);
+        let deliveries =
+            releaseable_in_flight_deliveries(state.in_flight, &state.pending_channel_ops);
+        if !deliveries.is_empty() {
+            broker.release_deliveries(&subscription.topic, &subscription.channel, &deliveries);
         }
         if subscription.channel.ends_with("#ephemeral") {
             ephemeral_consumers
@@ -465,14 +567,92 @@ fn publish_command(command: &Command) -> bool {
     )
 }
 
-fn delivery_is_outstanding(in_flight: &HashMap<u64, Instant>, id: u64) -> bool {
+fn delivery_is_outstanding(in_flight: &HashMap<u64, InFlightDelivery>, id: u64) -> bool {
     in_flight.contains_key(&id)
 }
 
-fn expire_client_deadlines(in_flight: &mut HashMap<u64, Instant>, now: Instant) -> bool {
+fn expire_client_deadlines(
+    in_flight: &mut HashMap<u64, InFlightDelivery>,
+    pending_channel_ops: &HashSet<u64>,
+    now: Instant,
+) -> bool {
     let before = in_flight.len();
-    in_flight.retain(|_, deadline| *deadline > now);
+    in_flight.retain(|id, delivery| pending_channel_ops.contains(id) || delivery.deadline > now);
     in_flight.len() != before
+}
+
+fn next_client_deadline(
+    in_flight: &HashMap<u64, InFlightDelivery>,
+    pending_channel_ops: &HashSet<u64>,
+) -> Option<Instant> {
+    in_flight
+        .iter()
+        .filter_map(|(id, delivery)| {
+            (!pending_channel_ops.contains(id)).then_some(delivery.deadline)
+        })
+        .min()
+}
+
+fn apply_channel_op_completion(
+    completion: ChannelOpCompletion,
+    state: &mut SessionState,
+    metrics: &Metrics,
+) -> Result<(), (&'static str, BrokerError)> {
+    state.pending_channel_ops.remove(&completion.id);
+    if let Err(error) = completion.result {
+        if broker_storage_error(&error) {
+            metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        return Err((completion.kind.error_code(), error));
+    }
+
+    state.in_flight.remove(&completion.id);
+    if let Some(subscription) = &state.subscription {
+        match completion.kind {
+            ChannelOpKind::Finish => subscription.lease.observe_finish(),
+            ChannelOpKind::Requeue => subscription.lease.observe_requeue(),
+            ChannelOpKind::SampleFinish => {}
+        }
+    }
+    match completion.kind {
+        ChannelOpKind::Finish => {
+            metrics.finished_messages.fetch_add(1, Ordering::Relaxed);
+        }
+        ChannelOpKind::Requeue => {
+            metrics.requeued_messages.fetch_add(1, Ordering::Relaxed);
+        }
+        ChannelOpKind::SampleFinish => {}
+    }
+    state.update_subscription_flow();
+    Ok(())
+}
+
+async fn settle_channel_op_results(
+    results: &mut tokio::sync::mpsc::UnboundedReceiver<ChannelOpCompletion>,
+    state: &mut SessionState,
+    metrics: &Metrics,
+) -> bool {
+    while !state.pending_channel_ops.is_empty() {
+        let Some(completion) = results.recv().await else {
+            return false;
+        };
+        let _ = apply_channel_op_completion(completion, state, metrics);
+    }
+    true
+}
+
+fn releaseable_in_flight_deliveries(
+    in_flight: HashMap<u64, InFlightDelivery>,
+    pending_channel_ops: &HashSet<u64>,
+) -> Vec<(u64, u64)> {
+    let mut deliveries: Vec<_> = in_flight
+        .into_iter()
+        .filter_map(|(id, delivery)| {
+            (!pending_channel_ops.contains(&id)).then_some((id, delivery.token))
+        })
+        .collect();
+    deliveries.sort_unstable();
+    deliveries
 }
 
 async fn wait_for_in_flight_deadline(deadline: Option<Instant>) {
@@ -485,6 +665,10 @@ async fn wait_for_in_flight_deadline(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delivery(deadline: Instant, token: u64) -> InFlightDelivery {
+        InFlightDelivery { deadline, token }
+    }
 
     #[tokio::test]
     async fn pending_fetch_survives_an_unrelated_ready_branch() {
@@ -519,7 +703,7 @@ mod tests {
     #[test]
     fn duplicate_delivery_is_suppressed_while_in_flight() {
         let mut in_flight = HashMap::new();
-        in_flight.insert(7, Instant::now());
+        in_flight.insert(7, delivery(Instant::now(), 70));
         assert!(delivery_is_outstanding(&in_flight, 7));
 
         in_flight.clear();
@@ -531,12 +715,43 @@ mod tests {
     fn client_deadlines_expire_without_waiting_for_another_fetch() {
         let now = Instant::now();
         let mut in_flight = HashMap::from([
-            (7, now - Duration::from_millis(1)),
-            (8, now + Duration::from_secs(1)),
+            (7, delivery(now - Duration::from_millis(1), 70)),
+            (8, delivery(now + Duration::from_secs(1), 80)),
         ]);
-        assert!(expire_client_deadlines(&mut in_flight, now));
+        assert!(expire_client_deadlines(
+            &mut in_flight,
+            &HashSet::new(),
+            now
+        ));
         assert_eq!(in_flight.keys().copied().collect::<Vec<_>>(), vec![8]);
-        assert!(!expire_client_deadlines(&mut in_flight, now));
+        assert!(!expire_client_deadlines(
+            &mut in_flight,
+            &HashSet::new(),
+            now
+        ));
+    }
+
+    #[test]
+    fn pending_channel_operations_do_not_expire() {
+        let now = Instant::now();
+        let mut in_flight = HashMap::from([(7, delivery(now - Duration::from_millis(1), 70))]);
+        let pending = HashSet::from([7]);
+
+        assert!(!expire_client_deadlines(&mut in_flight, &pending, now));
+        assert_eq!(next_client_deadline(&in_flight, &pending), None);
+        assert!(in_flight.contains_key(&7));
+    }
+
+    #[test]
+    fn unresolved_channel_operations_are_not_released_on_disconnect() {
+        let now = Instant::now();
+        let in_flight = HashMap::from([(7, delivery(now, 70)), (8, delivery(now, 80))]);
+        let pending = HashSet::from([7]);
+
+        assert_eq!(
+            releaseable_in_flight_deliveries(in_flight, &pending),
+            vec![(8, 80)]
+        );
     }
 
     #[test]

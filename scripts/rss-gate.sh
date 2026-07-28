@@ -60,6 +60,7 @@ docker exec "$container" /usr/local/bin/rustqueue-bench \
   --message-bytes "$message_bytes" \
   --batch-size "$batch_size" \
   --producers 16 \
+  --reuse-topic \
   --consumers 0 >/tmp/rustqueue-rss-gate-first.out
 sleep 5
 warm=$(rss_bytes)
@@ -70,6 +71,7 @@ docker exec "$container" /usr/local/bin/rustqueue-bench \
   --message-bytes "$message_bytes" \
   --batch-size "$batch_size" \
   --producers 16 \
+  --reuse-topic \
   --consumers 0 >/tmp/rustqueue-rss-gate-second.out
 sleep 5
 after=$(rss_bytes)

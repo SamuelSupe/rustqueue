@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const FEATURE_LEVEL_2_MAX_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
@@ -115,6 +115,8 @@ pub enum BrokerError {
     RevisionConflict { expected: u64, actual: u64 },
     #[error("management operation conflicts with an existing operation ID")]
     OperationConflict,
+    #[error("active tombstone deadline is required")]
+    InvalidTombstone,
     #[error("message does not exist")]
     MessageNotFound,
     #[error("message is not in flight")]
@@ -165,9 +167,10 @@ struct BrokerInner {
     fences: Mutex<FenceCatalog>,
     management_ops_path: PathBuf,
     management_ops: Mutex<OperationCatalog>,
+    outbox_moves: tokio::sync::Mutex<()>,
     management_fences_ready: AtomicBool,
     registry_revision: AtomicU64,
-    storage_healthy: AtomicBool,
+    storage_healthy: Arc<AtomicBool>,
     gc_cursor: AtomicUsize,
     publish_groups: group_commit::PublishGroups,
     channel_groups: channel_commit::ChannelGroups,
@@ -193,6 +196,14 @@ impl Broker {
         {
             return Err(BrokerError::InvalidRecord(
                 "topic and publish worker limits must be greater than zero".into(),
+            ));
+        }
+        let now = Instant::now();
+        if now.checked_add(config.message_timeout).is_none()
+            || now.checked_add(config.publish_worker_idle).is_none()
+        {
+            return Err(BrokerError::InvalidRecord(
+                "broker timeouts exceed the platform timer range".into(),
             ));
         }
         let readable_message_bytes = if config.storage_feature_level >= 2 {
@@ -239,6 +250,7 @@ impl Broker {
             }
         };
         let metrics = QueueMetrics::default();
+        let storage_healthy = Arc::new(AtomicBool::new(true));
         let (fences_path, fences) = FenceCatalog::load(&config.data_path)?;
         let (management_ops_path, management_ops) = OperationCatalog::load(&config.data_path)?;
         let require_fence_sync = config.require_management_fence_sync;
@@ -247,11 +259,13 @@ impl Broker {
             config.payload_read_workers,
             config.payload_read_queue,
             Arc::clone(&metrics.payload_read),
+            Arc::clone(&storage_healthy),
         );
         let message_index_cache = MessageIndexCache::new(
             config.message_index_cache_bytes,
             config.payload_read_workers,
             config.payload_read_queue,
+            Arc::clone(&storage_healthy),
         );
         let mut topics = HashMap::new();
         for entry in std::fs::read_dir(&topics_root)? {
@@ -326,9 +340,10 @@ impl Broker {
                 fences: Mutex::new(fences),
                 management_ops_path,
                 management_ops: Mutex::new(management_ops),
-                management_fences_ready: AtomicBool::new(true),
+                outbox_moves: tokio::sync::Mutex::new(()),
+                management_fences_ready: AtomicBool::new(!require_fence_sync),
                 registry_revision: AtomicU64::new(revision),
-                storage_healthy: AtomicBool::new(true),
+                storage_healthy,
                 gc_cursor: AtomicUsize::new(0),
                 publish_groups,
                 channel_groups,
@@ -338,12 +353,6 @@ impl Broker {
         };
         broker.reserve_message_metadata(0)?;
         broker.recover_outbox()?;
-        if require_fence_sync {
-            broker
-                .inner
-                .management_fences_ready
-                .store(false, Ordering::Release);
-        }
         Ok(broker)
     }
 
@@ -352,10 +361,15 @@ impl Broker {
     }
 
     pub async fn create_topic(&self, name: &str) -> Result<(), BrokerError> {
+        validate_name(name).map_err(|_| BrokerError::InvalidTopic)?;
         let broker = self.clone();
         let name = name.to_owned();
-        self.storage_task(move || broker.get_or_create_topic(&name).map(|_| ()))
-            .await
+        self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&name, None)?;
+            broker.get_or_create_topic_locked(&name).map(|_| ())
+        })
+        .await
     }
 
     pub async fn delete_topic(&self, name: &str) -> Result<(), BrokerError> {
@@ -365,6 +379,7 @@ impl Broker {
         let name = name.to_owned();
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&name, None)?;
             if broker.delete_topic_locked(&name)? {
                 broker.bump_registry()?;
             }
@@ -374,13 +389,16 @@ impl Broker {
     }
 
     pub async fn create_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
         validate_channel(channel)?;
         self.ensure_management_access(topic, Some(channel))?;
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
         self.storage_task(move || {
-            let handle = broker.get_or_create_topic(&topic)?;
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&topic, Some(&channel))?;
+            let handle = broker.get_or_create_topic_locked(&topic)?;
             if handle
                 .state
                 .lock()
@@ -400,6 +418,8 @@ impl Broker {
         let topic = topic.to_owned();
         let channel = channel.to_owned();
         self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&topic, Some(&channel))?;
             broker
                 .topic(&topic)?
                 .state
@@ -415,8 +435,12 @@ impl Broker {
         self.ensure_management_access(topic, None)?;
         let broker = self.clone();
         let topic = topic.to_owned();
-        self.storage_task(move || broker.topic(&topic)?.state.lock().set_paused(paused))
-            .await
+        self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&topic, None)?;
+            broker.topic(&topic)?.state.lock().set_paused(paused)
+        })
+        .await
     }
 
     pub async fn set_channel_paused(
@@ -430,6 +454,8 @@ impl Broker {
         let topic = topic.to_owned();
         let channel = channel.to_owned();
         self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&topic, Some(&channel))?;
             broker
                 .topic(&topic)?
                 .state
@@ -443,8 +469,12 @@ impl Broker {
         self.ensure_management_access(topic, None)?;
         let broker = self.clone();
         let topic = topic.to_owned();
-        self.storage_task(move || broker.topic(&topic)?.state.lock().empty_topic())
-            .await
+        self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&topic, None)?;
+            broker.topic(&topic)?.state.lock().empty_topic()
+        })
+        .await
     }
 
     pub async fn empty_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
@@ -452,8 +482,12 @@ impl Broker {
         let broker = self.clone();
         let topic = topic.to_owned();
         let channel = channel.to_owned();
-        self.storage_task(move || broker.topic(&topic)?.state.lock().empty_channel(&channel))
-            .await
+        self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            broker.ensure_management_access(&topic, Some(&channel))?;
+            broker.topic(&topic)?.state.lock().empty_channel(&channel)
+        })
+        .await
     }
 
     pub fn topic_names(&self) -> Vec<String> {
@@ -509,7 +543,13 @@ impl Broker {
         task: impl FnOnce() -> Result<T, BrokerError> + Send + 'static,
     ) -> Result<T, BrokerError> {
         self.ensure_storage_healthy()?;
-        let result = blocking(task).await;
+        let observer = self.clone();
+        let result = blocking(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
+                .unwrap_or(Err(BrokerError::StorageUnavailable));
+            observer.observe_storage_result(result)
+        })
+        .await;
         self.observe_storage_result(result)
     }
 

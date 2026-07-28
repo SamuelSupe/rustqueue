@@ -153,6 +153,14 @@ fn rejects_zero_protocol_capacity_and_timeouts() {
     assert!(config.validate().is_err());
 
     let mut config = Config::default();
+    config.limits.auth_max_ttl_seconds = 0;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.auth_memory_bytes = 0;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
     config.limits.http_body_timeout_ms = 1;
     config.queue.message_timeout_ms = config.queue.max_message_timeout_ms + 1;
     assert!(config.validate().is_err());
@@ -164,6 +172,37 @@ fn rejects_zero_protocol_capacity_and_timeouts() {
     let mut config = Config::default();
     config.limits.max_output_buffer_timeout_ms = i64::MAX as u64 + 1;
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn auth_memory_budget_must_cover_response_working_set() {
+    let mut config = Config::default();
+    config.limits.auth_memory_bytes = config.limits.auth_response_bytes * 4 - 1;
+    assert!(config.validate().is_err());
+
+    config.limits.auth_memory_bytes = config.limits.auth_response_bytes * 4;
+    config.validate().unwrap();
+}
+
+#[test]
+fn rejects_limits_that_would_panic_runtime_primitives() {
+    let mut config = Config::default();
+    config.limits.max_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.shutdown.grace_seconds = u64::MAX;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.auth_max_ttl_seconds = u64::MAX;
+    assert!(config.validate().is_err());
+
+    let mut config = Config::default();
+    config.limits.connection_publish_inflight_bytes = usize::MAX;
+    config.limits.node_publish_inflight_bytes = usize::MAX;
+    let error = config.validate().unwrap_err();
+    assert!(error.to_string().contains("publish inflight limits"));
 }
 
 #[test]
