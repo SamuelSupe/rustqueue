@@ -296,6 +296,7 @@ impl From<BrokerError> for ApiError {
             }
             BrokerError::RevisionConflict { .. } => (StatusCode::CONFLICT, "E_REVISION_CONFLICT"),
             BrokerError::OperationConflict => (StatusCode::CONFLICT, "E_OPERATION_CONFLICT"),
+            BrokerError::InvalidTombstone => (StatusCode::BAD_REQUEST, "E_BAD_TOMBSTONE"),
             BrokerError::InvalidChannel => (StatusCode::BAD_REQUEST, "E_BAD_CHANNEL"),
             BrokerError::MessageTooLarge | BrokerError::BatchTooLarge => {
                 (StatusCode::BAD_REQUEST, "E_BAD_MESSAGE")

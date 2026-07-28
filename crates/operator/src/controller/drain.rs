@@ -568,15 +568,14 @@ async fn drain_status(
     ip: &str,
     auth: &AuthSecret,
 ) -> anyhow::Result<DrainStatus> {
-    Ok(context
+    let response = context
         .http
         .get(format!("{}/v1/drain", origin(ip)))
         .bearer_auth(&auth.registry_token)
         .send()
         .await?
-        .error_for_status()?
-        .json::<DrainStatus>()
-        .await?)
+        .error_for_status()?;
+    super::read_broker_json(response).await
 }
 
 fn pod_revision(pod: &Pod) -> Option<&str> {

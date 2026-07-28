@@ -13,8 +13,16 @@ const MAX_GROUP_REQUESTS: usize = 64;
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) enum ChannelOperation {
-    Finish { id: u64, require_in_flight: bool },
-    Requeue { id: u64, available_at_ms: i64 },
+    Finish {
+        id: u64,
+        require_in_flight: bool,
+        token: Option<u64>,
+    },
+    Requeue {
+        id: u64,
+        available_at_ms: i64,
+        token: Option<u64>,
+    },
 }
 
 pub(super) struct ChannelGroups {
@@ -187,11 +195,13 @@ impl Broker {
                 ChannelOperation::Finish {
                     id,
                     require_in_flight,
-                } => topic_state.finish_buffered(&channel, id, require_in_flight),
+                    token,
+                } => topic_state.finish_buffered(&channel, id, require_in_flight, token),
                 ChannelOperation::Requeue {
                     id,
                     available_at_ms,
-                } => topic_state.requeue_buffered(&channel, id, available_at_ms),
+                    token,
+                } => topic_state.requeue_buffered(&channel, id, available_at_ms, token),
             };
             match result {
                 Ok(()) => {
@@ -333,6 +343,7 @@ mod tests {
             operation: ChannelOperation::Finish {
                 id: 1,
                 require_in_flight: true,
+                token: None,
             },
             enqueued_at: Instant::now(),
             reply,

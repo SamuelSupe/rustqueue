@@ -16,6 +16,7 @@ use tokio::sync::{watch, Semaphore};
 const MAX_BACKEND_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const KODO_STATS_HTTP_PORTS: [u16; 3] = [4151, 4154, 4155];
 const KODO_METRICS_HTTP_PORT: u16 = 4160;
+const KODO_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
 struct ProxyState {
@@ -143,13 +144,26 @@ async fn kodo_stats(State(state): State<ProxyState>, request: Request<Body>) -> 
     let Some(config) = &state.kodo else {
         return forward(State(state), request).await;
     };
-    kodo::stats(
-        config,
-        &state.broker_pool,
-        &state.client,
-        &request.uri().to_string(),
+    let Ok(permits) = u32::try_from(kodo::STATS_WORKING_SET_BYTES) else {
+        return stats_throttled();
+    };
+    let Ok(_permit) = Arc::clone(&state.inflight_bytes).try_acquire_many_owned(permits) else {
+        return stats_throttled();
+    };
+    match tokio::time::timeout(
+        KODO_STATS_TIMEOUT,
+        kodo::stats(
+            config,
+            &state.broker_pool,
+            &state.client,
+            &request.uri().to_string(),
+        ),
     )
     .await
+    {
+        Ok(response) => response,
+        Err(_) => stats_timeout(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -407,6 +421,27 @@ fn throttled() -> Response {
     response
 }
 
+fn stats_throttled() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "E_THROTTLED proxy stats byte budget is exhausted",
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
+}
+
+fn stats_timeout() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        "E_STATS_TIMEOUT proxy stats collection timed out",
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +557,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn kodo_stats_respects_the_node_byte_budget() {
+        let state = ProxyState {
+            pool: BackendPool::default(),
+            broker_pool: BackendPool::default(),
+            client: reqwest::Client::new(),
+            max_body_bytes: 1024,
+            body_timeout: std::time::Duration::from_secs(1),
+            inflight_bytes: Arc::new(Semaphore::new(1)),
+            metrics: ProxyMetrics::default(),
+            kodo: Some(KodoConfig {
+                ordinal: 0,
+                cleanup_enabled: false,
+                cleanup_token: None,
+                registry_token: None,
+            }),
+        };
+        let response = Router::new()
+            .route("/stats", get(kodo_stats))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
     }
 
     #[tokio::test]

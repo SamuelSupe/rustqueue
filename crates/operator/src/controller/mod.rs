@@ -26,12 +26,32 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const KODO_BOOTSTRAP_RETENTION_SECONDS: u64 = 180;
+const MAX_BROKER_CONTROL_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub(super) struct ContextData {
     pub client: Client,
     pub http: reqwest::Client,
     pub leader: Arc<AtomicBool>,
     pub leadership: watch::Receiver<bool>,
+}
+
+async fn read_broker_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> anyhow::Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BROKER_CONTROL_RESPONSE_BYTES as u64)
+    {
+        anyhow::bail!("broker control response exceeds its byte limit");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_BROKER_CONTROL_RESPONSE_BYTES {
+            anyhow::bail!("broker control response exceeds its byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&body)?)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1543,6 +1563,34 @@ fn watch_namespace() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn broker_control_json_is_bounded() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/",
+                    axum::routing::get(|| async {
+                        "x".repeat(MAX_BROKER_CONTROL_RESPONSE_BYTES + 1)
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+
+        let error = read_broker_json::<serde_json::Value>(response)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
+        task.abort();
+    }
 
     #[test]
     fn existing_gateway_replicas_preserve_activation_without_status() {

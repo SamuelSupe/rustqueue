@@ -131,6 +131,335 @@ async fn startup_replays_dlq_outbox_before_finishing_the_source() {
 }
 
 #[tokio::test]
+async fn blocked_dlq_target_does_not_prevent_broker_restart() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let id = broker
+        .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    let target = "events.workers.DLQ";
+    crate::outbox::store(
+        &root.path().join("dlq-outbox"),
+        &OutboxEntry {
+            source_topic: "events".into(),
+            source_channel: "workers".into(),
+            message_id: id,
+            target_topic: target.into(),
+            body: bytes::Bytes::from_static(b"poison"),
+        },
+    )
+    .unwrap();
+    broker
+        .sync_management_fences(ManagementFenceSnapshot {
+            revision: "blocked-dlq-target".into(),
+            topics: BTreeMap::from([(target.into(), now_ms() + 60_000)]),
+            channels: Vec::new(),
+        })
+        .await
+        .unwrap();
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    assert_eq!(
+        std::fs::read_dir(root.path().join("dlq-outbox"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let stats = broker.stats();
+    let source = stats
+        .topics
+        .iter()
+        .find(|topic| topic.name == "events")
+        .unwrap();
+    assert_eq!(source.channels[0].depth, 1);
+    assert!(!stats.topics.iter().any(|topic| topic.name == target));
+}
+
+#[tokio::test]
+async fn startup_does_not_replay_outbox_before_required_fence_sync() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        require_management_fence_sync: true,
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker
+        .sync_management_fences(ManagementFenceSnapshot::default())
+        .await
+        .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let id = broker
+        .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    let target = "events.workers.DLQ";
+    crate::outbox::store(
+        &root.path().join("dlq-outbox"),
+        &OutboxEntry {
+            source_topic: "events".into(),
+            source_channel: "workers".into(),
+            message_id: id,
+            target_topic: target.into(),
+            body: bytes::Bytes::from_static(b"poison"),
+        },
+    )
+    .unwrap();
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    assert!(!broker.management_fences_ready());
+    assert_eq!(
+        std::fs::read_dir(root.path().join("dlq-outbox"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let stats = broker.stats();
+    let source = stats
+        .topics
+        .iter()
+        .find(|topic| topic.name == "events")
+        .unwrap();
+    assert_eq!(source.channels[0].depth, 1);
+    assert!(!stats.topics.iter().any(|topic| topic.name == target));
+}
+
+#[tokio::test]
+async fn concurrent_dlq_moves_publish_only_one_copy() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let id = broker
+        .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+
+    let first = broker.move_to_dead_letter(
+        "events",
+        "workers",
+        id,
+        "events.workers.DLQ",
+        bytes::Bytes::from_static(b"poison"),
+    );
+    let second = broker.move_to_dead_letter(
+        "events",
+        "workers",
+        id,
+        "events.workers.DLQ",
+        bytes::Bytes::from_static(b"poison"),
+    );
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(
+        [first.unwrap(), second.unwrap()]
+            .into_iter()
+            .filter(|moved| *moved)
+            .count(),
+        1
+    );
+
+    let stats = broker.stats();
+    let source = stats
+        .topics
+        .iter()
+        .find(|topic| topic.name == "events")
+        .unwrap();
+    assert_eq!(source.channels[0].depth, 0);
+    let target = stats
+        .topics
+        .iter()
+        .find(|topic| topic.name == "events.workers.DLQ")
+        .unwrap();
+    assert_eq!(target.message_count, 1);
+}
+
+#[tokio::test]
+async fn cancelled_dlq_move_keeps_the_transaction_serialized_until_completion() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let id = broker
+        .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+
+    let blocker = broker.inner.outbox_moves.lock().await;
+    let mut moving = Box::pin(broker.move_to_dead_letter(
+        "events",
+        "workers",
+        id,
+        "events.workers.DLQ",
+        bytes::Bytes::from_static(b"poison"),
+    ));
+    std::future::poll_fn(|context| {
+        assert!(
+            std::future::Future::poll(moving.as_mut(), context).is_pending(),
+            "the blocked move must not complete"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(moving);
+    drop(blocker);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let stats = broker.stats();
+            let source_depth = stats
+                .topics
+                .iter()
+                .find(|topic| topic.name == "events")
+                .map(|topic| topic.channels[0].depth);
+            let target_count = stats
+                .topics
+                .iter()
+                .find(|topic| topic.name == "events.workers.DLQ")
+                .map(|topic| topic.message_count);
+            let outbox_empty = std::fs::read_dir(root.path().join("dlq-outbox"))
+                .is_ok_and(|entries| entries.count() == 0);
+            if source_depth == Some(0) && target_count == Some(1) && outbox_empty {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(!broker
+        .move_to_dead_letter(
+            "events",
+            "workers",
+            id,
+            "events.workers.DLQ",
+            bytes::Bytes::from_static(b"poison"),
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        broker
+            .stats()
+            .topics
+            .iter()
+            .find(|topic| topic.name == "events.workers.DLQ")
+            .unwrap()
+            .message_count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn completed_dlq_outbox_is_not_published_again_after_restart() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let id = broker
+        .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    let target = "events.workers.DLQ";
+    let outbox_path = crate::outbox::store(
+        &root.path().join("dlq-outbox"),
+        &OutboxEntry {
+            source_topic: "events".into(),
+            source_channel: "workers".into(),
+            message_id: id,
+            target_topic: target.into(),
+            body: bytes::Bytes::from_static(b"poison"),
+        },
+    )
+    .unwrap();
+    broker
+        .publish(target, vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    let delivery = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    broker
+        .finish("events", "workers", delivery.id)
+        .await
+        .unwrap();
+    assert!(outbox_path.exists());
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    assert!(!outbox_path.exists());
+    let target = broker
+        .stats()
+        .topics
+        .into_iter()
+        .find(|topic| topic.name == target)
+        .unwrap();
+    assert_eq!(target.message_count, 1);
+}
+
+#[tokio::test]
+async fn dlq_outbox_recovers_when_the_source_was_removed() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let id = broker
+        .publish("events", vec![b"poison".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    let target = "events.workers.DLQ";
+    crate::outbox::store(
+        &root.path().join("dlq-outbox"),
+        &OutboxEntry {
+            source_topic: "events".into(),
+            source_channel: "workers".into(),
+            message_id: id,
+            target_topic: target.into(),
+            body: bytes::Bytes::from_static(b"poison"),
+        },
+    )
+    .unwrap();
+    broker.delete_topic("events").await.unwrap();
+    drop(broker);
+
+    let broker = Broker::open(config).unwrap();
+    assert_eq!(
+        std::fs::read_dir(root.path().join("dlq-outbox"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let target = broker
+        .stats()
+        .topics
+        .into_iter()
+        .find(|topic| topic.name == target)
+        .unwrap();
+    assert_eq!(target.message_count, 1);
+}
+
+#[tokio::test]
 async fn stats_settle_expired_in_flight_messages_without_another_fetch() {
     let root = tempdir().unwrap();
     let broker = Broker::open(BrokerConfig {
@@ -155,6 +484,128 @@ async fn stats_settle_expired_in_flight_messages_without_another_fetch() {
     assert_eq!(channel.in_flight_count, 0);
     assert_eq!(channel.timeout_count, 1);
     assert_eq!(channel.depth, 1);
+}
+
+#[tokio::test]
+async fn stale_delivery_token_cannot_mutate_a_redelivery() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"body".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    let first = broker
+        .fetch_batch_retained(
+            "events",
+            "workers",
+            1,
+            usize::MAX,
+            Duration::ZERO,
+            Some(Duration::ZERO),
+        )
+        .await
+        .unwrap();
+    let (first, mut first_guard) = first.into_parts();
+    let id = first[0].id;
+    let stale_token = first_guard.accept_with_token(id).unwrap();
+    broker
+        .expire_channel_in_flight("events", "workers")
+        .await
+        .unwrap();
+
+    let redelivery = broker
+        .fetch_batch_retained("events", "workers", 1, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (redelivery, mut redelivery_guard) = redelivery.into_parts();
+    assert_eq!(redelivery[0].id, id);
+    let current_token = redelivery_guard.accept_with_token(id).unwrap();
+    assert_ne!(stale_token, current_token);
+
+    assert!(matches!(
+        broker
+            .finish_delivery("events", "workers", id, stale_token)
+            .await,
+        Err(BrokerError::MessageNotInFlight)
+    ));
+    assert!(matches!(
+        broker.touch_delivery("events", "workers", id, stale_token, None),
+        Err(BrokerError::MessageNotInFlight)
+    ));
+    assert!(matches!(
+        broker
+            .requeue_delivery("events", "workers", id, stale_token, Duration::ZERO)
+            .await,
+        Err(BrokerError::MessageNotInFlight)
+    ));
+    broker.release_deliveries("events", "workers", &[(id, stale_token)]);
+    assert_eq!(broker.stats().topics[0].channels[0].in_flight_count, 1);
+
+    broker
+        .finish_delivery("events", "workers", id, current_token)
+        .await
+        .unwrap();
+    assert_eq!(broker.stats().topics[0].channels[0].depth, 0);
+}
+
+#[tokio::test]
+async fn current_delivery_tokens_can_renew_an_expiring_batch() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![b"first".to_vec(), b"second".to_vec()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    let batch = broker
+        .fetch_batch_retained(
+            "events",
+            "workers",
+            2,
+            usize::MAX,
+            Duration::ZERO,
+            Some(Duration::ZERO),
+        )
+        .await
+        .unwrap();
+    let (deliveries, mut guard) = batch.into_parts();
+    let tokens: Vec<_> = deliveries
+        .iter()
+        .map(|delivery| (delivery.id, guard.token(delivery.id).unwrap()))
+        .collect();
+    broker
+        .touch_deliveries("events", "workers", &tokens, Some(Duration::from_secs(30)))
+        .unwrap();
+    for (id, token) in &tokens {
+        assert_eq!(guard.accept_with_token(*id), Some(*token));
+    }
+
+    broker
+        .expire_channel_in_flight("events", "workers")
+        .await
+        .unwrap();
+    assert_eq!(broker.stats().topics[0].channels[0].in_flight_count, 2);
+    for (id, token) in tokens {
+        broker
+            .finish_delivery("events", "workers", id, token)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -296,6 +747,20 @@ fn feature_level_two_rejects_a_delivery_budget_that_cannot_read_retained_message
     assert!(error
         .to_string()
         .contains("every message readable at the active storage feature level"));
+}
+
+#[test]
+fn broker_rejects_timeouts_that_would_overflow_instant() {
+    let root = tempdir().unwrap();
+    let error = match Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        message_timeout: Duration::MAX,
+        ..BrokerConfig::default()
+    }) {
+        Ok(_) => panic!("unrepresentable broker timeout was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("platform timer range"));
 }
 
 #[tokio::test]
@@ -808,6 +1273,29 @@ async fn dropping_an_unhanded_delivery_batch_does_not_consume_an_attempt() {
 }
 
 #[tokio::test]
+async fn maintenance_reclaims_retired_topics_after_readers_drain() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("events").await.unwrap();
+    let handle = broker.topic("events").unwrap();
+    let directory = crate::metadata::topic_directory(root.path(), "events");
+
+    broker.delete_topic("events").await.unwrap();
+    assert!(directory.exists());
+    assert!(broker.inner.retired_topics.lock().contains_key("events"));
+
+    drop(handle);
+    broker.compact().await.unwrap();
+
+    assert!(!directory.exists());
+    assert!(!broker.inner.retired_topics.lock().contains_key("events"));
+}
+
+#[tokio::test]
 async fn broker_metadata_budget_spills_active_tails_across_topics() {
     let root = tempdir().unwrap();
     let config = BrokerConfig {
@@ -896,6 +1384,327 @@ async fn concurrent_publishes_wait_for_metadata_spill_instead_of_rejecting() {
         32 * 1_024
     );
     assert!(broker.inner.message_index_cache.resident_bytes() <= 64 * 1024);
+}
+
+#[tokio::test]
+async fn channel_creation_rechecks_fences_after_waiting_for_management() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("events").await.unwrap();
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_holder = {
+        let broker = broker.clone();
+        std::thread::spawn(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+    };
+    locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let mut creation = Box::pin(broker.create_channel("events", "workers"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), creation.as_mut())
+            .await
+            .is_err(),
+        "ordinary channel creation bypassed the management lifecycle barrier"
+    );
+    {
+        let mut fences = broker.inner.fences.lock();
+        fences.set_channel("events", "workers", now_ms() + 60_000);
+        fences.store(&broker.inner.fences_path).unwrap();
+    }
+    release_tx.send(()).unwrap();
+    lock_holder.join().unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), creation)
+            .await
+            .unwrap(),
+        Err(BrokerError::ChannelTombstoned)
+    ));
+    assert!(broker.channel_names("events").unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_fetch_rechecks_channel_fence_before_reserving() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+
+    let topic = broker.topic("events").unwrap();
+    let baseline_receivers = topic.wake.receiver_count();
+    let fetch_broker = broker.clone();
+    let fetch = tokio::spawn(async move {
+        fetch_broker
+            .fetch_batch_retained("events", "workers", 1, 1024, Duration::from_secs(1), None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while topic.wake.receiver_count() <= baseline_receivers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let topic_state = topic.state.lock();
+    {
+        let mut fences = broker.inner.fences.lock();
+        fences.set_channel("events", "workers", now_ms() + 60_000);
+        fences.store(&broker.inner.fences_path).unwrap();
+    }
+    drop(topic_state);
+    broker
+        .publish("events", vec![b"body".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), fetch)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(BrokerError::ChannelTombstoned)
+    ));
+    let channel = &broker.stats().topics[0].channels[0];
+    assert_eq!(channel.depth, 1);
+    assert_eq!(channel.in_flight_count, 0);
+}
+
+#[tokio::test]
+async fn touch_rechecks_channel_fence_after_waiting_for_topic() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"body".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    let batch = broker
+        .fetch_batch_retained("events", "workers", 1, 1024, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (deliveries, mut guard) = batch.into_parts();
+    let id = deliveries[0].id;
+    let token = guard.accept_with_token(id).unwrap();
+
+    let topic = broker.topic("events").unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_holder = {
+        let topic = Arc::clone(&topic);
+        std::thread::spawn(move || {
+            let _topic_state = topic.state.lock();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+    };
+    locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let baseline_references = Arc::strong_count(&topic);
+    let toucher = {
+        let broker = broker.clone();
+        std::thread::spawn(move || {
+            broker.touch_delivery(
+                "events",
+                "workers",
+                id,
+                token,
+                Some(Duration::from_secs(30)),
+            )
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&topic) <= baseline_references {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let mut fences = broker.inner.fences.lock();
+        fences.set_channel("events", "workers", now_ms() + 60_000);
+        fences.store(&broker.inner.fences_path).unwrap();
+    }
+    release_tx.send(()).unwrap();
+    lock_holder.join().unwrap();
+
+    assert!(matches!(
+        toucher.join().unwrap(),
+        Err(BrokerError::ChannelTombstoned)
+    ));
+}
+
+#[tokio::test]
+async fn fence_sync_waits_for_active_management_mutation() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    let deadline = now_ms() + 60_000;
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_holder = {
+        let broker = broker.clone();
+        std::thread::spawn(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        })
+    };
+    locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let mut sync = Box::pin(broker.sync_management_fences(ManagementFenceSnapshot {
+        revision: "resource-version-1".into(),
+        topics: BTreeMap::from([("events".into(), deadline)]),
+        channels: Vec::new(),
+    }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), sync.as_mut())
+            .await
+            .is_err(),
+        "fence replacement bypassed the management lifecycle barrier"
+    );
+    release_tx.send(()).unwrap();
+    lock_holder.join().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), sync)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        broker.create_topic("events").await,
+        Err(BrokerError::TopicTombstoned)
+    ));
+}
+
+#[tokio::test]
+async fn failed_management_preconditions_do_not_leave_durable_blockers() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+
+    assert!(matches!(
+        broker
+            .manage_topic(
+                "pause-missing-0001",
+                "missing",
+                TopicManagementAction::Pause,
+                broker.registry_revision(),
+                None,
+            )
+            .await,
+        Err(BrokerError::TopicNotFound)
+    ));
+    broker.create_topic("missing").await.unwrap();
+
+    broker.create_topic("events").await.unwrap();
+    assert!(matches!(
+        broker
+            .manage_channel(ChannelManagementCommand {
+                operation_id: "pause-channel-0001",
+                topic: "events",
+                channel: "workers",
+                action: ChannelManagementAction::Pause,
+                expected_revision: broker.registry_revision(),
+                tombstone_until_ms: None,
+                require_idle: false,
+            })
+            .await,
+        Err(BrokerError::ChannelNotFound)
+    ));
+    broker.create_channel("events", "workers").await.unwrap();
+
+    assert!(matches!(
+        broker
+            .manage_topic(
+                "delete-no-deadline-0001",
+                "missing",
+                TopicManagementAction::Delete,
+                broker.registry_revision(),
+                None,
+            )
+            .await,
+        Err(BrokerError::InvalidTombstone)
+    ));
+    broker
+        .publish("missing", vec![b"still-open".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        broker
+            .manage_channel(ChannelManagementCommand {
+                operation_id: "delete-expired-0001",
+                topic: "events",
+                channel: "workers",
+                action: ChannelManagementAction::Delete,
+                expected_revision: broker.registry_revision(),
+                tombstone_until_ms: Some(now_ms().saturating_sub(1)),
+                require_idle: false,
+            })
+            .await,
+        Err(BrokerError::InvalidTombstone)
+    ));
+    broker
+        .publish("events", vec![b"still-open".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_different_management_action_cannot_cross_a_pending_operation() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("events").await.unwrap();
+    let fingerprint =
+        serde_json::to_string(&("topic", "events", TopicManagementAction::Pause)).unwrap();
+    broker
+        .inner
+        .management_ops
+        .lock()
+        .prepare(
+            &broker.inner.management_ops_path,
+            "pending-pause-0001",
+            fingerprint,
+            "events".into(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        broker
+            .manage_topic(
+                "delete-events-0002",
+                "events",
+                TopicManagementAction::Delete,
+                broker.registry_revision(),
+                Some(now_ms() + 60_000),
+            )
+            .await,
+        Err(BrokerError::OperationConflict)
+    ));
+    assert!(broker.topic_names().iter().any(|topic| topic == "events"));
 }
 
 #[tokio::test]
@@ -1367,10 +2176,56 @@ async fn concurrent_registry_updates_persist_the_latest_revision() {
 
 #[tokio::test]
 async fn panicked_storage_tasks_fail_the_broker_closed() {
-    let error = super::blocking::<()>(|| panic!("injected storage task panic"))
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    let error = broker
+        .storage_task::<()>(|| panic!("injected storage task panic"))
         .await
         .unwrap_err();
     assert!(matches!(error, BrokerError::StorageUnavailable));
+    assert!(!broker.storage_healthy());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_storage_task_still_records_its_failure() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let task = {
+        let broker = broker.clone();
+        tokio::spawn(async move {
+            broker
+                .storage_task(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Err::<(), _>(BrokerError::InvalidRecord(
+                        "injected cancelled storage failure".into(),
+                    ))
+                })
+                .await
+        })
+    };
+    started_rx.recv().unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    release_tx.send(()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while broker.storage_healthy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[test]

@@ -206,11 +206,37 @@ fn validate_proxy_limits(cli: &Cli) -> anyhow::Result<()> {
             "proxy limits must be non-zero, fit the 100 MiB message and 128 MiB batch contract, and fit the inflight byte budget"
         );
     }
+    if cli.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+        || cli.max_inflight_bytes > tokio::sync::Semaphore::MAX_PERMITS
+    {
+        anyhow::bail!("proxy limits exceed the runtime semaphore capacity");
+    }
+    let now = std::time::Instant::now();
+    let shutdown_timeout =
+        Duration::from_secs(cli.shutdown_grace_seconds).checked_add(Duration::from_secs(2));
+    let timers = [
+        Duration::from_millis(cli.http_body_timeout_ms),
+        Duration::from_millis(cli.tcp_command_timeout_ms),
+        Duration::from_secs(cli.tcp_max_connection_age_seconds),
+    ];
+    if shutdown_timeout
+        .and_then(|duration| now.checked_add(duration))
+        .is_none()
+        || timers
+            .into_iter()
+            .any(|duration| now.checked_add(duration).is_none())
+    {
+        anyhow::bail!("proxy timeouts exceed the platform timer range");
+    }
     if cli.kodo_compatibility_enabled
         && (cli.max_message_bytes != rustqueue_protocol::MAX_MESSAGE_BYTES
-            || cli.max_body_bytes != rustqueue_protocol::MAX_BATCH_BYTES)
+            || cli.max_body_bytes != rustqueue_protocol::MAX_BATCH_BYTES
+            || cli.max_inflight_bytes
+                < tcp::maximum_gateway_working_set(cli.max_message_bytes, cli.max_body_bytes))
     {
-        anyhow::bail!("Kodo compatibility requires the 100 MiB message and 128 MiB batch limits");
+        anyhow::bail!(
+            "Kodo compatibility requires the 100 MiB message and 128 MiB batch limits plus their parsing working set"
+        );
     }
     Ok(())
 }
@@ -339,6 +365,17 @@ mod tests {
     }
 
     #[test]
+    fn proxy_limits_reject_runtime_panics() {
+        let mut cli = default_cli();
+        cli.max_connections = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert!(validate_proxy_limits(&cli).is_err());
+
+        let mut cli = default_cli();
+        cli.shutdown_grace_seconds = u64::MAX;
+        assert!(validate_proxy_limits(&cli).is_err());
+    }
+
+    #[test]
     fn kodo_mode_requires_the_full_hundred_mebibyte_profile() {
         let mut cli = default_cli();
         cli.kodo_compatibility_enabled = true;
@@ -347,6 +384,13 @@ mod tests {
         assert!(validate_proxy_limits(&cli).is_ok());
 
         cli.max_message_bytes -= 1;
+        assert!(validate_proxy_limits(&cli).is_err());
+
+        let mut cli = default_cli();
+        cli.kodo_compatibility_enabled = true;
+        cli.max_message_bytes = rustqueue_protocol::MAX_MESSAGE_BYTES;
+        cli.max_body_bytes = rustqueue_protocol::MAX_BATCH_BYTES;
+        cli.max_inflight_bytes = cli.max_body_bytes;
         assert!(validate_proxy_limits(&cli).is_err());
     }
 }

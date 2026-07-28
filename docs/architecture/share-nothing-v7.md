@@ -1,7 +1,7 @@
 # RustQueue format v7 share-nothing architecture
 
 Status: accepted implementation contract
-Target release: 0.8.0
+Target release: 0.8.1
 Data format: v7, clean directories only
 
 ## 1. Goal

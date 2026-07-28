@@ -2,6 +2,7 @@ use super::*;
 use crate::channel::{MessageAvailability, NextCandidate};
 use crate::model::ReservedDelivery;
 use crate::topic::index::{Lookup, PageRequest};
+use std::time::Instant;
 
 pub(crate) enum ReserveBatch {
     Ready(Vec<ReservedDelivery>),
@@ -89,7 +90,7 @@ impl Topic {
         id: u64,
         require_in_flight: bool,
     ) -> Result<(), BrokerError> {
-        let command = self.finish_command(channel, id, require_in_flight)?;
+        let command = self.finish_command(channel, id, require_in_flight, None)?;
         self.persist_channel(channel, command)
     }
 
@@ -98,8 +99,9 @@ impl Topic {
         channel: &str,
         id: u64,
         require_in_flight: bool,
+        token: Option<u64>,
     ) -> Result<(), BrokerError> {
-        let command = self.finish_command(channel, id, require_in_flight)?;
+        let command = self.finish_command(channel, id, require_in_flight, token)?;
         self.persist_channel_buffered(channel, command)
     }
 
@@ -108,12 +110,19 @@ impl Topic {
         channel: &str,
         id: u64,
         require_in_flight: bool,
+        token: Option<u64>,
     ) -> Result<ChannelCommand, BrokerError> {
         let position = if require_in_flight {
-            self.channels
+            let state = &self
+                .channels
                 .get(channel)
-                .and_then(|channel| channel.state.in_flight_position(id))
-                .ok_or(BrokerError::MessageNotInFlight)?
+                .ok_or(BrokerError::ChannelNotFound)?
+                .state;
+            match token {
+                Some(token) => state.in_flight_position_with_token(id, token),
+                None => state.in_flight_position(id),
+            }
+            .ok_or(BrokerError::MessageNotInFlight)?
         } else {
             self.position_by_id(id)?
                 .ok_or(BrokerError::MessageNotFound)?
@@ -129,8 +138,9 @@ impl Topic {
         channel: &str,
         id: u64,
         available_at_ms: i64,
+        token: Option<u64>,
     ) -> Result<(), BrokerError> {
-        let command = self.requeue_command(channel, id, available_at_ms)?;
+        let command = self.requeue_command(channel, id, available_at_ms, token)?;
         self.persist_channel_buffered(channel, command)
     }
 
@@ -139,15 +149,17 @@ impl Topic {
         channel: &str,
         id: u64,
         available_at_ms: i64,
+        token: Option<u64>,
     ) -> Result<ChannelCommand, BrokerError> {
         let runtime = self
             .channels
             .get(channel)
             .ok_or(BrokerError::ChannelNotFound)?;
-        let position = runtime
-            .state
-            .in_flight_position(id)
-            .ok_or(BrokerError::MessageNotInFlight)?;
+        let position = match token {
+            Some(token) => runtime.state.in_flight_position_with_token(id, token),
+            None => runtime.state.in_flight_position(id),
+        }
+        .ok_or(BrokerError::MessageNotInFlight)?;
         let attempts = runtime.state.delivery_attempts(position);
         Ok(ChannelCommand::Requeue {
             position,
@@ -161,19 +173,56 @@ impl Topic {
     }
 
     pub fn touch(&mut self, channel: &str, id: u64, timeout: Duration) -> Result<(), BrokerError> {
+        self.touch_with_token(channel, id, None, timeout)
+    }
+
+    pub fn touch_with_token(
+        &mut self,
+        channel: &str,
+        id: u64,
+        token: Option<u64>,
+        timeout: Duration,
+    ) -> Result<(), BrokerError> {
         let channel = self
             .channels
             .get_mut(channel)
             .ok_or(BrokerError::ChannelNotFound)?;
-        let position = channel
-            .state
-            .in_flight_position(id)
-            .ok_or(BrokerError::MessageNotInFlight)?;
+        let position = match token {
+            Some(token) => channel.state.in_flight_position_with_token(id, token),
+            None => channel.state.in_flight_position(id),
+        }
+        .ok_or(BrokerError::MessageNotInFlight)?;
         if channel.state.touch(position, timeout) {
             Ok(())
         } else {
             Err(BrokerError::MessageNotInFlight)
         }
+    }
+
+    pub fn touch_deliveries_with_tokens(
+        &mut self,
+        channel: &str,
+        deliveries: &[(u64, u64)],
+        timeout: Duration,
+    ) -> Result<(), BrokerError> {
+        let channel = self
+            .channels
+            .get_mut(channel)
+            .ok_or(BrokerError::ChannelNotFound)?;
+        let positions: Vec<_> = deliveries
+            .iter()
+            .map(|(id, token)| {
+                channel
+                    .state
+                    .in_flight_position_with_token(*id, *token)
+                    .ok_or(BrokerError::MessageNotInFlight)
+            })
+            .collect::<Result<_, _>>()?;
+        let deadline = Instant::now() + timeout;
+        for position in positions {
+            debug_assert!(channel.state.touch_until(position, deadline));
+        }
+        Ok(())
     }
 
     pub fn release(&mut self, channel: &str, ids: &[u64]) {
@@ -187,11 +236,36 @@ impl Topic {
         }
     }
 
+    pub fn release_with_tokens(&mut self, channel: &str, deliveries: &[(u64, u64)]) {
+        let Some(channel) = self.channels.get_mut(channel) else {
+            return;
+        };
+        for (id, token) in deliveries {
+            if let Some(position) = channel.state.in_flight_position_with_token(*id, *token) {
+                channel.state.release(position);
+            }
+        }
+    }
+
     pub fn release_all(&mut self) -> usize {
         self.channels
             .values_mut()
             .map(|channel| channel.state.release_all())
             .sum()
+    }
+
+    pub fn message_is_unacknowledged(
+        &self,
+        channel: &str,
+        id: u64,
+    ) -> Result<Option<bool>, BrokerError> {
+        let Some(position) = self.position_by_id(id)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .channels
+            .get(channel)
+            .map(|runtime| runtime.state.is_unacknowledged(position)))
     }
 
     fn position_by_id(&self, id: u64) -> Result<Option<u64>, BrokerError> {

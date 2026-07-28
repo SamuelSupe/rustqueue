@@ -16,6 +16,7 @@ impl Broker {
     ) -> Result<(), BrokerError> {
         let broker = self.clone();
         self.storage_task(move || {
+            let _lifecycle = broker.inner.topic_lifecycle.lock();
             let mut fences = broker.inner.fences.lock();
             fences.replace(snapshot);
             fences.store(&broker.inner.fences_path)?;
@@ -44,15 +45,47 @@ impl Broker {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             let fingerprint = serde_json::to_string(&("topic", &topic, action))
                 .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
-            let (replayed, operation_id) = match broker.prepare_management_operation(
-                &operation_id,
-                &fingerprint,
-                &topic,
-                expected_revision,
-            )? {
-                PreparedOperation::Completed(result) => return Ok(result),
-                PreparedOperation::New(id) => (false, id),
-                PreparedOperation::Pending(id) => (true, id),
+            let pending_operation = {
+                let operations = broker.inner.management_ops.lock();
+                match operations
+                    .lookup(&operation_id, &fingerprint)
+                    .map_err(operation_catalog_error)?
+                {
+                    OperationLookup::Completed(result) => return Ok(result),
+                    OperationLookup::Pending => Some(operation_id.clone()),
+                    OperationLookup::New => operations.pending_id(&topic, &fingerprint),
+                }
+            };
+            if pending_operation.is_none()
+                && matches!(
+                    action,
+                    TopicManagementAction::Delete | TopicManagementAction::Tombstone
+                )
+            {
+                valid_tombstone(tombstone_until_ms, false)?;
+            }
+            if pending_operation.is_none()
+                && matches!(
+                    action,
+                    TopicManagementAction::Pause
+                        | TopicManagementAction::Unpause
+                        | TopicManagementAction::Empty
+                )
+            {
+                broker.topic(&topic)?;
+            }
+            let (replayed, operation_id) = match pending_operation {
+                Some(id) => (true, id),
+                None => match broker.prepare_management_operation(
+                    &operation_id,
+                    &fingerprint,
+                    &topic,
+                    expected_revision,
+                )? {
+                    PreparedOperation::Completed(result) => return Ok(result),
+                    PreparedOperation::New(id) => (false, id),
+                    PreparedOperation::Pending(id) => (true, id),
+                },
             };
             let mut changed = false;
             match action {
@@ -140,6 +173,33 @@ impl Broker {
                     OperationLookup::New => operations.pending_id(&topic, &fingerprint),
                 }
             };
+            if pending_operation.is_none()
+                && matches!(
+                    action,
+                    ChannelManagementAction::Delete | ChannelManagementAction::Tombstone
+                )
+            {
+                valid_tombstone(tombstone_until_ms, false)?;
+            }
+            if pending_operation.is_none()
+                && matches!(
+                    action,
+                    ChannelManagementAction::Pause
+                        | ChannelManagementAction::Unpause
+                        | ChannelManagementAction::Empty
+                )
+            {
+                let handle = broker.topic(&topic)?;
+                if !handle
+                    .state
+                    .lock()
+                    .channel_names()
+                    .iter()
+                    .any(|name| name == &channel)
+                {
+                    return Err(BrokerError::ChannelNotFound);
+                }
+            }
             let idle_handle = if action == ChannelManagementAction::Delete && require_idle {
                 match broker.topic(&topic) {
                     Ok(handle) => Some(handle),
@@ -315,6 +375,9 @@ impl Broker {
                 if let Some(pending_id) = operations.pending_id(topic, fingerprint) {
                     return Ok(PreparedOperation::Pending(pending_id));
                 }
+                if operations.blocks_topic(topic) {
+                    return Err(BrokerError::OperationConflict);
+                }
                 self.check_revision(expected_revision)?;
                 operations
                     .prepare(
@@ -352,7 +415,7 @@ enum PreparedOperation {
 fn valid_tombstone(value: Option<i64>, replayed: bool) -> Result<i64, BrokerError> {
     value
         .filter(|until| replayed || *until > now_ms())
-        .ok_or_else(|| BrokerError::InvalidRecord("active tombstone deadline is required".into()))
+        .ok_or(BrokerError::InvalidTombstone)
 }
 
 fn set_channel_fence(

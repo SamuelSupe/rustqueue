@@ -430,6 +430,7 @@ pub(super) fn copy_error(error: &BrokerError) -> BrokerError {
             actual: *actual,
         },
         BrokerError::OperationConflict => BrokerError::OperationConflict,
+        BrokerError::InvalidTombstone => BrokerError::InvalidTombstone,
         BrokerError::MessageNotFound => BrokerError::MessageNotFound,
         BrokerError::MessageNotInFlight => BrokerError::MessageNotInFlight,
         BrokerError::MessageTooLarge => BrokerError::MessageTooLarge,

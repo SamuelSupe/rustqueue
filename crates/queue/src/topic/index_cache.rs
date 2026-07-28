@@ -6,6 +6,7 @@ use rustqueue_storage::RecoveryMetadataRef;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -35,6 +36,7 @@ impl PageRequest {
 struct ReadJob {
     request: PageRequest,
     response: oneshot::Sender<Result<Vec<MessageMeta>, BrokerError>>,
+    _guard: Box<dyn Send>,
 }
 
 struct CacheState {
@@ -59,7 +61,12 @@ pub(crate) struct MetadataReservation {
 }
 
 impl MessageIndexCache {
-    pub(crate) fn new(cache_bytes: usize, workers: usize, queue_depth: usize) -> Arc<Self> {
+    pub(crate) fn new(
+        cache_bytes: usize,
+        workers: usize,
+        queue_depth: usize,
+        storage_healthy: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         let (sender, receiver) = sync_channel(queue_depth.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = if workers == 0 {
@@ -72,9 +79,10 @@ impl MessageIndexCache {
         .max(1);
         for index in 0..workers {
             let receiver = Arc::clone(&receiver);
+            let storage_healthy = Arc::clone(&storage_healthy);
             std::thread::Builder::new()
                 .name(format!("rustqueue-index-{index}"))
-                .spawn(move || index_worker(receiver))
+                .spawn(move || index_worker(receiver, storage_healthy))
                 .expect("message index reader worker must start");
         }
         Arc::new(Self {
@@ -92,7 +100,11 @@ impl MessageIndexCache {
         })
     }
 
-    pub(crate) async fn load(&self, request: PageRequest) -> Result<(), BrokerError> {
+    pub(crate) async fn load(
+        &self,
+        request: PageRequest,
+        guard: impl Send + 'static,
+    ) -> Result<(), BrokerError> {
         if self.state.lock().pages.contains_key(&request.key) {
             return Ok(());
         }
@@ -100,6 +112,7 @@ impl MessageIndexCache {
         match self.sender.try_send(ReadJob {
             request: request.clone(),
             response: sender,
+            _guard: Box::new(guard),
         }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -301,7 +314,7 @@ fn mark_changed(state: &mut CacheState, changed: &Condvar) {
     changed.notify_all();
 }
 
-fn index_worker(receiver: Arc<Mutex<Receiver<ReadJob>>>) {
+fn index_worker(receiver: Arc<Mutex<Receiver<ReadJob>>>, storage_healthy: Arc<AtomicBool>) {
     loop {
         let job = receiver.lock().recv();
         let Ok(job) = job else { return };
@@ -310,6 +323,101 @@ fn index_worker(receiver: Arc<Mutex<Receiver<ReadJob>>>) {
             job.request.first_ordinal,
             job.request.count,
         );
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                BrokerError::StorageUnavailable
+                    | BrokerError::Storage(_)
+                    | BrokerError::Io(_)
+                    | BrokerError::InvalidRecord(_)
+            )
+        }) {
+            storage_healthy.store(false, Ordering::Release);
+        }
         let _ = job.response.send(result);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use rustqueue_storage::{Record, RecordKind, SegmentLog, HEADER_LEN};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use tempfile::tempdir;
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_index_load_keeps_its_path_guard_until_the_worker_finishes() {
+        let root = tempdir().unwrap();
+        let mut log = SegmentLog::open(root.path(), HEADER_LEN as u64 + 1).unwrap();
+        let record = || Record {
+            kind: RecordKind::Noop,
+            flags: 0,
+            index: 0,
+            timestamp_ns: 0,
+            message_id: 0,
+            available_at_ms: 0,
+            payload: vec![0],
+        };
+        log.append(record(), true).unwrap();
+        let sealed = log.current_segment_path().to_path_buf();
+        log.append(record(), true).unwrap();
+        log.persist_recovery_index(
+            &sealed,
+            vec![0; recovery::HEADER_LEN + recovery::MESSAGE_LEN],
+        )
+        .unwrap();
+        let metadata = log.recovery_metadata_ref(&sealed).unwrap();
+        let index_path = sealed.with_extension("rqidx");
+        drop(log);
+        std::fs::remove_file(&index_path).unwrap();
+        let path = CString::new(index_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let healthy = Arc::new(AtomicBool::new(true));
+        let cache = MessageIndexCache::new(MIN_CACHE_BYTES * 2, 1, 1, healthy);
+        let request = PageRequest {
+            key: PageKey {
+                segment: sealed,
+                page: 0,
+            },
+            metadata,
+            first_ordinal: 0,
+            count: 1,
+        };
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut loading = Box::pin(cache.load(request, DropProbe(Arc::clone(&dropped))));
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(loading.as_mut(), context).is_pending(),
+                "the FIFO-backed index read must remain pending"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(loading);
+        assert!(!dropped.load(Ordering::Acquire));
+
+        drop(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(index_path)
+                .unwrap(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

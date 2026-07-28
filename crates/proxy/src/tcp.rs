@@ -4,12 +4,44 @@ mod gateway;
 use crate::backend::BackendPool;
 use crate::metrics::ProxyMetrics;
 use rand::Rng;
+use rustqueue_protocol::{Command, MAX_MPUB_MESSAGES};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
+
+pub(crate) const MAX_CONTROL_BODY_BYTES: usize = 1024 * 1024;
+const IDENTIFY_WORKING_SET_COPIES: usize = 3;
+const IDENTIFY_FIXED_WORKING_BYTES: usize = 4096;
+const MPUB_MESSAGE_WORKING_BYTES: usize = 128;
+
+fn command_working_set(command: &Command, bytes: usize) -> usize {
+    match command {
+        Command::Identify => bytes
+            .saturating_mul(IDENTIFY_WORKING_SET_COPIES)
+            .saturating_add(IDENTIFY_FIXED_WORKING_BYTES),
+        Command::MultiPublish { .. } => {
+            bytes.saturating_add(MAX_MPUB_MESSAGES.saturating_mul(MPUB_MESSAGE_WORKING_BYTES))
+        }
+        _ => bytes,
+    }
+}
+
+pub(crate) fn maximum_gateway_working_set(
+    max_message_bytes: usize,
+    max_body_bytes: usize,
+) -> usize {
+    command_working_set(&Command::Identify, MAX_CONTROL_BODY_BYTES)
+        .max(command_working_set(
+            &Command::MultiPublish {
+                topic: String::new(),
+            },
+            max_body_bytes,
+        ))
+        .max(max_message_bytes)
+}
 
 pub struct Limits {
     pub max_connections: usize,

@@ -146,6 +146,7 @@ pub struct LimitsConfig {
     pub auth_timeout_ms: u64,
     pub auth_max_ttl_seconds: u64,
     pub auth_cache_max_entries: usize,
+    pub auth_memory_bytes: usize,
     pub http_body_timeout_ms: u64,
     pub disconnect_on_retriable_publish_error: bool,
 }
@@ -279,6 +280,7 @@ impl Default for LimitsConfig {
             auth_timeout_ms: 5_000,
             auth_max_ttl_seconds: 3600,
             auth_cache_max_entries: 10_000,
+            auth_memory_bytes: 256 * 1024 * 1024,
             http_body_timeout_ms: 30_000,
             disconnect_on_retriable_publish_error: false,
         }
@@ -409,6 +411,7 @@ impl Config {
             bail!("metrics.max_detailed_series must be greater than zero");
         }
         self.validate_protocol_limits()?;
+        self.validate_runtime_limits()?;
         if !matches!(self.log_format.as_str(), "text" | "json") {
             bail!("log_format must be text or json");
         }

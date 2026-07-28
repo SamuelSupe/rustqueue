@@ -86,8 +86,24 @@ done
 for payload in $payloads; do
   for name in rustqueue-local-fsync nsq-sync-every-1 nsq-sync-every-2500 \
     rustqueue-local-fsync-fixed nsq-sync-every-1-fixed; do
-    jq -s '{runs: length, median: (sort_by(.messages_per_second) | .[length / 2 | floor])}' \
-      "$result_dir/$name-$payload-run"*.json > "$result_dir/$name-$payload-median.json"
+    jq -s '
+      def median_by($field):
+        map(select(.[$field] != null))
+        | sort_by(.[$field])
+        | if length == 0 then null else .[length / 2 | floor] end;
+      {
+        runs: length,
+        complete_delivery_runs: map(select(.delivery_complete == true)) | length,
+        incomplete_delivery_runs: map(select(.delivery_complete != true)) | length,
+        median: median_by("publish_messages_per_second"),
+        median_publish: median_by("publish_messages_per_second"),
+        median_receive: (
+          map(select(.delivery_complete == true))
+          | median_by("receive_messages_per_second")
+        )
+      }
+    ' "$result_dir/$name-$payload-run"*.json \
+      > "$result_dir/$name-$payload-median.json"
   done
 done
 

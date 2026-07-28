@@ -35,13 +35,25 @@ impl DeliveryGuard {
     }
 
     pub fn accept(&mut self, id: u64) {
+        let _ = self.accept_with_token(id);
+    }
+
+    pub fn accept_with_token(&mut self, id: u64) -> Option<u64> {
         if let Some(index) = self
             .reservations
             .iter()
             .position(|reservation| reservation.id == id)
         {
-            self.reservations.swap_remove(index);
+            return Some(self.reservations.swap_remove(index).token);
         }
+        None
+    }
+
+    pub fn token(&self, id: u64) -> Option<u64> {
+        self.reservations
+            .iter()
+            .find(|reservation| reservation.id == id)
+            .map(|reservation| reservation.token)
     }
 
     pub fn accept_all(&mut self) {

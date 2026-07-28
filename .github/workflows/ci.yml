@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*.*.*"]
 
 permissions:
   contents: read
@@ -17,5 +18,100 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.17.3
+      - name: Verify release metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        run: ./scripts/verify-release-version.sh "${GITHUB_REF_NAME#v}"
       - name: Core, compatibility, fuzz and packaging gates
         run: FULL=1 K8S_ACCEPTANCE=0 FUZZ_SECONDS=1 ./scripts/release-gate.sh
+
+  release-binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release-gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release metadata
+        run: ./scripts/verify-release-version.sh "${GITHUB_REF_NAME#v}"
+      - name: Build native binaries and Console UI
+        run: make release-bin operator-release-bin console-ui-build
+      - name: Package native bundle
+        run: ./scripts/package-release.sh binaries "${GITHUB_REF_NAME#v}" release "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustqueue-${{ matrix.arch }}
+          path: release/rustqueue-*-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-gate, release-binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.3
+      - name: Require a tag reachable from main
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Package source and Helm Chart
+        run: ./scripts/package-release.sh common "${GITHUB_REF_NAME#v}" release
+      - name: Create and verify checksums
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cd release
+          sha256sum \
+            "rustqueue-$version-linux-aarch64.tar.gz" \
+            "rustqueue-$version-linux-x86_64.tar.gz" \
+            "rustqueue-$version-source.tar.gz" \
+            "rustqueue-$version.tgz" \
+            > "SHA256SUMS-$version"
+          sha256sum --check "SHA256SUMS-$version"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          assets=(
+            "release/rustqueue-$version-linux-aarch64.tar.gz"
+            "release/rustqueue-$version-linux-x86_64.tar.gz"
+            "release/rustqueue-$version-source.tar.gz"
+            "release/rustqueue-$version.tgz"
+            "release/SHA256SUMS-$version"
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --draft \
+              --verify-tag \
+              --title "RustQueue $version" \
+              --notes-file "$notes"
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}"
+          fi
+          gh release edit "$GITHUB_REF_NAME" \
+            --title "RustQueue $version" \
+            --notes-file "$notes" \
+            --draft=false \
+            --latest

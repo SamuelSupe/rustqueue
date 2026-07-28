@@ -1,4 +1,5 @@
 mod authorization;
+mod channel_ops;
 mod codec;
 mod commands;
 mod dead_letter;
@@ -8,6 +9,7 @@ mod time;
 mod writer;
 
 use authorization::*;
+use channel_ops::*;
 use codec::*;
 use commands::*;
 use dead_letter::*;
@@ -31,7 +33,7 @@ use rustqueue_protocol::{
 };
 use rustqueue_queue::{Broker, BrokerError, DeliveryGuard};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -57,6 +59,22 @@ pub(crate) fn broker_storage_error(error: &BrokerError) -> bool {
             | BrokerError::Io(_)
             | BrokerError::InvalidRecord(_)
     )
+}
+
+fn renew_delivery_lease(
+    broker: &Broker,
+    topic: &str,
+    channel: &str,
+    id: u64,
+    token: u64,
+    timeout: Duration,
+) -> Result<Instant, BrokerError> {
+    // Keep the session deadline slightly earlier than the broker deadline so a
+    // client operation cannot pass the local check after its broker lease has
+    // already expired.
+    let deadline = Instant::now() + timeout;
+    broker.touch_delivery(topic, channel, id, token, Some(timeout))?;
+    Ok(deadline)
 }
 
 #[derive(Debug)]
@@ -104,6 +122,12 @@ struct RemoteDelivery {
     body: Bytes,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct InFlightDelivery {
+    deadline: Instant,
+    token: u64,
+}
+
 struct SessionState {
     identified: bool,
     encrypted: bool,
@@ -115,10 +139,12 @@ struct SessionState {
     sample_rate: u8,
     sample_cursor: u8,
     auth: Option<AuthSession>,
-    auth_secret: Option<Vec<u8>>,
+    auth_secret: Option<Bytes>,
+    _auth_reservation: Option<PublishReservation>,
     subscription: Option<Subscription>,
     rdy: u64,
-    in_flight: HashMap<u64, Instant>,
+    in_flight: HashMap<u64, InFlightDelivery>,
+    pending_channel_ops: HashSet<u64>,
     closing: bool,
     client_identity: ClientIdentity,
 }
@@ -139,6 +165,13 @@ impl SessionState {
                 .lease
                 .update_flow(self.rdy, self.in_flight.len());
         }
+    }
+
+    fn delivery_for_operation(&self, id: u64) -> Option<InFlightDelivery> {
+        if self.pending_channel_ops.contains(&id) {
+            return None;
+        }
+        self.in_flight.get(&id).copied()
     }
 }
 
@@ -303,9 +336,11 @@ async fn handle_connection(
         sample_cursor: 0,
         auth: None,
         auth_secret: None,
+        _auth_reservation: None,
         subscription: None,
         rdy: 0,
         in_flight: HashMap::new(),
+        pending_channel_ops: HashSet::new(),
         closing: false,
         client_identity: ClientIdentity {
             remote_address: peer.to_string(),

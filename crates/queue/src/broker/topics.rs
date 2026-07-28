@@ -61,6 +61,25 @@ impl Broker {
         Ok(())
     }
 
+    pub(super) fn cleanup_drained_retired_topics(&self) -> Result<usize, BrokerError> {
+        let ready: Vec<_> = self
+            .inner
+            .retired_topics
+            .lock()
+            .iter()
+            .filter_map(|(name, handle)| {
+                let directory = topic_directory(&self.inner.config.data_path, name);
+                (Arc::strong_count(handle) == 1
+                    && !self.inner.payload_reader.has_active_under(&directory))
+                .then(|| name.clone())
+            })
+            .collect();
+        for name in &ready {
+            self.cleanup_retired_topic(name)?;
+        }
+        Ok(ready.len())
+    }
+
     pub(super) fn delete_topic_locked(&self, name: &str) -> Result<bool, BrokerError> {
         let Some(handle) = self.inner.topics.read().get(name).cloned() else {
             return Ok(false);

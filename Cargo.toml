@@ -16,7 +16,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.88"
@@ -37,7 +37,7 @@ libc = "0.2.186"
 hdrhistogram = "7.5.4"
 parking_lot = "0.12.3"
 rand = "0.8.5"
-regex = "1.11.1"
+regex-automata = "0.4.16"
 reqwest = { version = "0.12.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
 rustls = "0.23.21"
 rustls-pemfile = "2.2.0"

@@ -20,12 +20,11 @@ pub(super) async fn dead_letter_if_needed(
     };
     let target = dead_letter_topic(topic, channel, &config.queue.dead_letter_suffix)
         .map_err(BrokerError::InvalidRecord)?;
-    let result = broker
+    let moved = broker
         .move_to_dead_letter(topic, channel, delivery.id, &target, delivery.body.clone())
-        .await;
-    if let Err(error) = result {
-        broker.release(topic, channel, &[delivery.id]);
-        return Err(error);
+        .await?;
+    if !moved {
+        return Ok(true);
     }
     metrics.dead_letter_messages.fetch_add(1, Ordering::Relaxed);
     if reason == DeadLetterReason::Retention {
