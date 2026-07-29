@@ -67,6 +67,7 @@ impl TopicHandle {
                 MAX_CHANNELS_PER_TOPIC
             )));
         }
+        topic.reconcile_unrouted_boundary()?;
         Ok(Arc::new(Self {
             state: Mutex::new(topic),
             wake,
@@ -89,6 +90,7 @@ impl TopicHandle {
             paused: false,
             deleted: false,
             next_position: 1,
+            unrouted_from_position: Some(1),
         };
         store_atomic(&directory.join("manifest"), &manifest)?;
         let log = SegmentLog::open_with_feature_level(
@@ -135,6 +137,14 @@ impl Topic {
         if manifest.format != 7 || manifest.deleted {
             return Err(BrokerError::InvalidRecord(
                 "topic manifest is not an active v7 topic".into(),
+            ));
+        }
+        if manifest
+            .unrouted_from_position
+            .is_some_and(|position| position == 0 || position > manifest.next_position)
+        {
+            return Err(BrokerError::InvalidRecord(
+                "topic manifest has an invalid unrouted position".into(),
             ));
         }
         let expected_directory = hex::encode(manifest.name.as_bytes());
@@ -244,6 +254,11 @@ impl Topic {
         if self.manifest.deleted {
             return Err(BrokerError::TopicNotFound);
         }
+        if !self.has_durable_channels() && self.manifest.unrouted_from_position.is_none() {
+            return Err(BrokerError::InvalidRecord(
+                "topic without a durable channel is missing its retention boundary".into(),
+            ));
+        }
         let timestamp_ns = self
             .messages
             .last_timestamp_ns()
@@ -323,6 +338,54 @@ impl Topic {
     pub fn last_position(&self) -> u64 {
         self.manifest.next_position.saturating_sub(1)
     }
+
+    fn has_durable_channels(&self) -> bool {
+        self.channels
+            .values()
+            .any(|channel| !channel.state.ephemeral)
+    }
+
+    fn earliest_retained_position(&self) -> u64 {
+        self.messages
+            .first_position()
+            .unwrap_or(self.manifest.next_position)
+    }
+
+    fn unrouted_start_position(&self) -> Result<u64, BrokerError> {
+        self.manifest.unrouted_from_position.ok_or_else(|| {
+            BrokerError::InvalidRecord(
+                "topic without a durable channel is missing its retention boundary".into(),
+            )
+        })
+    }
+
+    fn set_unrouted_from_position(&mut self, position: Option<u64>) -> Result<(), BrokerError> {
+        if self.manifest.unrouted_from_position == position {
+            return Ok(());
+        }
+        let mut manifest = self.manifest.clone();
+        manifest.unrouted_from_position = position;
+        store_atomic(&self.manifest_path, &manifest)?;
+        self.manifest = manifest;
+        Ok(())
+    }
+
+    fn reconcile_unrouted_boundary(&mut self) -> Result<(), BrokerError> {
+        let position = if self.has_durable_channels() {
+            None
+        } else {
+            let earliest = self.earliest_retained_position();
+            Some(
+                self.manifest
+                    .unrouted_from_position
+                    .unwrap_or(earliest)
+                    .max(earliest)
+                    .min(self.manifest.next_position),
+            )
+        };
+        self.set_unrouted_from_position(position)
+    }
+
     pub fn set_paused(&mut self, paused: bool) -> Result<(), BrokerError> {
         self.manifest.paused = paused;
         store_atomic(&self.manifest_path, &self.manifest)?;
@@ -344,11 +407,14 @@ impl Topic {
             return Err(BrokerError::ChannelLimit);
         }
         let ephemeral = name.ends_with("#ephemeral");
+        let first_durable = !ephemeral && !self.has_durable_channels();
         let barrier = if ephemeral {
             // NSQ ephemeral channels only observe messages published while at
             // least one consumer keeps the channel alive. Re-creating an
             // ephemeral channel must therefore start at the current tail.
             self.last_position()
+        } else if first_durable {
+            self.unrouted_start_position()?.saturating_sub(1)
         } else {
             let cutoff = now_ns()
                 .saturating_sub(bootstrap_retention.as_nanos().min(i64::MAX as u128) as i64);
@@ -365,6 +431,11 @@ impl Topic {
                 &state,
             )?)
         };
+        if first_durable {
+            // The checkpoint reaches disk before the Topic releases this
+            // boundary, so recovery always has either the Channel or the hold.
+            self.set_unrouted_from_position(None)?;
+        }
         self.channels.insert(
             name.into(),
             ChannelRuntime {
@@ -377,6 +448,23 @@ impl Topic {
     }
 
     pub fn delete_channel(&mut self, name: &str) -> Result<(), BrokerError> {
+        let state = &self
+            .channels
+            .get(name)
+            .ok_or(BrokerError::ChannelNotFound)?
+            .state;
+        let deleting_last_durable = !state.ephemeral
+            && self
+                .channels
+                .values()
+                .filter(|channel| !channel.state.ephemeral)
+                .count()
+                == 1;
+        if deleting_last_durable {
+            // Establish the new hold before removing the final checkpoint.
+            // After a crash, either the Channel recovers or this boundary does.
+            self.set_unrouted_from_position(Some(self.manifest.next_position))?;
+        }
         let channel = self
             .channels
             .remove(name)

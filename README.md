@@ -45,6 +45,10 @@ your workload before deploying to production.
 
 ## What's new in 0.8.2
 
+- **NSQ-aligned no-Channel durability.** A Topic with no durable Channel now
+  persists its unrouted start position and normal GC cannot cross it. The first
+  durable Channel receives every acknowledged publish from that interval, even
+  when creation happens after the bootstrap window or a Broker restart.
 - **Direct-Broker qualification.** A reproducible OrbStack gate compares the
   exact `v0.8.1` tag with one candidate commit using fresh volumes, fixed
   2 vCPU / 2 GiB limits and alternating paired runs. Raw reports remain local;
@@ -65,8 +69,8 @@ your workload before deploying to production.
   wholly below `0.95`. Fixed-rate PUB ACK p99 and comparable fixed-rate peak
   RSS fail only when the interval is wholly above `1.10`.
 
-The patch keeps disk format v7 and the NSQ/Kodo compatibility contract from
-0.8.1. See the
+The patch keeps disk format v7 and remains wire-compatible with the NSQ/Kodo
+contract from 0.8.1. See the
 [v0.8.2 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2)
 for the qualification protocol and validation record.
 
@@ -123,11 +127,15 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 - Delivery is at least once. A restart redelivers messages without durable FIN.
 - The broker PVC is the only copy; permanent PVC loss loses its messages.
 - Topics and channels are broker-local. Lookup consumers union all owners.
-- Messages are retained for 90 seconds before a channel exists. This covers one
-  official Go client default 60-second lookup poll plus its 30% jitter and lets
-  `SUB` catch a newly selected owner without a normal-path miss. The Kodo
-  profile forces 180 seconds so one failed lookup request still gets a second
-  discovery opportunity before data can age out.
+- Normal GC retains every message accepted while no durable Channel exists,
+  across restart and without a bootstrap timeout. The first durable Channel
+  starts at that persisted unrouted boundary. Deleting the last durable Channel
+  starts a new boundary at the current Topic tail; ephemeral Channels do not
+  clear it.
+- Once a durable Channel exists, a later Channel can still bootstrap from the
+  last 90 seconds. This covers one official Go client default 60-second lookup
+  poll plus its 30% jitter. The Kodo profile forces 180 seconds so one failed
+  lookup request still gets a second discovery opportunity.
 - The stable v7 single-message limit is 100 MiB. The conservative defaults
   remain 20 MiB per message and 64 MiB per MPUB body; the opt-in Kodo profile
   raises them to 100 MiB and 128 MiB respectively.

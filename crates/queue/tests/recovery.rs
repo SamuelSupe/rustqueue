@@ -144,6 +144,107 @@ async fn channels_fan_out_and_ephemeral_channels_do_not_survive_restart() {
 }
 
 #[tokio::test]
+async fn messages_without_a_durable_channel_survive_gc_and_a_legacy_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.bootstrap_retention = Duration::ZERO;
+    let broker = Broker::open(cfg.clone()).unwrap();
+    let ids = broker
+        .publish(
+            "events",
+            vec![vec![1; 80], vec![2; 80], vec![3; 80]],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    broker.flush().await.unwrap();
+
+    assert_eq!(broker.compact().await.unwrap(), 0);
+    assert_eq!(broker.stats().topics[0].message_count, ids.len() as u64);
+    drop(broker);
+
+    let manifest_path = root
+        .path()
+        .join("topics")
+        .join(hex::encode("events"))
+        .join("manifest");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert!(manifest
+        .as_object_mut()
+        .unwrap()
+        .remove("unrouted_from_position")
+        .is_some());
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    let broker = Broker::open(cfg).unwrap();
+    assert_eq!(broker.compact().await.unwrap(), 0);
+    broker.create_channel("events", "workers").await.unwrap();
+    let delivered = broker
+        .fetch_batch("events", "workers", 8, 1024, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+}
+
+#[tokio::test]
+async fn messages_after_the_last_durable_channel_is_deleted_survive_gc_and_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.bootstrap_retention = Duration::ZERO;
+    let broker = Broker::open(cfg.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    let old = broker
+        .publish("events", vec![vec![1; 160]], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    let delivered = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.id, old);
+    broker.finish("events", "workers", old).await.unwrap();
+    broker.delete_channel("events", "workers").await.unwrap();
+
+    let fresh = broker
+        .publish(
+            "events",
+            vec![vec![2; 80], vec![3; 80], vec![4; 80]],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    broker.flush().await.unwrap();
+    drop(broker);
+
+    let broker = Broker::open(cfg).unwrap();
+    assert!(broker.compact().await.unwrap() > 0);
+    assert_eq!(broker.stats().topics[0].message_count, fresh.len() as u64);
+    broker
+        .create_channel("events", "replacement")
+        .await
+        .unwrap();
+    let delivered = broker
+        .fetch_batch("events", "replacement", 8, 1024, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        delivered
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>(),
+        fresh
+    );
+}
+
+#[tokio::test]
 async fn recreated_ephemeral_channel_starts_at_the_current_tail() {
     let root = tempfile::tempdir().unwrap();
     let broker = Broker::open(config(root.path())).unwrap();

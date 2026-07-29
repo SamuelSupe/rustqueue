@@ -57,25 +57,31 @@ There is no broker-to-broker message path and no cluster consensus path.
 - A direct `SUB` sees only the addressed broker. Lookup-based consumers connect
   to all discovered owners of the topic.
 
-### 2.3 Bootstrap retention
+### 2.3 Unrouted and bootstrap retention
 
-Every broker retains each topic message for at least 90 seconds even when no
-channel exists. The Kodo compatibility profile requires 180 seconds so the
-default Go consumer can survive one failed 60-second Lookupd poll, including
-its 30% initial jitter. When a local channel is created, its initial cursor
-starts at the oldest message still inside this bootstrap window.
+Every broker persists the earliest Topic position accepted while no durable
+Channel exists. Normal GC cannot cross that unrouted boundary, regardless of
+the bootstrap window or a Broker restart. The first durable Channel starts
+immediately before the boundary and can therefore consume every successfully
+published message from that zero-Channel interval. Deleting the last durable
+Channel starts a new boundary at the current Topic tail. Ephemeral Channels do
+not satisfy or clear this durability boundary.
 
-This deliberately prefers duplicates over misses during the normal discovery
-window. The guarantee is bounded:
+Once at least one durable Channel exists, a later Channel starts at the oldest
+message still inside the configured bootstrap window. The default is 90
+seconds. The Kodo compatibility profile requires 180 seconds so the default Go
+consumer can survive one failed 60-second Lookupd poll, including its 30%
+initial jitter.
 
-- If discovery and `SUB` complete within 90 seconds, messages accepted by a new
-  fallback owner remain consumable by the newly created local channel.
-- In the Kodo profile, the equivalent bound is 180 seconds and includes a
-  second default lookup poll after one failed request.
-- A newly created channel may receive a small amount of data published before
-  its `SUB`.
-- If all consumers are absent for longer than the bootstrap window and a topic
-  appears on a previously unused broker, complete replay is not guaranteed.
+This separates two guarantees:
+
+- A Topic with no durable Channel retains all acknowledged publishes until its
+  first durable Channel is created.
+- Additional Channels prefer duplicates over misses during the normal
+  discovery window, but do not receive unbounded Topic history.
+- Explicit Topic empty/delete and opt-in protective eviction remain
+  intentional destructive operations; protective eviction writes an audit
+  record before advancing the unrouted boundary.
 
 ### 2.4 Routing and scale
 
@@ -280,7 +286,8 @@ discard is a separate, audited administrative action.
 A complete segment may be deleted only when it is older than:
 
 - every durable local channel retention cursor;
-- the 90-second bootstrap floor;
+- the persisted unrouted boundary when no durable Channel exists;
+- the configured bootstrap time floor;
 - every active reader reference;
 - every pending DLQ outbox reference.
 
@@ -397,9 +404,11 @@ The implementation is complete only when all of the following pass:
    GC delete boundaries reopen successfully without losing acknowledged live
    records.
 3. Tail corruption truncates safely; middle corruption isolates the topic.
-4. Discovery indexes a new fallback owner within 5 seconds. An official Go
-   consumer using the unchanged 60-second poll and 30% jitter then subscribes
-   before the 90-second bootstrap floor expires; its ledger has `missing=0`.
+4. A Topic published before any durable Channel survives the configured
+   bootstrap interval, normal GC, and Broker restart. A durable Channel created
+   afterward receives the complete acknowledged ledger with `missing=0`.
+   Discovery still indexes a new fallback owner within 5 seconds, and an
+   official Go consumer uses the unchanged 60-second poll and 30% jitter.
 5. Official Go and Python NSQ clients pass direct, lookup, compression, TLS,
    AUTH, MPUB, DPUB, REQ, TOUCH, fan-out, sampling, and ephemeral cases.
 6. Broker restart reattaches its PVC and resumes its local backlog.

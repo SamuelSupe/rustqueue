@@ -22,6 +22,8 @@ pub(crate) struct TopicManifest {
     #[serde(default)]
     pub deleted: bool,
     pub next_position: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrouted_from_position: Option<u64>,
 }
 
 pub(crate) fn load_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
