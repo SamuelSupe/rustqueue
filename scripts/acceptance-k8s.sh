@@ -544,6 +544,8 @@ done
 kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
   -p "{\"spec\":{\"image\":\"$BROKER_IMAGE_A\"}}" >/dev/null
 wait_queue_ready 300
+kubectl -n "$NAMESPACE" rollout status deployment/"$QUEUE-discovery" --timeout=180s
+kubectl -n "$NAMESPACE" rollout status daemonset/"$QUEUE-proxy" --timeout=180s
 run_curl proxy-health-after-recovery -fsS "http://$QUEUE-proxy:4151/v1/health"
 
 echo "OrbStack Kubernetes share-nothing v7 acceptance passed"

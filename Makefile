@@ -1,6 +1,6 @@
 .PHONY: test check fmt clippy rustfmt-component clippy-component release-bin image image-from-dist operator-release-bin operator-image console-ui-build console-ui-check kodo-replay kodo-gateway-acceptance \
 	helm-lint helm-template k8s-acceptance k8s-console-management-acceptance k8s-multi-acceptance up down compat compat-go compat-python \
-	fuzz-smoke benchmark release-gate
+	fuzz-smoke benchmark benchmark-qualify release-gate
 
 RUST_IMAGE := rust:1.88-bookworm
 CARGO_CACHE := rustqueue-cargo-registry
@@ -127,6 +127,9 @@ fuzz-smoke:
 
 benchmark:
 	./scripts/benchmark-compare.sh
+
+benchmark-qualify:
+	./scripts/benchmark-qualify.sh
 
 release-gate:
 	./scripts/release-gate.sh
