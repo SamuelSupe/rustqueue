@@ -82,7 +82,7 @@ pub(super) async fn run_session(
         loop {
             let expired = expire_client_deadlines(
                 &mut state.in_flight,
-                &state.pending_channel_ops,
+                &mut state.in_flight_deadlines,
                 Instant::now(),
             );
             if expired {
@@ -196,8 +196,7 @@ pub(super) async fn run_session(
                     pending_fetch = Some(PendingFetch { request, future });
                 }
             }
-            let in_flight_deadline =
-                next_client_deadline(&state.in_flight, &state.pending_channel_ops);
+            let in_flight_deadline = next_client_deadline(&state.in_flight_deadlines);
 
             tokio::select! {
                 command = command_rx.recv() => {
@@ -380,14 +379,14 @@ pub(super) async fn run_session(
                                             token,
                                         )
                                         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                                    state.in_flight.insert(
+                                    state.record_delivery(
                                         delivery.id,
                                         InFlightDelivery {
                                             deadline,
                                             token,
                                         },
                                     );
-                                    state.pending_channel_ops.insert(delivery.id);
+                                    state.mark_channel_operation_pending(delivery.id);
                                     delivery_guard.accept(delivery.id);
                                     continue;
                                 }
@@ -410,7 +409,7 @@ pub(super) async fn run_session(
                                     .accept_with_token(delivery.id)
                                     .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
                                 debug_assert_eq!(accepted_token, token);
-                                state.in_flight.insert(
+                                state.record_delivery(
                                     delivery.id,
                                     InFlightDelivery {
                                         deadline: handoff_deadline,
@@ -434,9 +433,12 @@ pub(super) async fn run_session(
                                     )
                                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                                 for (id, token) in handed_off {
-                                    if let Some(delivery) = state.in_flight.get_mut(&id) {
+                                    if let Some(delivery) = state.in_flight.get(&id).copied() {
                                         debug_assert_eq!(delivery.token, token);
-                                        delivery.deadline = deadline;
+                                        state.record_delivery(
+                                            id,
+                                            InFlightDelivery { deadline, ..delivery },
+                                        );
                                     }
                                 }
                             }
@@ -573,24 +575,28 @@ fn delivery_is_outstanding(in_flight: &HashMap<u64, InFlightDelivery>, id: u64) 
 
 fn expire_client_deadlines(
     in_flight: &mut HashMap<u64, InFlightDelivery>,
-    pending_channel_ops: &HashSet<u64>,
+    deadlines: &mut BTreeSet<(Instant, u64, u64)>,
     now: Instant,
 ) -> bool {
-    let before = in_flight.len();
-    in_flight.retain(|id, delivery| pending_channel_ops.contains(id) || delivery.deadline > now);
-    in_flight.len() != before
+    let mut expired = false;
+    while let Some((deadline, id, token)) = deadlines.first().copied() {
+        if deadline > now {
+            break;
+        }
+        deadlines.remove(&(deadline, id, token));
+        if in_flight
+            .get(&id)
+            .is_some_and(|delivery| delivery.deadline == deadline && delivery.token == token)
+        {
+            in_flight.remove(&id);
+            expired = true;
+        }
+    }
+    expired
 }
 
-fn next_client_deadline(
-    in_flight: &HashMap<u64, InFlightDelivery>,
-    pending_channel_ops: &HashSet<u64>,
-) -> Option<Instant> {
-    in_flight
-        .iter()
-        .filter_map(|(id, delivery)| {
-            (!pending_channel_ops.contains(id)).then_some(delivery.deadline)
-        })
-        .min()
+fn next_client_deadline(deadlines: &BTreeSet<(Instant, u64, u64)>) -> Option<Instant> {
+    deadlines.first().map(|(deadline, _, _)| *deadline)
 }
 
 fn apply_channel_op_completion(
@@ -600,13 +606,14 @@ fn apply_channel_op_completion(
 ) -> Result<(), (&'static str, BrokerError)> {
     state.pending_channel_ops.remove(&completion.id);
     if let Err(error) = completion.result {
+        state.restore_delivery_deadline(completion.id);
         if broker_storage_error(&error) {
             metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
         }
         return Err((completion.kind.error_code(), error));
     }
 
-    state.in_flight.remove(&completion.id);
+    state.remove_delivery(completion.id);
     if let Some(subscription) = &state.subscription {
         match completion.kind {
             ChannelOpKind::Finish => subscription.lease.observe_finish(),
@@ -670,6 +677,30 @@ mod tests {
         InFlightDelivery { deadline, token }
     }
 
+    fn session_state() -> SessionState {
+        SessionState {
+            identified: false,
+            encrypted: false,
+            tls_common_name: String::new(),
+            heartbeat: None,
+            message_timeout: Duration::from_secs(60),
+            output_buffer_size: 1,
+            output_buffer_timeout: None,
+            sample_rate: 0,
+            sample_cursor: 0,
+            auth: None,
+            auth_secret: None,
+            _auth_reservation: None,
+            subscription: None,
+            rdy: 0,
+            in_flight: HashMap::new(),
+            in_flight_deadlines: BTreeSet::new(),
+            pending_channel_ops: HashSet::new(),
+            closing: false,
+            client_identity: ClientIdentity::default(),
+        }
+    }
+
     #[tokio::test]
     async fn pending_fetch_survives_an_unrelated_ready_branch() {
         let request = FetchRequest {
@@ -718,28 +749,39 @@ mod tests {
             (7, delivery(now - Duration::from_millis(1), 70)),
             (8, delivery(now + Duration::from_secs(1), 80)),
         ]);
-        assert!(expire_client_deadlines(
-            &mut in_flight,
-            &HashSet::new(),
-            now
-        ));
+        let mut deadlines = BTreeSet::from([
+            (now - Duration::from_millis(1), 7, 70),
+            (now + Duration::from_secs(1), 8, 80),
+        ]);
+        assert!(expire_client_deadlines(&mut in_flight, &mut deadlines, now));
         assert_eq!(in_flight.keys().copied().collect::<Vec<_>>(), vec![8]);
         assert!(!expire_client_deadlines(
             &mut in_flight,
-            &HashSet::new(),
+            &mut deadlines,
             now
         ));
     }
 
     #[test]
-    fn pending_channel_operations_do_not_expire() {
+    fn pending_channel_operations_unschedule_and_restore_the_delivery_deadline() {
         let now = Instant::now();
-        let mut in_flight = HashMap::from([(7, delivery(now - Duration::from_millis(1), 70))]);
-        let pending = HashSet::from([7]);
+        let mut state = session_state();
+        let deadline = now + Duration::from_secs(1);
+        state.record_delivery(7, delivery(deadline, 70));
+        assert_eq!(
+            next_client_deadline(&state.in_flight_deadlines),
+            Some(deadline)
+        );
 
-        assert!(!expire_client_deadlines(&mut in_flight, &pending, now));
-        assert_eq!(next_client_deadline(&in_flight, &pending), None);
-        assert!(in_flight.contains_key(&7));
+        state.mark_channel_operation_pending(7);
+        assert_eq!(next_client_deadline(&state.in_flight_deadlines), None);
+
+        state.pending_channel_ops.remove(&7);
+        state.restore_delivery_deadline(7);
+        assert_eq!(
+            next_client_deadline(&state.in_flight_deadlines),
+            Some(deadline)
+        );
     }
 
     #[test]

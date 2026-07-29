@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE="${RELEASE:-0.8.2}"
-BASELINE_REF="${BASELINE_REF:-v0.8.1}"
+RELEASE="${RELEASE:-0.8.3}"
+BASELINE_REF="${BASELINE_REF:-v0.8.2}"
 CANDIDATE_REF="${CANDIDATE_REF:-HEAD}"
 PAIRS="${PAIRS:-10}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
@@ -15,7 +15,7 @@ CASES="${CASES:-raw_write sustainable low_load_latency}"
 QUALIFICATION_DEV="${QUALIFICATION_DEV:-0}"
 KEEP_IMAGES="${KEEP_IMAGES:-0}"
 RESULT_ROOT="$ROOT/benchmarks/results"
-EVIDENCE_OUTPUT="${EVIDENCE_OUTPUT:-$ROOT/benchmarks/qualifications/v0.8.2-orbstack.json}"
+EVIDENCE_OUTPUT="${EVIDENCE_OUTPUT:-$ROOT/benchmarks/qualifications/v0.8.3-orbstack.json}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_DIR="$RESULT_ROOT/qualification-$RUN_ID"
 RUNS_FILE="$RUN_DIR/runs.ndjson"
@@ -103,13 +103,15 @@ if [[ "$docker_context" != "orbstack" && "$docker_os" != *OrbStack* ]]; then
   die "Docker must use OrbStack (context=$docker_context, os=$docker_os)"
 fi
 
+[[ "$BASELINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+  die "baseline reference must be a version tag"
 baseline_commit="$(git -C "$ROOT" rev-parse --verify "$BASELINE_REF^{commit}")"
 candidate_commit="$(git -C "$ROOT" rev-parse --verify "$CANDIDATE_REF^{commit}")"
-tag_commit="$(git -C "$ROOT" rev-parse --verify "v0.8.1^{commit}")"
+tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$BASELINE_REF^{commit}")"
 BASELINE_TARGET="$TARGET_ROOT/$baseline_commit"
 CANDIDATE_TARGET="$TARGET_ROOT/$candidate_commit"
 [[ "$baseline_commit" == "$tag_commit" ]] ||
-  die "baseline must resolve to the exact v0.8.1 tag commit"
+  die "baseline must resolve to the exact $BASELINE_REF tag commit"
 
 case "$EVIDENCE_OUTPUT" in
   "$ROOT/benchmarks/qualifications/"*)
@@ -151,8 +153,9 @@ read_workspace_version() {
 
 baseline_version="$(read_workspace_version "$BASELINE_SOURCE")"
 candidate_version="$(read_workspace_version "$CANDIDATE_SOURCE")"
-[[ "$baseline_version" == 0.8.1 ]] ||
-  die "baseline workspace version is $baseline_version, expected 0.8.1"
+expected_baseline_version="${BASELINE_REF#v}"
+[[ "$baseline_version" == "$expected_baseline_version" ]] ||
+  die "baseline workspace version is $baseline_version, expected $expected_baseline_version"
 if [[ "$QUALIFICATION_DEV" == 0 && "$candidate_version" != "$RELEASE" ]]; then
   die "candidate workspace version is $candidate_version, expected $RELEASE"
 fi

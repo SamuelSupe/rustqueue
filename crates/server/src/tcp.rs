@@ -33,7 +33,7 @@ use rustqueue_protocol::{
 };
 use rustqueue_queue::{Broker, BrokerError, DeliveryGuard};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -144,6 +144,7 @@ struct SessionState {
     subscription: Option<Subscription>,
     rdy: u64,
     in_flight: HashMap<u64, InFlightDelivery>,
+    in_flight_deadlines: BTreeSet<(Instant, u64, u64)>,
     pending_channel_ops: HashSet<u64>,
     closing: bool,
     client_identity: ClientIdentity,
@@ -172,6 +173,44 @@ impl SessionState {
             return None;
         }
         self.in_flight.get(&id).copied()
+    }
+
+    fn record_delivery(&mut self, id: u64, delivery: InFlightDelivery) {
+        if let Some(previous) = self.in_flight.insert(id, delivery) {
+            self.in_flight_deadlines
+                .remove(&(previous.deadline, id, previous.token));
+        }
+        if !self.pending_channel_ops.contains(&id) {
+            self.in_flight_deadlines
+                .insert((delivery.deadline, id, delivery.token));
+        }
+    }
+
+    fn mark_channel_operation_pending(&mut self, id: u64) {
+        if !self.pending_channel_ops.insert(id) {
+            return;
+        }
+        if let Some(delivery) = self.in_flight.get(&id) {
+            self.in_flight_deadlines
+                .remove(&(delivery.deadline, id, delivery.token));
+        }
+    }
+
+    fn restore_delivery_deadline(&mut self, id: u64) {
+        if self.pending_channel_ops.contains(&id) {
+            return;
+        }
+        if let Some(delivery) = self.in_flight.get(&id) {
+            self.in_flight_deadlines
+                .insert((delivery.deadline, id, delivery.token));
+        }
+    }
+
+    fn remove_delivery(&mut self, id: u64) -> Option<InFlightDelivery> {
+        let delivery = self.in_flight.remove(&id)?;
+        self.in_flight_deadlines
+            .remove(&(delivery.deadline, id, delivery.token));
+        Some(delivery)
     }
 }
 
@@ -340,6 +379,7 @@ async fn handle_connection(
         subscription: None,
         rdy: 0,
         in_flight: HashMap::new(),
+        in_flight_deadlines: BTreeSet::new(),
         pending_channel_ops: HashSet::new(),
         closing: false,
         client_identity: ClientIdentity {

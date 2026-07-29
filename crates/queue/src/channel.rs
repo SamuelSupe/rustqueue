@@ -77,6 +77,7 @@ pub(crate) struct ChannelState {
     next_position: u64,
     in_flight: HashMap<u64, InFlight>,
     in_flight_ids: HashMap<u64, u64>,
+    in_flight_deadlines: BTreeSet<(Instant, u64, u64)>,
     redelivery: BTreeSet<u64>,
     attempts: HashMap<u64, u16>,
     next_token: u64,
@@ -111,6 +112,7 @@ impl ChannelState {
             next_position: barrier_position.saturating_add(1),
             in_flight: HashMap::new(),
             in_flight_ids: HashMap::new(),
+            in_flight_deadlines: BTreeSet::new(),
             redelivery: BTreeSet::new(),
             attempts: HashMap::new(),
             next_token: 1,
@@ -149,6 +151,7 @@ impl ChannelState {
             next_position,
             in_flight: HashMap::new(),
             in_flight_ids: HashMap::new(),
+            in_flight_deadlines: BTreeSet::new(),
             redelivery,
             attempts: checkpoint.attempts.into_iter().collect(),
             next_token: 1,
@@ -307,14 +310,16 @@ impl ChannelState {
         self.next_token = self.next_token.wrapping_add(1).max(1);
         let attempts = self.attempts.entry(position).or_insert(0);
         *attempts = attempts.saturating_add(1);
+        let deadline = Instant::now() + timeout;
         self.in_flight.insert(
             position,
             InFlight {
                 id,
-                deadline: Instant::now() + timeout,
+                deadline,
                 token,
             },
         );
+        self.in_flight_deadlines.insert((deadline, position, token));
         self.in_flight_ids.insert(id, position);
         (token, *attempts)
     }
@@ -369,10 +374,17 @@ impl ChannelState {
     }
 
     pub fn touch_until(&mut self, position: u64, deadline: Instant) -> bool {
-        let Some(flight) = self.in_flight.get_mut(&position) else {
+        let Some(flight) = self.in_flight.get(&position) else {
             return false;
         };
-        flight.deadline = deadline;
+        self.in_flight_deadlines
+            .remove(&(flight.deadline, position, flight.token));
+        let token = flight.token;
+        self.in_flight
+            .get_mut(&position)
+            .expect("in-flight delivery remains present")
+            .deadline = deadline;
+        self.in_flight_deadlines.insert((deadline, position, token));
         true
     }
 
@@ -393,10 +405,16 @@ impl ChannelState {
     }
 
     fn expired_positions(&self, now: Instant) -> Vec<u64> {
-        self.in_flight
-            .iter()
-            .filter_map(|(position, flight)| (flight.deadline <= now).then_some(*position))
+        self.in_flight_deadlines
+            .range(..=(now, u64::MAX, u64::MAX))
+            .map(|(_, position, _)| *position)
             .collect()
+    }
+
+    fn has_expired_in_flight(&self, now: Instant) -> bool {
+        self.in_flight_deadlines
+            .first()
+            .is_some_and(|(deadline, _, _)| *deadline <= now)
     }
 
     fn expire_positions(&mut self, positions: &[u64]) {
@@ -489,6 +507,8 @@ impl ChannelState {
         let Some(delivery) = self.in_flight.remove(&position) else {
             return false;
         };
+        self.in_flight_deadlines
+            .remove(&(delivery.deadline, position, delivery.token));
         self.in_flight_ids.remove(&delivery.id);
         true
     }
@@ -496,7 +516,7 @@ impl ChannelState {
 
 impl ChannelRuntime {
     pub fn has_expired_in_flight(&self) -> bool {
-        !self.state.expired_positions(Instant::now()).is_empty()
+        self.state.has_expired_in_flight(Instant::now())
     }
 
     pub fn expire_in_flight(&mut self) -> Result<usize, BrokerError> {
@@ -573,6 +593,23 @@ mod tests {
             channel.stats(1, &BTreeSet::new(), i64::MAX).timeout_count,
             1
         );
+    }
+
+    #[test]
+    fn in_flight_deadline_index_tracks_touch_and_finish() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 16);
+        channel.reserve(1, 10, Duration::from_secs(60));
+        channel.reserve(2, 20, Duration::from_secs(60));
+
+        let now = Instant::now();
+        assert!(channel.touch_until(1, now - Duration::from_secs(1)));
+        assert_eq!(channel.expired_positions(now), vec![1]);
+
+        channel.apply(&ChannelCommand::Finish {
+            position: 1,
+            message_id: 10,
+        });
+        assert!(channel.expired_positions(now).is_empty());
     }
 
     #[test]

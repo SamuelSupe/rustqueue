@@ -7,14 +7,14 @@ qualification. Run it on OrbStack from a committed candidate:
 make benchmark-qualify
 ```
 
-The default protocol compares the exact `v0.8.1` tag with `HEAD`, uses fresh
+The default protocol compares the exact `v0.8.2` tag with `HEAD`, uses fresh
 Docker volumes, fixes Broker and load-generator containers at 2 vCPU / 2 GiB,
 and runs all three cases as 10 alternating pairs. A full run writes the
-reviewable artifact to `v0.8.2-orbstack.json`. Consumer cases must drain
-completely and have a fixed 1,800-second timeout so the v0.8.1 durable `FIN`
+reviewable artifact to `v0.8.3-orbstack.json`. Consumer cases must drain
+completely and have a fixed 1,800-second timeout so the v0.8.2 durable `FIN`
 baseline is not rejected merely for exceeding a short operational timeout.
 
-The RustQueue 0.8.2 release does not make this optional 60-run artifact a
+The RustQueue 0.8.3 release does not make this optional 60-run artifact a
 release metadata requirement. Short development preflights can detect hard
 correctness failures and obvious regressions, but they do not substantiate a
 formal performance claim.
