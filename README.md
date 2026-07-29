@@ -536,10 +536,11 @@ transfers only small revision/readiness heads; nevertheless a consumer still
 needs one connection per actual Topic owner. This is a share-nothing cost, not
 an unbounded or zero-cost scaling claim.
 
-Latency histograms cover publish and channel-WAL fsync, publish and FIN/REQ
-group-commit queueing, publish and channel ACK, payload reads, scrub/GC, proxy
-backend calls, and discovery registry polling. Queue aggregates have fixed
-cardinality by default; `[metrics].detailed_queue_metrics` enables bounded
+Latency histograms cover publish and channel-WAL fsync, Topic-lock wait/hold
+for publish and delivery reservation, publish and FIN/REQ group-commit
+queueing, publish and channel ACK, payload reads, scrub/GC, proxy backend
+calls, and discovery registry polling. Queue aggregates have fixed cardinality
+by default; `[metrics].detailed_queue_metrics` enables bounded
 per-topic/channel series up to `max_detailed_series`.
 Delivery-budget bytes, waiters and cumulative waits are exported as bounded
 aggregate gauges/counters.

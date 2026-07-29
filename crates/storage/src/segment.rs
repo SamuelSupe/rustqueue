@@ -377,6 +377,19 @@ impl SegmentLog {
         result
     }
 
+    pub fn clone_current_for_sync(&self) -> Result<File, StorageError> {
+        self.ensure_available()?;
+        let result = self.current.try_clone().map_err(StorageError::from);
+        if result.is_err() {
+            self.isolate();
+        }
+        result
+    }
+
+    pub fn mark_sync_failed(&self) {
+        self.isolate();
+    }
+
     pub fn read(&self, index: u64) -> Result<Option<Record>, StorageError> {
         let Some(location) = self.location(index)? else {
             return Ok(None);

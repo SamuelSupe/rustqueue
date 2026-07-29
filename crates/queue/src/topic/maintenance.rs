@@ -9,13 +9,13 @@ impl Topic {
         self.persist_channel(
             channel,
             ChannelCommand::Empty {
-                through_position: self.last_position(),
+                through_position: self.deliverable_position,
             },
         )
     }
 
     pub fn empty_topic(&mut self) -> Result<(), BrokerError> {
-        let through = self.last_position();
+        let through = self.deliverable_position;
         let has_durable_channels = self.has_durable_channels();
         let channels: Vec<_> = self.channels.keys().cloned().collect();
         for channel in channels {
@@ -37,7 +37,7 @@ impl Topic {
     }
 
     pub fn stats(&mut self) -> TopicStats {
-        let last = self.last_position();
+        let last = self.deliverable_position;
         let now_ms = now_ms();
         let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();
@@ -59,7 +59,7 @@ impl Topic {
     }
 
     pub fn add_aggregate_stats(&mut self, aggregate: &mut QueueAggregateStats) {
-        let last = self.last_position();
+        let last = self.deliverable_position;
         let now_ms = now_ms();
         let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();

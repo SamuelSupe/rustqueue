@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use rustqueue_protocol::validate_name;
 use rustqueue_storage::{RecordHeader, RecordKind, SegmentLog};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +27,7 @@ use std::time::Duration;
 pub(crate) const MAX_CHANNELS_PER_TOPIC: usize = 1_024;
 
 pub(crate) struct TopicHandle {
+    pub commit_gate: Mutex<()>,
     pub state: Mutex<Topic>,
     pub wake: tokio::sync::watch::Sender<u64>,
 }
@@ -37,6 +39,7 @@ pub(crate) struct Topic {
     manifest: TopicManifest,
     log: SegmentLog,
     messages: MessageIndex,
+    deliverable_position: u64,
     channels: HashMap<String, ChannelRuntime>,
     max_ack_gap: usize,
     durable_channel_counters: bool,
@@ -69,6 +72,7 @@ impl TopicHandle {
         }
         topic.reconcile_unrouted_boundary()?;
         Ok(Arc::new(Self {
+            commit_gate: Mutex::new(()),
             state: Mutex::new(topic),
             wake,
         }))
@@ -101,6 +105,7 @@ impl TopicHandle {
         )?;
         let (wake, _) = tokio::sync::watch::channel(0);
         Ok(Arc::new(Self {
+            commit_gate: Mutex::new(()),
             state: Mutex::new(Topic {
                 name: name.into(),
                 directory: directory.into(),
@@ -108,6 +113,7 @@ impl TopicHandle {
                 manifest,
                 log,
                 messages: MessageIndex::new(index_cache),
+                deliverable_position: 0,
                 channels: HashMap::new(),
                 max_ack_gap,
                 durable_channel_counters: storage_feature_level >= 2,
@@ -198,6 +204,7 @@ impl Topic {
         let recovered_next = messages
             .last_position()
             .map_or(1, |position| position.saturating_add(1));
+        let deliverable_position = messages.last_position().unwrap_or(0);
         if manifest.next_position < recovered_next {
             manifest.next_position = recovered_next;
             store_atomic(&manifest_path, &manifest)?;
@@ -210,6 +217,7 @@ impl Topic {
             manifest,
             log,
             messages,
+            deliverable_position,
             channels: HashMap::new(),
             max_ack_gap,
             durable_channel_counters: storage_feature_level >= 2,
@@ -289,12 +297,23 @@ impl Topic {
             .manifest
             .next_position
             .saturating_add(batch.entries.len() as u64);
+        if durable {
+            self.deliverable_position = self.last_position();
+        }
         Ok(ids)
     }
 
-    pub fn sync_log(&self) -> Result<(), BrokerError> {
-        self.log.sync()?;
-        Ok(())
+    pub fn clone_log_for_sync(&self) -> Result<File, BrokerError> {
+        Ok(self.log.clone_current_for_sync()?)
+    }
+
+    pub fn mark_log_sync_failed(&self) {
+        self.log.mark_sync_failed();
+    }
+
+    pub fn mark_deliverable_through(&mut self, position: u64) {
+        debug_assert!(position <= self.last_position());
+        self.deliverable_position = self.deliverable_position.max(position);
     }
 
     fn seal_log(&mut self) -> Result<(), BrokerError> {
@@ -412,7 +431,7 @@ impl Topic {
             // NSQ ephemeral channels only observe messages published while at
             // least one consumer keeps the channel alive. Re-creating an
             // ephemeral channel must therefore start at the current tail.
-            self.last_position()
+            self.deliverable_position
         } else if first_durable {
             self.unrouted_start_position()?.saturating_sub(1)
         } else {
@@ -484,7 +503,7 @@ impl Topic {
     pub fn channel_counts(&mut self, channel: &str) -> Result<(u64, u64, u64), BrokerError> {
         let now_ms = now_ms();
         let scheduled = self.messages.deferred_positions(now_ms);
-        let last_position = self.last_position();
+        let last_position = self.deliverable_position;
         let channel = self
             .channels
             .get(channel)

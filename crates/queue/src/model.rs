@@ -103,7 +103,11 @@ impl QueueAggregateStats {
 pub struct BrokerLatencyStats {
     pub fsync: HistogramSnapshot,
     pub group_commit_wait: HistogramSnapshot,
+    pub publish_topic_lock_wait: HistogramSnapshot,
+    pub publish_topic_lock_hold: HistogramSnapshot,
     pub publish_ack: HistogramSnapshot,
+    pub delivery_topic_lock_wait: HistogramSnapshot,
+    pub delivery_topic_lock_hold: HistogramSnapshot,
     pub channel_fsync: HistogramSnapshot,
     pub channel_group_commit_wait: HistogramSnapshot,
     pub channel_ack: HistogramSnapshot,

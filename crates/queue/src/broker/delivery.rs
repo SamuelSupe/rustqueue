@@ -114,7 +114,13 @@ impl Broker {
             }
             let handle = Arc::clone(&batch.handle);
             let action = {
+                let topic_lock_started = Instant::now();
                 let mut topic_state = handle.state.lock();
+                self.inner
+                    .metrics
+                    .delivery_topic_lock_wait
+                    .observe(topic_lock_started.elapsed());
+                let _topic_lock_hold = self.inner.metrics.delivery_topic_lock_hold.timer();
                 self.ensure_management_access(topic, Some(channel))?;
                 let action = topic_state.reserve_batch(
                     channel,

@@ -226,11 +226,18 @@ impl Broker {
                 return;
             }
         };
-        let mut topic_state = handle.state.lock();
+        let commit_gate = handle.commit_gate.lock();
         if let Err(error) = self.ensure_management_access(topic, None) {
             fail_requests(requests, &error);
             return;
         }
+        let topic_lock_started = Instant::now();
+        let mut topic_state = handle.state.lock();
+        self.inner
+            .metrics
+            .publish_topic_lock_wait
+            .observe(topic_lock_started.elapsed());
+        let topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
         let mut pending = Vec::with_capacity(requests.len());
         let mut requests = requests.into_iter();
 
@@ -285,19 +292,49 @@ impl Broker {
                 return;
             }
         }
+        let durable_through = topic_state.last_position();
+        let sync_file = match topic_state.clone_log_for_sync() {
+            Ok(file) => file,
+            Err(error) => {
+                self.observe_storage_result::<()>(Err(copy_error(&error)))
+                    .ok();
+                fail_pending(pending);
+                return;
+            }
+        };
+        drop(topic_state);
+        drop(topic_lock_hold);
         rustqueue_storage::crash_failpoint("publish_after_append_before_fsync");
         let sync_result = {
             let _timer = self.inner.metrics.fsync.timer();
-            topic_state.sync_log()
+            sync_file.sync_data().map_err(BrokerError::from)
         };
         if let Err(error) = sync_result {
+            let topic_lock_started = Instant::now();
+            let topic_state = handle.state.lock();
+            self.inner
+                .metrics
+                .publish_topic_lock_wait
+                .observe(topic_lock_started.elapsed());
+            let _topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
+            topic_state.mark_log_sync_failed();
             self.observe_storage_result::<()>(Err(copy_error(&error)))
                 .ok();
             fail_pending(pending);
             return;
         }
-        rustqueue_storage::crash_failpoint("publish_after_fsync_before_reply");
+        let topic_lock_started = Instant::now();
+        let mut topic_state = handle.state.lock();
+        self.inner
+            .metrics
+            .publish_topic_lock_wait
+            .observe(topic_lock_started.elapsed());
+        let topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
+        topic_state.mark_deliverable_through(durable_through);
         drop(topic_state);
+        drop(topic_lock_hold);
+        rustqueue_storage::crash_failpoint("publish_after_fsync_before_reply");
+        drop(commit_gate);
         self.inner.publish_groups.record(pending.len());
         handle.signal();
         for pending in pending {

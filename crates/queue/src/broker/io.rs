@@ -299,6 +299,7 @@ impl Broker {
         self.validate_publish_request_with_limit(topic, bodies, self.durable_message_read_limit())?;
         let mut metadata = self.reserve_message_metadata(bodies.len())?;
         let handle = self.get_or_create_topic(topic)?;
+        let _commit_gate = handle.commit_gate.lock();
         let mut state = handle.state.lock();
         self.ensure_management_access(topic, None)?;
         let ids = self.append_publish_to_topic(&mut state, bodies, delay, true, &mut metadata)?;

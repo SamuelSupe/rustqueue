@@ -18,6 +18,12 @@ The on-disk format remains v7. A successful `FIN` or `REQ` still crosses the
 Channel WAL group `fsync` before the broker replies; this release changes the
 runtime scheduler, not the acknowledged-delivery contract.
 
+For publish groups, RustQueue now releases the Topic state lock while the
+active segment file is syncing. A separate commit gate keeps tail mutations
+serialized, and reservation stops at a durable position that advances only
+after the sync succeeds. Existing durable messages can therefore continue to
+flow while the next group waits for its acknowledged-durability boundary.
+
 ## Material differences from NSQ
 
 | Area | NSQ v1.3.0 | RustQueue | Performance consequence |
@@ -26,7 +32,7 @@ runtime scheduler, not the acknowledged-delivery contract.
 | Publish acknowledgement | `Topic.put` queues to memory or `go-diskqueue`; the diskqueue writer replies after `writeOne`, and performs its scheduled `sync` on a later I/O-loop iteration | A publish group appends, calls segment `fsync`, then replies | RustQueue has higher durable-PUB latency by design. NSQ `--sync-every=1` is not an acknowledgement-after-fsync equivalent. |
 | FIN / REQ acknowledgement | In-flight state is memory-resident; shutdown flushes outstanding messages to the backend | Channel state is appended to a WAL and group-fsynced before success | RustQueue trades throughput for a stronger confirmed-ack crash boundary. Do not compare raw consume rate without stating this difference. |
 | Normal-message memory queue | Configurable `mem-queue-size`; the default may absorb normal traffic before disk | No acknowledged in-memory Topic fast path; data is retained in the local segment before PUB success | A default NSQ benchmark can be much faster while shifting its durability window to memory / OS cache. The comparison script sets NSQ `mem-queue-size=0` to avoid that mismatch. |
-| Topic fan-out and locking | A Topic message pump allocates a message object per additional Channel and feeds each Channel queue | One Topic segment is shared by cursor-based Channels, but publish fsync and reservation currently contend on one Topic state lock | RustQueue avoids one durable payload log per Channel, but high publish-and-consume concurrency on one Topic remains a likely next hot path. |
+| Topic fan-out and locking | A Topic message pump allocates a message object per additional Channel and feeds each Channel queue | One Topic segment is shared by cursor-based Channels; publish append/rotation remains serialized, but group `fsync` runs outside the reservation lock and delivery stops at the durable tail | RustQueue avoids one durable payload log per Channel without making existing durable reservations wait for the next PUB fsync. |
 
 ## How to read benchmark results
 
@@ -46,8 +52,8 @@ duplicates, or an incomplete drain.
 
 ## Next candidates to measure before changing semantics
 
-1. Split Topic append/fsync ownership from Channel reservation so consumers do
-   not wait on a publish group holding the Topic state lock.
+1. Profile Channel WAL `FIN`/`REQ` commit time against reservation latency;
+   those durable state transitions still use the Topic state lock.
 2. Measure an explicitly opt-in relaxed acknowledgement mode separately from
    the durable default; it must document crash-time redelivery and never be
    mixed with the durable-PUB result.

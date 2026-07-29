@@ -20,6 +20,7 @@ impl Broker {
                 .sort_by_key(|topic| std::cmp::Reverse(topic.state.lock().active_metadata_count()));
             let mut progressed = false;
             for topic in topics {
+                let _commit_gate = topic.commit_gate.lock();
                 if topic.state.lock().spill_message_metadata()? > 0 {
                     progressed = true;
                 }

@@ -144,9 +144,29 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
             &stats.latency.group_commit_wait,
         ),
         (
+            "rustqueue_publish_topic_lock_wait_duration_seconds",
+            "Time a publish group waits to acquire its Topic state lock.",
+            &stats.latency.publish_topic_lock_wait,
+        ),
+        (
+            "rustqueue_publish_topic_lock_hold_duration_seconds",
+            "Time a publish group holds its Topic state lock.",
+            &stats.latency.publish_topic_lock_hold,
+        ),
+        (
             "rustqueue_publish_ack_duration_seconds",
             "End-to-end broker publish acknowledgement latency.",
             &stats.latency.publish_ack,
+        ),
+        (
+            "rustqueue_delivery_topic_lock_wait_duration_seconds",
+            "Time a delivery reservation waits to acquire its Topic state lock.",
+            &stats.latency.delivery_topic_lock_wait,
+        ),
+        (
+            "rustqueue_delivery_topic_lock_hold_duration_seconds",
+            "Time a delivery reservation holds its Topic state lock.",
+            &stats.latency.delivery_topic_lock_hold,
         ),
         (
             "rustqueue_channel_fsync_duration_seconds",
@@ -408,6 +428,8 @@ mod tests {
         let output = render_broker(&broker_stats(), &MetricsConfig::default());
         assert!(output.contains("rustqueue_topic_messages_total 7\n"));
         assert!(output.contains("rustqueue_channel_depth_total 3\n"));
+        assert!(output.contains("rustqueue_publish_topic_lock_wait_duration_seconds_count 0\n"));
+        assert!(output.contains("rustqueue_delivery_topic_lock_hold_duration_seconds_count 0\n"));
         assert!(!output.contains("topic=\"events\""));
         assert!(output.contains("rustqueue_detailed_queue_metric_series 0\n"));
         assert!(output.contains("rustqueue_detailed_queue_metric_series_omitted 5\n"));

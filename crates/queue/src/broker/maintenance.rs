@@ -49,6 +49,7 @@ impl Broker {
             let mut removed = 0;
             for offset in 0..selected {
                 let (_, topic) = &topics[(start + offset) % topics.len()];
+                let _commit_gate = topic.commit_gate.lock();
                 let mut topic = topic.state.lock();
                 let retained = broker.inner.payload_reader.retained_paths();
                 let name = topic.name.clone();
@@ -77,6 +78,7 @@ impl Broker {
             let Some((_, topic)) = candidate else {
                 return Ok(None);
             };
+            let _commit_gate = topic.commit_gate.lock();
             let mut topic = topic.state.lock();
             let retained = broker.inner.payload_reader.retained_paths();
             let result = topic
@@ -180,6 +182,7 @@ impl Broker {
         let broker = self.clone();
         self.storage_task(move || {
             for topic in broker.inner.topics.read().values() {
+                let _commit_gate = topic.commit_gate.lock();
                 topic.state.lock().sync()?;
             }
             Ok(())

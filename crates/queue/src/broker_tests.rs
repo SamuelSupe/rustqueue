@@ -78,6 +78,98 @@ async fn cancelled_publish_keeps_admission_guard_until_commit_finishes() {
 }
 
 #[tokio::test]
+async fn pending_publish_is_not_reservable_before_its_fsync_completes() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+
+    let handle = broker.topic("events").unwrap();
+    let mut metadata = broker.reserve_message_metadata(1).unwrap();
+    let (sync_file, durable_through) = {
+        let _commit_gate = handle.commit_gate.lock();
+        let mut state = handle.state.lock();
+        broker
+            .append_publish_to_topic(
+                &mut state,
+                &[bytes::Bytes::from_static(b"pending")],
+                Duration::ZERO,
+                false,
+                &mut metadata,
+            )
+            .unwrap();
+        let durable_through = state.last_position();
+        let sync_file = state.clone_log_for_sync().unwrap();
+        (sync_file, durable_through)
+    };
+
+    assert!(broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .is_none());
+
+    sync_file.sync_data().unwrap();
+    handle
+        .state
+        .lock()
+        .mark_deliverable_through(durable_through);
+    handle.signal();
+
+    let message = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*message.body, b"pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_reservation_does_not_wait_for_the_publish_commit_gate() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![bytes::Bytes::from_static(b"already-durable")],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    let handle = broker.topic("events").unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_thread = std::thread::spawn(move || {
+        // This is the interval after append where a publisher is syncing its
+        // file outside the Topic state lock.
+        let _commit_gate = handle.commit_gate.lock();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let delivery = tokio::time::timeout(
+        Duration::from_secs(1),
+        broker.next_message("events", "workers", None),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    lock_thread.join().unwrap();
+
+    let message = delivery.unwrap().unwrap().unwrap();
+    assert_eq!(&*message.body, b"already-durable");
+}
+
+#[tokio::test]
 async fn startup_replays_dlq_outbox_before_finishing_the_source() {
     let root = tempdir().unwrap();
     let config = BrokerConfig {

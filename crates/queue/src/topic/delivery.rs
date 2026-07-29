@@ -26,7 +26,7 @@ impl Topic {
         if self.manifest.paused {
             return Ok(ReserveBatch::Ready(Vec::new()));
         }
-        let last = self.last_position();
+        let last = self.deliverable_position;
         let messages = &self.messages;
         let channel = self
             .channels

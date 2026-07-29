@@ -23,6 +23,7 @@ impl Broker {
         let mut topics = Vec::new();
         let mut remaining = max_series;
         for handle in handles {
+            let _commit_gate = handle.commit_gate.lock();
             let mut topic = handle.state.lock();
             topic.add_aggregate_stats(&mut aggregate);
             if detailed && remaining > 0 {
@@ -55,7 +56,10 @@ impl Broker {
         };
         handles
             .into_iter()
-            .map(|topic| topic.state.lock().stats())
+            .map(|topic| {
+                let _commit_gate = topic.commit_gate.lock();
+                topic.state.lock().stats()
+            })
             .collect()
     }
 

@@ -399,6 +399,7 @@ impl Broker {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
             let handle = broker.get_or_create_topic_locked(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
             if handle
                 .state
                 .lock()
@@ -420,11 +421,9 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            broker
-                .topic(&topic)?
-                .state
-                .lock()
-                .delete_channel(&channel)?;
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            handle.state.lock().delete_channel(&channel)?;
             broker.bump_registry()?;
             Ok(())
         })
@@ -438,7 +437,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, None)?;
-            broker.topic(&topic)?.state.lock().set_paused(paused)
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().set_paused(paused);
+            result
         })
         .await
     }
@@ -456,11 +458,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            broker
-                .topic(&topic)?
-                .state
-                .lock()
-                .set_channel_paused(&channel, paused)
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().set_channel_paused(&channel, paused);
+            result
         })
         .await
     }
@@ -472,7 +473,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, None)?;
-            broker.topic(&topic)?.state.lock().empty_topic()
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().empty_topic();
+            result
         })
         .await
     }
@@ -485,7 +489,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            broker.topic(&topic)?.state.lock().empty_channel(&channel)
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().empty_channel(&channel);
+            result
         })
         .await
     }
