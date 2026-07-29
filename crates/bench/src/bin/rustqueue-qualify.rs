@@ -43,6 +43,7 @@ struct Protocol {
     pairs: usize,
     warmup_seconds: u64,
     measurement_seconds: u64,
+    drain_timeout_seconds: u64,
     alternating_order: String,
     bootstrap_iterations: usize,
     bootstrap_seed: u64,
@@ -258,6 +259,12 @@ fn validate_input(input: &QualificationInput) -> anyhow::Result<()> {
     }
     if input.protocol.pairs == 0 {
         bail!("qualification requires at least one pair");
+    }
+    if input.protocol.warmup_seconds == 0
+        || input.protocol.measurement_seconds == 0
+        || input.protocol.drain_timeout_seconds == 0
+    {
+        bail!("qualification timing values must be greater than zero");
     }
     if input.protocol.bootstrap_iterations == 0 {
         bail!("bootstrap-iterations must be greater than zero");

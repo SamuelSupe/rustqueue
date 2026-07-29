@@ -10,7 +10,7 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASUREMENT_SECONDS="${MEASUREMENT_SECONDS:-120}"
 BOOTSTRAP_ITERATIONS="${BOOTSTRAP_ITERATIONS:-100000}"
 BOOTSTRAP_SEED="${BOOTSTRAP_SEED:-802}"
-DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-300}"
+DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-1800}"
 CASES="${CASES:-raw_write sustainable low_load_latency}"
 QUALIFICATION_DEV="${QUALIFICATION_DEV:-0}"
 KEEP_IMAGES="${KEEP_IMAGES:-0}"
@@ -117,6 +117,8 @@ case "$EVIDENCE_OUTPUT" in
       die "development runs cannot publish committed qualification evidence"
     [[ "$PAIRS" == 10 && "$WARMUP_SECONDS" == 30 && "$MEASUREMENT_SECONDS" == 120 ]] ||
       die "committed evidence requires 10 pairs, 30s warmup and 120s measurement"
+    [[ "$DRAIN_TIMEOUT_SECONDS" == 1800 ]] ||
+      die "committed evidence requires an 1800s complete-drain timeout"
     [[ "$CASES" == "raw_write sustainable low_load_latency" ]] ||
       die "committed evidence requires all three qualification cases"
     ;;
@@ -579,6 +581,7 @@ jq -n \
   --argjson pairs "$PAIRS" \
   --argjson warmup "$WARMUP_SECONDS" \
   --argjson measurement "$MEASUREMENT_SECONDS" \
+  --argjson drain_timeout "$DRAIN_TIMEOUT_SECONDS" \
   --argjson iterations "$BOOTSTRAP_ITERATIONS" \
   --argjson seed "$BOOTSTRAP_SEED" \
   --arg cases "$CASES" \
@@ -586,6 +589,7 @@ jq -n \
     pairs: $pairs,
     warmup_seconds: $warmup,
     measurement_seconds: $measurement,
+    drain_timeout_seconds: $drain_timeout,
     alternating_order: "AB_then_BA",
     bootstrap_iterations: $iterations,
     bootstrap_seed: $seed,
