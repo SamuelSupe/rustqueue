@@ -49,17 +49,17 @@ your workload before deploying to production.
   persists its unrouted start position and normal GC cannot cross it. The first
   durable Channel receives every acknowledged publish from that interval, even
   when creation happens after the bootstrap window or a Broker restart.
-- **Direct-Broker qualification.** A reproducible OrbStack gate compares the
-  exact `v0.8.1` tag with one candidate commit using fresh volumes, fixed
-  2 vCPU / 2 GiB limits and alternating paired runs. Raw reports remain local;
-  the compact environment, run metrics, deterministic bootstrap result and
-  verdict are committed with the release.
+- **Direct-Broker preflight.** Reproducible OrbStack tooling compares the exact
+  `v0.8.1` tag with one candidate commit using fresh volumes, fixed
+  2 vCPU / 2 GiB limits and alternating paired runs. RustQueue 0.8.2 completed
+  short correctness and regression preflights but does not claim completion of
+  the optional 60-run performance qualification.
 - **Bounded Channel coalescing.** The durable Channel worker now keeps
   collecting `FIN` and `REQ` requests throughout its existing bounded 1 ms
   window instead of committing at the first transient queue gap. The
   64-request ceiling, channel WAL `fsync` boundary and at-least-once contract
-  are unchanged; the qualification record, rather than the mechanism alone,
-  determines whether a performance claim is justified.
+  are unchanged. The mechanism and short preflight are not a formal throughput
+  guarantee.
 - **Reliable benchmark shutdown and warmup.** The benchmark preserves a
   partially read NSQ frame while closing consumers, and a consumer warmup is
   fully drained before measurement. Missing, duplicate or non-drained delivery
@@ -72,7 +72,7 @@ your workload before deploying to production.
 The patch keeps disk format v7 and remains wire-compatible with the NSQ/Kodo
 contract from 0.8.1. See the
 [v0.8.2 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2)
-for the qualification protocol and validation record.
+for the validation boundaries.
 
 ## Download 0.8.2
 

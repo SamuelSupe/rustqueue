@@ -95,11 +95,7 @@ grep -Fq "Current release: [v$EXPECTED]" "$ROOT/README.md" || {
 }
 
 qualification="$ROOT/benchmarks/qualifications/v$EXPECTED-orbstack.json"
-if [[ "$EXPECTED" == "0.8.2" ]]; then
-  [[ -f "$qualification" ]] || {
-    echo "Broker qualification evidence is missing: $qualification" >&2
-    exit 1
-  }
+if [[ "$EXPECTED" == "0.8.2" && -f "$qualification" ]]; then
   command -v jq >/dev/null 2>&1 || {
     echo "jq is required to verify Broker qualification evidence" >&2
     exit 1
