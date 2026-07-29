@@ -11,8 +11,8 @@ const CHECKPOINT_MAGIC: &[u8; 4] = b"RCC7";
 const HEADER_LEN: usize = 12;
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_RECOVERY_COMMANDS: usize = 2_048;
-const CHECKPOINT_INTERVAL: usize = 1024;
+const CHECKPOINT_INTERVAL: usize = 8 * 1024;
+const MAX_RECOVERY_COMMANDS: usize = CHECKPOINT_INTERVAL * 2;
 
 pub(crate) struct ChannelStore {
     directory: PathBuf,
@@ -544,6 +544,29 @@ mod tests {
             }),
             crate::channel::NextCandidate::Ready(1)
         ));
+    }
+
+    #[test]
+    fn recovery_accepts_a_commit_group_past_the_checkpoint_interval() {
+        let root = tempdir().unwrap();
+        let state = ChannelState::new("workers".into(), 0, false, MAX_RECOVERY_COMMANDS);
+        let mut store = ChannelStore::create(root.path(), &state).unwrap();
+        for position in 1..=(CHECKPOINT_INTERVAL as u64 + 1) {
+            store
+                .append_buffered(&ChannelCommand::Finish {
+                    position,
+                    message_id: position,
+                })
+                .unwrap();
+        }
+        store.sync().unwrap();
+        drop(store);
+
+        let checkpoint = root
+            .path()
+            .join(format!("{}.checkpoint", hex::encode("workers")));
+        let (recovered, _) = ChannelStore::open(&checkpoint, MAX_RECOVERY_COMMANDS).unwrap();
+        assert_eq!(recovered.ack_floor_position, CHECKPOINT_INTERVAL as u64 + 1);
     }
 
     #[test]
