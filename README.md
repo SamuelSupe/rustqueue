@@ -30,7 +30,7 @@ The complete architecture and reliability contract is documented in
 
 | Area | Contract |
 | --- | --- |
-| Durability | `PUB`/`MPUB`/`DPUB` return only after local segment `fsync`; `FIN`/`REQ` use a durable channel WAL |
+| Durability | Default `PUB`/`MPUB`/`DPUB` return after local segment `fsync`; opt-in `write_ack` and `nsq_relaxed` return after append with explicit crash-loss windows; `FIN`/`REQ` use a durable channel WAL |
 | Delivery | At least once; a restart may redeliver a message without a durable `FIN` |
 | Compatibility | NSQ V2 core commands, lookup, standard Stats fields, TLS/mTLS, AUTH, Snappy, Deflate, fan-out and ephemeral channels |
 | Kodo | Default-off compatibility profile: stable publish Gateways from `/nodes`, real Broker owners from `/lookup`, and no upstream Kodo change |
@@ -101,7 +101,10 @@ consumer -> discovery /lookup -> every broker that owns the topic
 operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 ```
 
-- A successful `PUB`, `MPUB`, or `DPUB` has passed local segment `fsync`.
+- In the default `durable` mode, a successful `PUB`, `MPUB`, or `DPUB` has
+  passed local segment `fsync`. `write_ack` returns after append but delays
+  consumption until background fsync; `nsq_relaxed` returns and exposes the
+  append immediately. Both relaxed modes can lose their unsynced tail.
 - Concurrent publishes to one topic use a bounded group commit (up to 64
   requests or 8 MiB, with at most 1 ms coalescing delay) and all wait for the
   same durable boundary before receiving `OK`.
@@ -544,6 +547,16 @@ by default; `[metrics].detailed_queue_metrics` enables bounded
 per-topic/channel series up to `max_detailed_series`.
 Delivery-budget bytes, waiters and cumulative waits are exported as bounded
 aggregate gauges/counters.
+
+`[queue].publish_ack_mode` defaults to `"durable"`: successful publish commands
+follow local segment `fsync`. `"write_ack"` returns after append while consumers
+remain bounded by `last_durable_position`; `"nsq_relaxed"` also exposes the
+appended tail immediately. Background sync runs at the first of
+`relaxed_sync_messages`, `relaxed_sync_bytes`, or `relaxed_sync_interval_ms`.
+`rustqueue_publish_unsynced_messages`, `rustqueue_publish_unsynced_bytes`, and
+`rustqueue_publish_sync_lag_seconds` expose the crash-loss window, with bounded
+per-Topic variants when detailed metrics are enabled. A sync failure stops new
+writes. Keep both relaxed profiles separate from durable-PUB results.
 
 ## Storage and upgrades
 

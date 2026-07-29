@@ -77,6 +77,283 @@ async fn cancelled_publish_keeps_admission_guard_until_commit_finishes() {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relaxed_publish_waits_for_append_before_acknowledging() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        publish_ack_mode: PublishAckMode::WriteAck,
+        relaxed_sync_interval: Duration::from_secs(60),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("events").await.unwrap();
+
+    let handle = broker.topic("events").unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_thread = std::thread::spawn(move || {
+        let _lock = handle.commit_gate.lock();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let mut publish = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            broker
+                .publish(
+                    "events",
+                    vec![bytes::Bytes::from_static(b"write-ack")],
+                    Duration::ZERO,
+                )
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut publish)
+            .await
+            .is_err(),
+        "write_ack must not acknowledge queue admission before append"
+    );
+
+    release_tx.send(()).unwrap();
+    lock_thread.join().unwrap();
+    assert_eq!(publish.await.unwrap().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_publish_rechecks_storage_health_before_append() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        publish_ack_mode: PublishAckMode::WriteAck,
+        relaxed_sync_interval: Duration::from_secs(60),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("events").await.unwrap();
+
+    let handle = broker.topic("events").unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_thread = std::thread::spawn(move || {
+        let _lock = handle.commit_gate.lock();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let mut publish = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            broker
+                .publish(
+                    "events",
+                    vec![bytes::Bytes::from_static(b"must-not-append")],
+                    Duration::ZERO,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while broker.inner.publish_groups.stats().active_workers == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut publish)
+            .await
+            .is_err(),
+        "the publish must be waiting at the Topic commit boundary"
+    );
+    broker
+        .observe_storage_result::<()>(Err(BrokerError::StorageUnavailable))
+        .unwrap_err();
+
+    release_tx.send(()).unwrap();
+    lock_thread.join().unwrap();
+    assert!(matches!(
+        publish.await.unwrap(),
+        Err(BrokerError::StorageUnavailable)
+    ));
+    assert_eq!(
+        broker.filtered_stats(Some("events"), None).topics[0].message_count,
+        0
+    );
+}
+
+#[tokio::test]
+async fn write_ack_hides_the_unsynced_tail_until_flush() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        publish_ack_mode: PublishAckMode::WriteAck,
+        relaxed_sync_messages: usize::MAX,
+        relaxed_sync_bytes: usize::MAX,
+        relaxed_sync_interval: Duration::from_secs(60),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+
+    let ids = broker
+        .publish(
+            "events",
+            vec![bytes::Bytes::from_static(b"pending")],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    let stats = broker.filtered_stats(Some("events"), None);
+    assert_eq!(stats.topics[0].last_durable_position, 0);
+    assert_eq!(stats.topics[0].unsynced_messages, 1);
+    assert!(stats.topics[0].unsynced_bytes > 0);
+    assert!(broker
+        .next_message("events", "workers", Some(Duration::ZERO))
+        .await
+        .unwrap()
+        .is_none());
+
+    broker.flush().await.unwrap();
+    let delivery = broker
+        .next_message("events", "workers", Some(Duration::ZERO))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.id, ids[0]);
+    assert_eq!(&*delivery.body, b"pending");
+    let stats = broker.filtered_stats(Some("events"), None);
+    assert_eq!(stats.topics[0].last_durable_position, 1);
+    assert_eq!(stats.topics[0].unsynced_messages, 0);
+    assert_eq!(stats.topics[0].unsynced_bytes, 0);
+}
+
+#[tokio::test]
+async fn nsq_relaxed_exposes_the_unsynced_tail_immediately() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        publish_ack_mode: PublishAckMode::NsqRelaxed,
+        relaxed_sync_messages: usize::MAX,
+        relaxed_sync_bytes: usize::MAX,
+        relaxed_sync_interval: Duration::from_secs(60),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+
+    let ids = broker
+        .publish(
+            "events",
+            vec![bytes::Bytes::from_static(b"visible")],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    let stats = broker.filtered_stats(Some("events"), None);
+    assert_eq!(stats.topics[0].last_durable_position, 0);
+    assert_eq!(stats.topics[0].unsynced_messages, 1);
+    let delivery = broker
+        .next_message("events", "workers", Some(Duration::ZERO))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.id, ids[0]);
+    assert_eq!(&*delivery.body, b"visible");
+}
+
+#[tokio::test]
+async fn write_ack_timer_makes_the_tail_durable_and_visible() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        publish_ack_mode: PublishAckMode::WriteAck,
+        relaxed_sync_messages: usize::MAX,
+        relaxed_sync_bytes: usize::MAX,
+        relaxed_sync_interval: Duration::from_millis(10),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![bytes::Bytes::from_static(b"timer")],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    let delivery = broker
+        .fetch_batch(
+            "events",
+            "workers",
+            1,
+            usize::MAX,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .expect("the relaxed sync interval must flush an idle Topic")
+        .pop()
+        .unwrap();
+    assert_eq!(&*delivery.body, b"timer");
+    assert_eq!(
+        broker.filtered_stats(Some("events"), None).topics[0].unsynced_messages,
+        0
+    );
+}
+
+#[tokio::test]
+async fn relaxed_sync_failure_stops_new_writes() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        publish_ack_mode: PublishAckMode::WriteAck,
+        relaxed_sync_messages: usize::MAX,
+        relaxed_sync_bytes: usize::MAX,
+        relaxed_sync_interval: Duration::from_millis(100),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker
+        .publish(
+            "events",
+            vec![bytes::Bytes::from_static(b"pending")],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    broker
+        .topic("events")
+        .unwrap()
+        .state
+        .lock()
+        .mark_log_sync_failed();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while broker.storage_healthy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed background sync must isolate the broker");
+    assert!(matches!(
+        broker
+            .publish(
+                "events",
+                vec![bytes::Bytes::from_static(b"rejected")],
+                Duration::ZERO,
+            )
+            .await,
+        Err(BrokerError::StorageUnavailable)
+    ));
+}
+
 #[tokio::test]
 async fn pending_publish_is_not_reservable_before_its_fsync_completes() {
     let root = tempdir().unwrap();
@@ -113,10 +390,7 @@ async fn pending_publish_is_not_reservable_before_its_fsync_completes() {
         .is_none());
 
     sync_file.sync_data().unwrap();
-    handle
-        .state
-        .lock()
-        .mark_deliverable_through(durable_through);
+    handle.state.lock().mark_durable_through(durable_through);
     handle.signal();
 
     let message = broker
@@ -1449,6 +1723,63 @@ async fn broker_metadata_budget_spills_active_tails_across_topics() {
         3_200
     );
     assert!(broker.inner.message_index_cache.resident_bytes() <= 64 * 1024);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_spill_wakes_a_write_ack_consumer() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        message_index_cache_bytes: 128 * 1024,
+        publish_ack_mode: PublishAckMode::WriteAck,
+        relaxed_sync_messages: usize::MAX,
+        relaxed_sync_bytes: usize::MAX,
+        relaxed_sync_interval: Duration::from_secs(60),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![vec![1u8]; 64], Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.filtered_stats(Some("events"), None).topics[0].unsynced_messages,
+        64
+    );
+
+    let waiting = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            broker
+                .fetch_batch(
+                    "events",
+                    "workers",
+                    1,
+                    usize::MAX,
+                    Duration::from_secs(1),
+                    None,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    broker
+        .publish("other", vec![vec![2u8]; 1_024], Duration::ZERO)
+        .await
+        .unwrap();
+    let stats = broker.filtered_stats(Some("events"), Some("workers"));
+    assert_eq!(stats.topics[0].unsynced_messages, 0);
+    assert_eq!(stats.topics[0].last_durable_position, 64);
+    assert_eq!(stats.topics[0].channels[0].depth, 64);
+
+    let delivery = waiting
+        .await
+        .unwrap()
+        .unwrap()
+        .pop()
+        .expect("metadata spill must wake consumers after making the tail durable");
+    assert_eq!(&*delivery.body, &[1]);
 }
 
 #[tokio::test]

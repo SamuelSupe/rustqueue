@@ -70,6 +70,7 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
     let channel_in_flight = stats.aggregate.channel_in_flight;
     let channel_deferred = stats.aggregate.channel_deferred;
     let channel_ack_gap = stats.aggregate.channel_ack_gap;
+    let sync_lag_seconds = stats.aggregate.sync_lag_ms as f64 / 1_000.0;
     let mut output = format!(
         "# TYPE rustqueue_publish_group_commits_total counter\n\
          rustqueue_publish_group_commits_total {}\n\
@@ -99,6 +100,12 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
          rustqueue_topics {topic_count}\n\
          # TYPE rustqueue_topic_messages_total gauge\n\
          rustqueue_topic_messages_total {message_count}\n\
+         # TYPE rustqueue_publish_unsynced_messages gauge\n\
+         rustqueue_publish_unsynced_messages {}\n\
+         # TYPE rustqueue_publish_unsynced_bytes gauge\n\
+         rustqueue_publish_unsynced_bytes {}\n\
+         # TYPE rustqueue_publish_sync_lag_seconds gauge\n\
+         rustqueue_publish_sync_lag_seconds {sync_lag_seconds}\n\
          # TYPE rustqueue_channels gauge\n\
          rustqueue_channels {channel_count}\n\
          # TYPE rustqueue_channel_depth_total gauge\n\
@@ -127,6 +134,8 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
         stats.channel_group_commit.active_workers,
         stats.channel_group_commit.retired_workers,
         stats.channel_group_commit.rejected_workers,
+        stats.aggregate.unsynced_messages,
+        stats.aggregate.unsynced_bytes,
         stats.delivery_budget.in_flight_bytes,
         stats.delivery_budget.waiters,
         stats.delivery_budget.waits_total,
@@ -207,6 +216,7 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
 fn render_detailed_queue_metrics(output: &mut String, stats: &BrokerStats, config: &MetricsConfig) {
     let desired = usize::try_from(stats.aggregate.topic_count)
         .unwrap_or(usize::MAX)
+        .saturating_mul(5)
         .saturating_add(
             usize::try_from(stats.aggregate.channel_count)
                 .unwrap_or(usize::MAX)
@@ -216,19 +226,31 @@ fn render_detailed_queue_metrics(output: &mut String, stats: &BrokerStats, confi
     if config.detailed_queue_metrics {
         output.push_str(
             "# TYPE rustqueue_topic_messages gauge\n\
+             # TYPE rustqueue_topic_last_durable_position gauge\n\
+             # TYPE rustqueue_topic_publish_unsynced_messages gauge\n\
+             # TYPE rustqueue_topic_publish_unsynced_bytes gauge\n\
+             # TYPE rustqueue_topic_publish_sync_lag_seconds gauge\n\
              # TYPE rustqueue_channel_depth gauge\n\
              # TYPE rustqueue_channel_in_flight gauge\n\
              # TYPE rustqueue_channel_deferred gauge\n\
              # TYPE rustqueue_channel_ack_gap gauge\n",
         );
         for topic in &stats.topics {
-            if emitted < config.max_detailed_series {
+            if emitted.saturating_add(5) <= config.max_detailed_series {
                 let topic_label = format!("topic=\"{}\"", escape_label(&topic.name));
                 output.push_str(&format!(
-                    "rustqueue_topic_messages{{{topic_label}}} {}\n",
-                    topic.message_count
+                    "rustqueue_topic_messages{{{topic_label}}} {}\n\
+                     rustqueue_topic_last_durable_position{{{topic_label}}} {}\n\
+                     rustqueue_topic_publish_unsynced_messages{{{topic_label}}} {}\n\
+                     rustqueue_topic_publish_unsynced_bytes{{{topic_label}}} {}\n\
+                     rustqueue_topic_publish_sync_lag_seconds{{{topic_label}}} {}\n",
+                    topic.message_count,
+                    topic.last_durable_position,
+                    topic.unsynced_messages,
+                    topic.unsynced_bytes,
+                    topic.sync_lag_ms as f64 / 1_000.0,
                 ));
-                emitted += 1;
+                emitted += 5;
             }
             for channel in &topic.channels {
                 if emitted.saturating_add(4) > config.max_detailed_series {
@@ -392,6 +414,9 @@ mod tests {
                 message_count: 7,
                 segment_count: 1,
                 segment_bytes: 100,
+                unsynced_messages: 2,
+                unsynced_bytes: 32,
+                sync_lag_ms: 7,
                 channel_count: 1,
                 channel_depth: 3,
                 channel_in_flight: 2,
@@ -405,6 +430,10 @@ mod tests {
                 message_count: 7,
                 segment_count: 1,
                 segment_bytes: 100,
+                last_durable_position: 5,
+                unsynced_messages: 2,
+                unsynced_bytes: 32,
+                sync_lag_ms: 7,
                 channels: vec![ChannelStats {
                     name: "workers".into(),
                     depth: 3,
@@ -430,9 +459,12 @@ mod tests {
         assert!(output.contains("rustqueue_channel_depth_total 3\n"));
         assert!(output.contains("rustqueue_publish_topic_lock_wait_duration_seconds_count 0\n"));
         assert!(output.contains("rustqueue_delivery_topic_lock_hold_duration_seconds_count 0\n"));
+        assert!(output.contains("rustqueue_publish_unsynced_messages 2\n"));
+        assert!(output.contains("rustqueue_publish_unsynced_bytes 32\n"));
+        assert!(output.contains("rustqueue_publish_sync_lag_seconds 0.007\n"));
         assert!(!output.contains("topic=\"events\""));
         assert!(output.contains("rustqueue_detailed_queue_metric_series 0\n"));
-        assert!(output.contains("rustqueue_detailed_queue_metric_series_omitted 5\n"));
+        assert!(output.contains("rustqueue_detailed_queue_metric_series_omitted 9\n"));
     }
 
     #[test]
@@ -441,12 +473,13 @@ mod tests {
             &broker_stats(),
             &MetricsConfig {
                 detailed_queue_metrics: true,
-                max_detailed_series: 4,
+                max_detailed_series: 5,
             },
         );
         assert!(output.contains("rustqueue_topic_messages{topic=\"events\"} 7\n"));
+        assert!(output.contains("rustqueue_topic_last_durable_position{topic=\"events\"} 5\n"));
         assert!(!output.contains("rustqueue_channel_depth{topic="));
-        assert!(output.contains("rustqueue_detailed_queue_metric_series 1\n"));
+        assert!(output.contains("rustqueue_detailed_queue_metric_series 5\n"));
         assert!(output.contains("rustqueue_detailed_queue_metric_series_omitted 4\n"));
     }
 

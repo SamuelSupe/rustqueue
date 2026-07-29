@@ -300,6 +300,7 @@ impl Broker {
         let mut metadata = self.reserve_message_metadata(bodies.len())?;
         let handle = self.get_or_create_topic(topic)?;
         let _commit_gate = handle.commit_gate.lock();
+        self.ensure_storage_healthy()?;
         let mut state = handle.state.lock();
         self.ensure_management_access(topic, None)?;
         let ids = self.append_publish_to_topic(&mut state, bodies, delay, true, &mut metadata)?;
@@ -361,8 +362,20 @@ impl Broker {
         durable: bool,
         metadata: &mut crate::topic::index::MetadataReservation,
     ) -> Result<Vec<u64>, BrokerError> {
-        let first_position = state.next_position();
         let first_id = self.reserve_ids(bodies.len())?;
+        self.append_reserved_publish_to_topic(state, first_id, bodies, delay, durable, metadata)
+    }
+
+    pub(super) fn append_reserved_publish_to_topic(
+        &self,
+        state: &mut Topic,
+        first_id: u64,
+        bodies: &[Bytes],
+        delay: Duration,
+        durable: bool,
+        metadata: &mut crate::topic::index::MetadataReservation,
+    ) -> Result<Vec<u64>, BrokerError> {
+        let first_position = state.next_position();
         let batch = batch::encode(first_position, first_id, bodies)?;
         let timestamp = now_ns();
         let available = now_ms().saturating_add(delay.as_millis().min(i64::MAX as u128) as i64);
@@ -499,5 +512,36 @@ mod tests {
             Err(BrokerError::TopicTombstoned)
         ));
         assert_eq!(broker.stats().topics[0].message_count, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_publish_remains_durable_in_nsq_relaxed_mode() {
+        let root = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig {
+            data_path: root.path().into(),
+            publish_ack_mode: PublishAckMode::NsqRelaxed,
+            relaxed_sync_messages: usize::MAX,
+            relaxed_sync_bytes: usize::MAX,
+            relaxed_sync_interval: Duration::from_secs(60),
+            ..BrokerConfig::default()
+        })
+        .unwrap();
+        broker.create_channel("events", "workers").await.unwrap();
+
+        broker
+            .publish(
+                "events",
+                vec![Bytes::from_static(b"relaxed")],
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(broker.stats().topics[0].unsynced_messages, 1);
+        broker
+            .publish_durable_body_sync("events", &[Bytes::from_static(b"durable")], Duration::ZERO)
+            .unwrap();
+        let stats = broker.stats();
+        assert_eq!(stats.topics[0].last_durable_position, 2);
+        assert_eq!(stats.topics[0].unsynced_messages, 0);
     }
 }

@@ -9,13 +9,13 @@ impl Topic {
         self.persist_channel(
             channel,
             ChannelCommand::Empty {
-                through_position: self.deliverable_position,
+                through_position: self.last_position(),
             },
         )
     }
 
     pub fn empty_topic(&mut self) -> Result<(), BrokerError> {
-        let through = self.deliverable_position;
+        let through = self.last_position();
         let has_durable_channels = self.has_durable_channels();
         let channels: Vec<_> = self.channels.keys().cloned().collect();
         for channel in channels {
@@ -41,6 +41,7 @@ impl Topic {
         let now_ms = now_ms();
         let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();
+        let pending_sync = self.pending_sync();
         let mut channels: Vec<_> = self
             .channels
             .values_mut()
@@ -54,6 +55,12 @@ impl Topic {
             message_count: self.messages.total_count(),
             segment_count,
             segment_bytes,
+            last_durable_position: self.durable_position,
+            unsynced_messages: pending_sync.map_or(0, |pending| pending.messages),
+            unsynced_bytes: pending_sync.map_or(0, |pending| pending.bytes),
+            sync_lag_ms: pending_sync.map_or(0, |pending| {
+                pending.since.elapsed().as_millis().min(u64::MAX as u128) as u64
+            }),
             channels,
         }
     }
@@ -69,6 +76,14 @@ impl Topic {
             .saturating_add(self.messages.total_count());
         aggregate.segment_count = aggregate.segment_count.saturating_add(segment_count);
         aggregate.segment_bytes = aggregate.segment_bytes.saturating_add(segment_bytes);
+        if let Some(pending) = self.pending_sync() {
+            aggregate.unsynced_messages =
+                aggregate.unsynced_messages.saturating_add(pending.messages);
+            aggregate.unsynced_bytes = aggregate.unsynced_bytes.saturating_add(pending.bytes);
+            aggregate.sync_lag_ms = aggregate
+                .sync_lag_ms
+                .max(pending.since.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        }
         for channel in self.channels.values_mut() {
             let (depth, in_flight, deferred, ack_gap) =
                 channel.state.metric_counts(last, &scheduled, now_ms);
@@ -208,6 +223,7 @@ impl Topic {
 
     pub fn sync(&mut self) -> Result<(), BrokerError> {
         self.log.sync()?;
+        self.mark_durable_through(self.last_position());
         self.checkpoint_channels()?;
         store_atomic(&self.manifest_path, &self.manifest)?;
         Ok(())

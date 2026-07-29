@@ -53,6 +53,10 @@ spec:
                 maxTopics: {type: integer, format: int64, minimum: 1, default: 10000}
                 maxPublishWorkers: {type: integer, format: int64, minimum: 1, default: 1024}
                 publishWorkerIdleSeconds: {type: integer, format: int64, minimum: 1, default: 60}
+                publishAckMode: {type: string, enum: [durable, write_ack, nsq_relaxed], default: durable}
+                relaxedSyncMessages: {type: integer, format: int64, minimum: 1, default: 2500}
+                relaxedSyncBytes: {type: integer, format: int64, minimum: 4096, default: 8388608}
+                relaxedSyncIntervalMs: {type: integer, format: int64, minimum: 1, default: 10}
                 detailedQueueMetrics: {type: boolean, default: false}
                 maxDetailedMetricSeries: {type: integer, format: int64, minimum: 1, default: 1000}
                 registrySecretName: {type: string, nullable: true}

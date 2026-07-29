@@ -14,7 +14,10 @@ mod payload_reader;
 mod telemetry;
 mod topic;
 
-pub use broker::{Broker, BrokerConfig, BrokerError};
+pub use broker::{
+    Broker, BrokerConfig, BrokerError, InvalidPublishAckMode, PublishAckMode,
+    RELAXED_SYNC_MIN_BYTES,
+};
 pub use delivery_budget::DeliveryHold;
 pub use delivery_guard::DeliveryGuard;
 pub use eviction::ProtectiveEviction;

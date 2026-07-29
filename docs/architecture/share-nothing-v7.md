@@ -33,8 +33,22 @@ There is no broker-to-broker message path and no cluster consensus path.
   message.
 - The broker PVC is the only copy. Permanent PVC loss means permanent message
   loss.
-- `PUB`, `MPUB`, and `DPUB` succeed only after the local message segment has
-  passed `fsync`.
+- By default, `PUB`, `MPUB`, and `DPUB` succeed only after the local message
+  segment has passed `fsync`.
+- `queue.publish_ack_mode = "write_ack"` is an explicit weaker alternative:
+  success follows append/write, while consumers remain bounded by the last
+  background-fsynced position. A crash or power loss can lose the acknowledged
+  tail.
+- `queue.publish_ack_mode = "nsq_relaxed"` also exposes the appended tail
+  immediately. A crash can therefore lose messages that were both acknowledged
+  and delivered. Neither relaxed mode is a durable-PUB benchmark result.
+- Recovery derives lost-tail gaps from surviving Topic metadata and durable
+  Channel commands. This prevents an acknowledged vanished position from
+  aliasing a later publish; derived gap ranges do not consume Channel depth or
+  the out-of-order ACK window.
+- Relaxed background fsync runs when the first configured message, byte, or
+  interval threshold is reached. Any sync failure isolates local storage and
+  stops subsequent writes.
 - `FIN` and `REQ` succeed only after the local channel WAL has passed `fsync`.
 - Local group commit may combine requests, but never weakens the fsync boundary.
 - Message ID ranges are reserved durably in large blocks. A restart may leave

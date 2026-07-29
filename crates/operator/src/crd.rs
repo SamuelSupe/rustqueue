@@ -57,6 +57,14 @@ pub struct RustQueueSpec {
     pub max_publish_workers: usize,
     #[serde(default = "default_publish_worker_idle_seconds")]
     pub publish_worker_idle_seconds: u64,
+    #[serde(default = "default_publish_ack_mode")]
+    pub publish_ack_mode: String,
+    #[serde(default = "default_relaxed_sync_messages")]
+    pub relaxed_sync_messages: usize,
+    #[serde(default = "default_relaxed_sync_bytes")]
+    pub relaxed_sync_bytes: usize,
+    #[serde(default = "default_relaxed_sync_interval_ms")]
+    pub relaxed_sync_interval_ms: u64,
     #[serde(default)]
     pub detailed_queue_metrics: bool,
     #[serde(default = "default_max_detailed_metric_series")]
@@ -349,6 +357,18 @@ fn default_max_publish_workers() -> usize {
 fn default_publish_worker_idle_seconds() -> u64 {
     60
 }
+fn default_publish_ack_mode() -> String {
+    "durable".into()
+}
+fn default_relaxed_sync_messages() -> usize {
+    2_500
+}
+fn default_relaxed_sync_bytes() -> usize {
+    8 * 1024 * 1024
+}
+fn default_relaxed_sync_interval_ms() -> u64 {
+    10
+}
 fn default_max_detailed_metric_series() -> usize {
     1_000
 }
@@ -381,6 +401,7 @@ mod tests {
         assert!(schema
             .to_string()
             .contains("proxyTcpMaxConnectionAgeSeconds"));
+        assert!(schema.to_string().contains("publishAckMode"));
         assert!(schema.to_string().contains("kodoCompatibility"));
         assert!(schema.to_string().contains("decommissionConfirmed"));
         assert!(schema.to_string().contains("producerRestartNonce"));

@@ -29,14 +29,15 @@ flow while the next group waits for its acknowledged-durability boundary.
 | Area | NSQ v1.3.0 | RustQueue | Performance consequence |
 | --- | --- | --- | --- |
 | In-flight timeout lookup | `inFlightPQ` priority queue plus ID map | Ordered deadline index plus ID map | Both avoid a full in-flight scan. RustQueue 0.8.3 closes the prior CPU and lock-contention gap at high RDY. |
-| Publish acknowledgement | `Topic.put` queues to memory or `go-diskqueue`; the diskqueue writer replies after `writeOne`, and performs its scheduled `sync` on a later I/O-loop iteration | A publish group appends, calls segment `fsync`, then replies | RustQueue has higher durable-PUB latency by design. NSQ `--sync-every=1` is not an acknowledgement-after-fsync equivalent. |
+| Publish acknowledgement | `Topic.put` queues to memory or `go-diskqueue`; the diskqueue writer replies after `writeOne`, and performs its scheduled `sync` on a later I/O-loop iteration | Default `durable` mode appends, calls segment `fsync`, then replies | RustQueue has higher durable-PUB latency by design. NSQ `--sync-every=1` is not an acknowledgement-after-fsync equivalent. |
 | FIN / REQ acknowledgement | In-flight state is memory-resident; shutdown flushes outstanding messages to the backend | Channel state is appended to a WAL and group-fsynced before success | RustQueue trades throughput for a stronger confirmed-ack crash boundary. Do not compare raw consume rate without stating this difference. |
-| Normal-message memory queue | Configurable `mem-queue-size`; the default may absorb normal traffic before disk | No acknowledged in-memory Topic fast path; data is retained in the local segment before PUB success | A default NSQ benchmark can be much faster while shifting its durability window to memory / OS cache. The comparison script sets NSQ `mem-queue-size=0` to avoid that mismatch. |
+| Relaxed publish path | Configurable `mem-queue-size`; diskqueue replies after write and syncs later by count or timer | `write_ack` replies after append but delays delivery until fsync; `nsq_relaxed` replies and delivers after append | Compare each mode under its own durability label. The script keeps NSQ `mem-queue-size=0`, so the relaxed comparison isolates diskqueue sync cadence rather than adding NSQ's memory queue. |
 | Topic fan-out and locking | A Topic message pump allocates a message object per additional Channel and feeds each Channel queue | One Topic segment is shared by cursor-based Channels; publish append/rotation remains serialized, but group `fsync` runs outside the reservation lock and delivery stops at the durable tail | RustQueue avoids one durable payload log per Channel without making existing durable reservations wait for the next PUB fsync. |
 
 ## How to read benchmark results
 
-`scripts/benchmark-compare.sh` produces three distinct durability profiles:
+`scripts/benchmark-compare.sh` always produces three distinct durability
+profiles:
 
 - `rustqueue-local-fsync`: a PUB acknowledgement follows the local segment
   group `fsync`.
@@ -50,17 +51,35 @@ complete unique delivery, duplicates, drain state, and RSS alongside throughput.
 The benchmark aborts when a consumer run has missing deliveries, unexpected
 duplicates, or an incomplete drain.
 
+Set `RUN_RELAXED=1` to add two separately named RustQueue profiles:
+
+- `rustqueue-write-ack`: ACK after append, consume after background fsync.
+- `rustqueue-nsq-relaxed`: ACK and consume after append.
+
+Both use the first reached `RELAXED_SYNC_MESSAGES` (default 2500),
+`RELAXED_SYNC_BYTES` (default 8 MiB), or `RELAXED_SYNC_INTERVAL_MS` (default
+10 ms) boundary. Never combine either result with `rustqueue-local-fsync`.
+Track `rustqueue_publish_unsynced_messages`,
+`rustqueue_publish_unsynced_bytes`, and
+`rustqueue_publish_sync_lag_seconds` alongside throughput and ACK latency.
+
 ## Next candidates to measure before changing semantics
 
 1. Profile Channel WAL `FIN`/`REQ` commit time against reservation latency;
    those durable state transitions still use the Topic state lock.
-2. Measure an explicitly opt-in relaxed acknowledgement mode separately from
-   the durable default; it must document crash-time redelivery and never be
-   mixed with the durable-PUB result.
+2. Profile `write_ack` and `nsq_relaxed` under mixed producer/consumer load,
+   including ACK latency, durable-position lag, RSS, and the time from append
+   acknowledgement to fsync. Keep both separate from the durable-PUB result.
 3. Compare many-Channel fan-out with equal memory budgets. NSQ allocates a
    message object per Channel and can persist each Channel backlog separately;
    RustQueue's shared segment reduces durable payload duplication but must also
    keep cursor and metadata lock costs bounded.
+4. Keep NSQ's memory queue as a separate profile. Neither RustQueue relaxed
+   mode bypasses the segment append, so comparing either one with a non-zero
+   NSQ `mem-queue-size` measures an additional architectural difference.
+5. Inspect publish latency outliers at segment rotation and durable message-ID
+   block reservation. These paths sync metadata infrequently and should not be
+   inferred from median steady-state throughput.
 
 Primary source paths: NSQ's
 [`channel.go`](https://github.com/nsqio/nsq/blob/v1.3.0/nsqd/channel.go),

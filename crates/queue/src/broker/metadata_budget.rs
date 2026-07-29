@@ -21,7 +21,16 @@ impl Broker {
             let mut progressed = false;
             for topic in topics {
                 let _commit_gate = topic.commit_gate.lock();
-                if topic.state.lock().spill_message_metadata()? > 0 {
+                let (spilled, visibility_advanced) = {
+                    let mut state = topic.state.lock();
+                    let deliverable_before = state.deliverable_position();
+                    let spilled = state.spill_message_metadata()?;
+                    (spilled, state.deliverable_position() > deliverable_before)
+                };
+                if visibility_advanced {
+                    topic.signal();
+                }
+                if spilled > 0 {
                     progressed = true;
                 }
                 if let Some(reservation) = self.inner.message_index_cache.try_reserve(messages) {

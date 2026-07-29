@@ -1366,9 +1366,19 @@ fn validate(cluster: &RustQueue, active_feature_floor: u32) -> anyhow::Result<()
         || cluster.spec.max_topics == 0
         || cluster.spec.max_publish_workers == 0
         || cluster.spec.publish_worker_idle_seconds == 0
+        || (cluster.spec.publish_ack_mode != "durable"
+            && (cluster.spec.relaxed_sync_messages == 0
+                || cluster.spec.relaxed_sync_bytes < 4096
+                || cluster.spec.relaxed_sync_interval_ms == 0))
         || cluster.spec.max_detailed_metric_series == 0
     {
         bail!("queue limits are outside the stable v7 contract");
+    }
+    if !matches!(
+        cluster.spec.publish_ack_mode.as_str(),
+        "durable" | "write_ack" | "nsq_relaxed"
+    ) {
+        bail!("publishAckMode must be durable, write_ack, or nsq_relaxed");
     }
     validate_message_storage_contract(
         cluster.spec.max_message_bytes,
@@ -1381,13 +1391,14 @@ fn validate(cluster: &RustQueue, active_feature_floor: u32) -> anyhow::Result<()
             || cluster.spec.bootstrap_retention_seconds < KODO_BOOTSTRAP_RETENTION_SECONDS
             || cluster.spec.max_message_bytes != 100 * 1024 * 1024
             || cluster.spec.connection_delivery_inflight_bytes < 128 * 1024 * 1024
-            || cluster.spec.node_delivery_inflight_bytes < 512 * 1024 * 1024)
+            || cluster.spec.node_delivery_inflight_bytes < 512 * 1024 * 1024
+            || cluster.spec.publish_ack_mode != "durable")
     {
         bail!(
             "Kodo compatibility requires exactly 3 brokers, storageFeatureLevel 2, \
              bootstrapRetentionSeconds >= 180, \
              maxMessageBytes 104857600, connectionDeliveryInflightBytes >= 134217728, \
-             and nodeDeliveryInflightBytes >= 536870912"
+             nodeDeliveryInflightBytes >= 536870912, and publishAckMode durable"
         );
     }
     if !(630..=86_400).contains(&cluster.spec.kodo_compatibility.cutover_grace_seconds) {
@@ -2037,5 +2048,11 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("bootstrapRetentionSeconds >= 180"));
+        cluster.spec.bootstrap_retention_seconds = KODO_BOOTSTRAP_RETENTION_SECONDS;
+        cluster.spec.publish_ack_mode = "nsq_relaxed".into();
+        assert!(validate(&cluster, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("publishAckMode durable"));
     }
 }

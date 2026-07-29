@@ -380,6 +380,10 @@ mod tests {
                 message_count: 3,
                 segment_count: 1,
                 segment_bytes: 256,
+                last_durable_position: 3,
+                unsynced_messages: 0,
+                unsynced_bytes: 0,
+                sync_lag_ms: 0,
                 channels: vec![ChannelStats {
                     name: "workers".into(),
                     depth: 2,

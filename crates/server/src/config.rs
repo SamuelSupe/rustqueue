@@ -3,6 +3,7 @@ mod environment;
 mod validation;
 
 use environment::read_optional_secret;
+use rustqueue_queue::{PublishAckMode, RELAXED_SYNC_MIN_BYTES};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::SocketAddr;
@@ -93,6 +94,10 @@ pub struct QueueConfig {
     pub max_topics: usize,
     pub max_publish_workers: usize,
     pub publish_worker_idle_seconds: u64,
+    pub publish_ack_mode: PublishAckMode,
+    pub relaxed_sync_messages: usize,
+    pub relaxed_sync_bytes: usize,
+    pub relaxed_sync_interval_ms: u64,
     pub bootstrap_retention_seconds: u64,
     pub message_retention_seconds: u64,
     pub max_delivery_attempts: u16,
@@ -237,6 +242,10 @@ impl Default for QueueConfig {
             max_topics: 10_000,
             max_publish_workers: 1_024,
             publish_worker_idle_seconds: 60,
+            publish_ack_mode: PublishAckMode::Durable,
+            relaxed_sync_messages: 2_500,
+            relaxed_sync_bytes: 8 * 1024 * 1024,
+            relaxed_sync_interval_ms: 10,
             bootstrap_retention_seconds: 90,
             message_retention_seconds: 0,
             max_delivery_attempts: 16,
@@ -344,8 +353,12 @@ impl Config {
             || self.queue.max_topics == 0
             || self.queue.max_publish_workers == 0
             || self.queue.publish_worker_idle_seconds == 0
+            || (self.queue.publish_ack_mode.is_relaxed()
+                && (self.queue.relaxed_sync_messages == 0
+                    || self.queue.relaxed_sync_bytes < RELAXED_SYNC_MIN_BYTES
+                    || self.queue.relaxed_sync_interval_ms == 0))
         {
-            bail!("queue limits must be greater than zero");
+            bail!("queue limits must be greater than zero; relaxed sync requires at least one message, 4096 bytes, and a non-zero interval");
         }
         if self.storage.entry_cache_bytes == 0 || self.storage.message_index_cache_bytes == 0 {
             bail!("storage caches must be greater than zero");

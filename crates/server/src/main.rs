@@ -71,6 +71,12 @@ async fn main() -> anyhow::Result<()> {
         publish_worker_idle: std::time::Duration::from_secs(
             config.queue.publish_worker_idle_seconds,
         ),
+        publish_ack_mode: config.queue.publish_ack_mode,
+        relaxed_sync_messages: config.queue.relaxed_sync_messages,
+        relaxed_sync_bytes: config.queue.relaxed_sync_bytes,
+        relaxed_sync_interval: std::time::Duration::from_millis(
+            config.queue.relaxed_sync_interval_ms,
+        ),
         entry_cache_bytes: config.storage.entry_cache_bytes,
         message_index_cache_bytes: config.storage.message_index_cache_bytes,
         payload_read_workers: config.storage.payload_read_workers,

@@ -46,6 +46,12 @@ queue:
   maxTopics: 10000
   maxPublishWorkers: 1024
   publishWorkerIdleSeconds: 60
+  # Default is strict local-fsync acknowledgement. write_ack and nsq_relaxed
+  # are explicit crash-loss trade-offs and are not supported by Kodo compatibility.
+  publishAckMode: durable
+  relaxedSyncMessages: 2500
+  relaxedSyncBytes: 8388608
+  relaxedSyncIntervalMs: 10
   detailedQueueMetrics: false
   maxDetailedMetricSeries: 1000
   registrySecretName: ""
