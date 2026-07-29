@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 const QUEUE_CAPACITY: usize = 1024;
-const MAX_GROUP_REQUESTS: usize = 64;
+const MAX_GROUP_REQUESTS: usize = 256;
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) enum ChannelOperation {
@@ -352,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_size_is_bounded() {
-        let (sender, mut receiver) = mpsc::channel(128);
+        let (sender, mut receiver) = mpsc::channel(MAX_GROUP_REQUESTS + 1);
         for _ in 0..=MAX_GROUP_REQUESTS {
             sender.send(request()).await.unwrap();
         }
