@@ -74,6 +74,9 @@ pub struct QueueAggregateStats {
     pub message_count: u64,
     pub segment_count: u64,
     pub segment_bytes: u64,
+    pub unsynced_messages: u64,
+    pub unsynced_bytes: u64,
+    pub sync_lag_ms: u64,
     pub channel_count: u64,
     pub channel_depth: u64,
     pub channel_in_flight: u64,
@@ -87,6 +90,11 @@ impl QueueAggregateStats {
         self.message_count = self.message_count.saturating_add(topic.message_count);
         self.segment_count = self.segment_count.saturating_add(topic.segment_count);
         self.segment_bytes = self.segment_bytes.saturating_add(topic.segment_bytes);
+        self.unsynced_messages = self
+            .unsynced_messages
+            .saturating_add(topic.unsynced_messages);
+        self.unsynced_bytes = self.unsynced_bytes.saturating_add(topic.unsynced_bytes);
+        self.sync_lag_ms = self.sync_lag_ms.max(topic.sync_lag_ms);
         for channel in &topic.channels {
             self.channel_count = self.channel_count.saturating_add(1);
             self.channel_depth = self.channel_depth.saturating_add(channel.depth);
@@ -103,7 +111,11 @@ impl QueueAggregateStats {
 pub struct BrokerLatencyStats {
     pub fsync: HistogramSnapshot,
     pub group_commit_wait: HistogramSnapshot,
+    pub publish_topic_lock_wait: HistogramSnapshot,
+    pub publish_topic_lock_hold: HistogramSnapshot,
     pub publish_ack: HistogramSnapshot,
+    pub delivery_topic_lock_wait: HistogramSnapshot,
+    pub delivery_topic_lock_hold: HistogramSnapshot,
     pub channel_fsync: HistogramSnapshot,
     pub channel_group_commit_wait: HistogramSnapshot,
     pub channel_ack: HistogramSnapshot,
@@ -146,6 +158,14 @@ pub struct TopicStats {
     pub segment_count: u64,
     #[serde(default)]
     pub segment_bytes: u64,
+    #[serde(default)]
+    pub last_durable_position: u64,
+    #[serde(default)]
+    pub unsynced_messages: u64,
+    #[serde(default)]
+    pub unsynced_bytes: u64,
+    #[serde(default)]
+    pub sync_lag_ms: u64,
     pub channels: Vec<ChannelStats>,
 }
 

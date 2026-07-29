@@ -234,6 +234,37 @@ impl MessageIndex {
             .or_else(|| self.active.front().map(|message| message.position))
     }
 
+    pub(crate) fn position_gaps(&self, last_position: u64) -> Vec<(u64, u64)> {
+        let mut gaps = Vec::new();
+        let mut next = 1u64;
+        let active = self
+            .active
+            .front()
+            .zip(self.active.back())
+            .map(|(first, last)| (first.position, last.position));
+        for (first, last) in self
+            .sealed
+            .iter()
+            .map(|segment| (segment.first_position, segment.last_position))
+            .chain(active)
+        {
+            if first > last_position {
+                break;
+            }
+            if next < first {
+                gaps.push((next, first.saturating_sub(1).min(last_position)));
+            }
+            let Some(after) = last.checked_add(1) else {
+                return gaps;
+            };
+            next = after;
+        }
+        if next <= last_position {
+            gaps.push((next, last_position));
+        }
+        gaps
+    }
+
     pub(crate) fn last_timestamp_ns(&self) -> Option<i64> {
         self.active
             .back()
@@ -360,12 +391,18 @@ impl MessageIndex {
         let mut expected = self
             .active
             .back()
-            .map(|message| message.position.saturating_add(1))
-            .or_else(|| {
-                self.sealed
-                    .back()
-                    .map(|segment| segment.last_position.saturating_add(1))
-            });
+            .map(|message| message.position.saturating_add(1));
+        if expected.is_none()
+            && self.sealed.back().is_some_and(|segment| {
+                messages
+                    .first()
+                    .is_some_and(|message| message.position <= segment.last_position)
+            })
+        {
+            return Err(BrokerError::InvalidRecord(
+                "topic message position ranges overlap".into(),
+            ));
+        }
         for message in &messages {
             if expected.is_some_and(|expected| message.position != expected) {
                 return Err(BrokerError::InvalidRecord(
@@ -424,11 +461,11 @@ impl MessageIndex {
             || self
                 .sealed
                 .back()
-                .is_some_and(|previous| previous.last_position + 1 != segment.first_position)
+                .is_some_and(|previous| previous.last_position >= segment.first_position)
             || self
                 .active
                 .front()
-                .is_some_and(|message| segment.last_position + 1 != message.position)
+                .is_some_and(|message| segment.last_position >= message.position)
         {
             return Err(BrokerError::InvalidRecord(
                 "sealed topic message range is invalid".into(),

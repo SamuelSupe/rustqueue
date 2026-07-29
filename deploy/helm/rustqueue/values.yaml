@@ -5,7 +5,7 @@ operator:
   replicas: 2
   image:
     repository: rustqueue-operator
-    tag: "0.8.2"
+    tag: "0.8.3"
     pullPolicy: IfNotPresent
   log: rustqueue_operator=info
   resources:
@@ -20,7 +20,7 @@ operator:
 queue:
   create: true
   name: rustqueue
-  image: rustqueue:0.8.2
+  image: rustqueue:0.8.3
   imagePullPolicy: IfNotPresent
   minBrokers: 1
   maxBrokers: 500
@@ -46,6 +46,12 @@ queue:
   maxTopics: 10000
   maxPublishWorkers: 1024
   publishWorkerIdleSeconds: 60
+  # Default is strict local-fsync acknowledgement. write_ack and nsq_relaxed
+  # are explicit crash-loss trade-offs and are not supported by Kodo compatibility.
+  publishAckMode: durable
+  relaxedSyncMessages: 2500
+  relaxedSyncBytes: 8388608
+  relaxedSyncIntervalMs: 10
   detailedQueueMetrics: false
   maxDetailedMetricSeries: 1000
   registrySecretName: ""

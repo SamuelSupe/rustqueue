@@ -332,6 +332,10 @@ fn observation_head(state: &AppState) -> Value {
         "delivery_budget": state.broker.delivery_budget_stats(),
         "limits": {
             "max_message_bytes": state.config.queue.max_message_bytes,
+            "publish_ack_mode": state.config.queue.publish_ack_mode.as_str(),
+            "relaxed_sync_messages": state.config.queue.relaxed_sync_messages,
+            "relaxed_sync_bytes": state.config.queue.relaxed_sync_bytes,
+            "relaxed_sync_interval_ms": state.config.queue.relaxed_sync_interval_ms,
             "message_index_cache_bytes": state.config.storage.message_index_cache_bytes,
             "max_connections": state.config.limits.max_connections,
         },

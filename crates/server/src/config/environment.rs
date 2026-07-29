@@ -70,6 +70,22 @@ impl Config {
             "RUSTQUEUE_PUBLISH_WORKER_IDLE_SECONDS",
             &mut self.queue.publish_worker_idle_seconds,
         )?;
+        set_from_env(
+            "RUSTQUEUE_PUBLISH_ACK_MODE",
+            &mut self.queue.publish_ack_mode,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_RELAXED_SYNC_MESSAGES",
+            &mut self.queue.relaxed_sync_messages,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_RELAXED_SYNC_BYTES",
+            &mut self.queue.relaxed_sync_bytes,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_RELAXED_SYNC_INTERVAL_MS",
+            &mut self.queue.relaxed_sync_interval_ms,
+        )?;
         set_from_env("RUSTQUEUE_MAX_BODY_BYTES", &mut self.limits.max_body_bytes)?;
         set_from_env(
             "RUSTQUEUE_HTTP_BODY_TIMEOUT_MS",

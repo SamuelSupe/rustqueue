@@ -14,6 +14,24 @@ fn default_bootstrap_window_covers_official_lookup_poll_jitter() {
 }
 
 #[test]
+fn relaxed_acknowledgement_requires_bounded_sync_thresholds() {
+    let mut config = Config::default();
+    assert_eq!(config.queue.publish_ack_mode, PublishAckMode::Durable);
+
+    config.queue.publish_ack_mode = PublishAckMode::WriteAck;
+    config.queue.relaxed_sync_bytes = RELAXED_SYNC_MIN_BYTES - 1;
+    assert!(config.validate().is_err());
+
+    config.queue.relaxed_sync_bytes = RELAXED_SYNC_MIN_BYTES;
+    config.queue.relaxed_sync_messages = 0;
+    assert!(config.validate().is_err());
+
+    config.queue.relaxed_sync_messages = 1;
+    config.queue.relaxed_sync_interval_ms = 0;
+    assert!(config.validate().is_err());
+}
+
+#[test]
 fn maintenance_has_a_startup_quiet_period() {
     assert_eq!(
         Config::default().storage.maintenance_startup_delay_seconds,

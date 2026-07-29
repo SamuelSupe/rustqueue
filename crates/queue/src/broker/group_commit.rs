@@ -1,5 +1,6 @@
-use super::{Broker, BrokerError, BrokerInner};
+use super::{Broker, BrokerError, BrokerInner, PublishAckMode};
 use crate::model::PublishGroupCommitStats;
+use crate::topic::PendingSync;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -8,7 +9,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
-const QUEUE_CAPACITY: usize = 1024;
+const QUEUE_CAPACITY: usize = 1_024;
 const MAX_GROUP_REQUESTS: usize = 64;
 const MAX_GROUP_BYTES: usize = 8 * 1024 * 1024;
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
@@ -145,9 +146,8 @@ impl Broker {
         self.publish_inner(topic, bodies, delay, None).await
     }
 
-    /// Keeps `guard` alive until the queued body has either been rejected or
-    /// crossed the durable publish boundary. This makes caller-side admission
-    /// accounting cancellation-safe after a request enters group commit.
+    /// Keeps `guard` alive until the request crosses the configured publish
+    /// acknowledgement boundary, including cancellation after it is queued.
     pub async fn publish_guarded<B, G>(
         &self,
         topic: &str,
@@ -199,10 +199,14 @@ impl Broker {
         }
     }
 
-    fn commit_publish_group(&self, topic: &str, requests: Vec<PublishRequest>) {
+    fn commit_publish_group(
+        &self,
+        topic: &str,
+        requests: Vec<PublishRequest>,
+    ) -> Result<(), BrokerError> {
         if let Err(error) = self.ensure_storage_healthy() {
             fail_requests(requests, &error);
-            return;
+            return Err(error);
         }
         let message_count = requests
             .iter()
@@ -211,26 +215,34 @@ impl Broker {
         let mut metadata = match self.reserve_message_metadata(message_count) {
             Ok(reservation) => reservation,
             Err(error) => {
-                self.observe_storage_result::<()>(Err(copy_error(&error)))
-                    .ok();
                 fail_requests(requests, &error);
-                return;
+                return self.worker_result(error);
             }
         };
         let handle = match self.get_or_create_topic(topic) {
             Ok(handle) => handle,
             Err(error) => {
-                self.observe_storage_result::<()>(Err(copy_error(&error)))
-                    .ok();
                 fail_requests(requests, &error);
-                return;
+                return self.worker_result(error);
             }
         };
-        let mut topic_state = handle.state.lock();
+        let commit_gate = handle.commit_gate.lock();
+        if let Err(error) = self.ensure_storage_healthy() {
+            fail_requests(requests, &error);
+            return Err(error);
+        }
         if let Err(error) = self.ensure_management_access(topic, None) {
             fail_requests(requests, &error);
-            return;
+            return Ok(());
         }
+        let topic_lock_started = Instant::now();
+        let mut topic_state = handle.state.lock();
+        self.inner
+            .metrics
+            .publish_topic_lock_wait
+            .observe(topic_lock_started.elapsed());
+        let topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
+        let deliverable_before = topic_state.deliverable_position();
         let mut pending = Vec::with_capacity(requests.len());
         let mut requests = requests.into_iter();
 
@@ -238,10 +250,10 @@ impl Broker {
             let PublishRequest {
                 bodies,
                 delay,
+                encoded_bytes,
                 enqueued_at,
                 reply,
                 guard,
-                ..
             } = request;
             self.inner
                 .metrics
@@ -254,18 +266,19 @@ impl Broker {
                 false,
                 &mut metadata,
             ) {
-                Ok(ids) => pending.push(PendingPublish {
-                    ids,
-                    reply,
-                    _guard: guard,
-                }),
+                Ok(ids) => {
+                    topic_state.record_unsynced(bodies.len(), encoded_bytes);
+                    pending.push(PendingPublish {
+                        ids,
+                        reply,
+                        _guard: guard,
+                    });
+                }
                 Err(error) if is_storage_error(&error) => {
-                    self.observe_storage_result::<()>(Err(copy_error(&error)))
-                        .ok();
                     let _ = reply.send(Err(copy_error(&error)));
                     fail_pending(pending);
                     fail_requests(requests, &BrokerError::StorageUnavailable);
-                    return;
+                    return self.worker_result(error);
                 }
                 Err(error) => {
                     let _ = reply.send(Err(error));
@@ -274,34 +287,133 @@ impl Broker {
         }
 
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         drop(metadata);
         if self.inner.message_index_cache.over_budget() {
             if let Err(error) = topic_state.spill_message_metadata() {
-                self.observe_storage_result::<()>(Err(copy_error(&error)))
-                    .ok();
                 fail_pending(pending);
-                return;
+                return self.worker_result(error);
             }
         }
+        let ack_mode = self.inner.config.publish_ack_mode;
+        let visibility_advanced;
+        if ack_mode == PublishAckMode::Durable {
+            let durable_through = topic_state.last_position();
+            let sync_file = match topic_state.clone_log_for_sync() {
+                Ok(file) => file,
+                Err(error) => {
+                    fail_pending(pending);
+                    return self.worker_result(error);
+                }
+            };
+            drop(topic_state);
+            drop(topic_lock_hold);
+            rustqueue_storage::crash_failpoint("publish_after_append_before_fsync");
+            let sync_result = {
+                let _timer = self.inner.metrics.fsync.timer();
+                sync_file.sync_data().map_err(BrokerError::from)
+            };
+            if let Err(error) = sync_result {
+                let topic_lock_started = Instant::now();
+                let topic_state = handle.state.lock();
+                self.inner
+                    .metrics
+                    .publish_topic_lock_wait
+                    .observe(topic_lock_started.elapsed());
+                let _topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
+                topic_state.mark_log_sync_failed();
+                fail_pending(pending);
+                return self.worker_result(error);
+            }
+            let topic_lock_started = Instant::now();
+            let mut topic_state = handle.state.lock();
+            self.inner
+                .metrics
+                .publish_topic_lock_wait
+                .observe(topic_lock_started.elapsed());
+            let topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
+            topic_state.mark_durable_through(durable_through);
+            visibility_advanced = topic_state.deliverable_position() > deliverable_before;
+            drop(topic_state);
+            drop(topic_lock_hold);
+            rustqueue_storage::crash_failpoint("publish_after_fsync_before_reply");
+        } else {
+            if ack_mode.exposes_unsynced() {
+                let deliverable_through = topic_state.last_position();
+                topic_state.mark_deliverable_through(deliverable_through);
+            }
+            visibility_advanced = topic_state.deliverable_position() > deliverable_before;
+            drop(topic_state);
+            drop(topic_lock_hold);
+        }
+
+        drop(commit_gate);
+        self.inner.publish_groups.record(pending.len());
+        if visibility_advanced {
+            handle.signal();
+        }
+        for pending in pending {
+            let _ = pending.reply.send(Ok(pending.ids));
+        }
+        Ok(())
+    }
+
+    fn sync_pending_topic(&self, topic: &str) -> Result<(), BrokerError> {
+        self.ensure_storage_healthy()?;
+        let handle = match self.topic(topic) {
+            Ok(handle) => handle,
+            Err(BrokerError::TopicNotFound) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let commit_gate = handle.commit_gate.lock();
+        let topic_lock_started = Instant::now();
+        let topic_state = handle.state.lock();
+        self.inner
+            .metrics
+            .publish_topic_lock_wait
+            .observe(topic_lock_started.elapsed());
+        let topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
+        if topic_state.pending_sync().is_none() {
+            return Ok(());
+        }
+        let durable_through = topic_state.last_position();
+        let sync_file = topic_state.clone_log_for_sync()?;
+        drop(topic_state);
+        drop(topic_lock_hold);
         rustqueue_storage::crash_failpoint("publish_after_append_before_fsync");
         let sync_result = {
             let _timer = self.inner.metrics.fsync.timer();
-            topic_state.sync_log()
+            sync_file.sync_data().map_err(BrokerError::from)
         };
         if let Err(error) = sync_result {
-            self.observe_storage_result::<()>(Err(copy_error(&error)))
-                .ok();
-            fail_pending(pending);
-            return;
+            let topic_state = handle.state.lock();
+            topic_state.mark_log_sync_failed();
+            drop(topic_state);
+            return self.observe_storage_result(Err(error));
         }
-        rustqueue_storage::crash_failpoint("publish_after_fsync_before_reply");
+        let mut topic_state = handle.state.lock();
+        topic_state.mark_durable_through(durable_through);
         drop(topic_state);
-        self.inner.publish_groups.record(pending.len());
+        drop(commit_gate);
         handle.signal();
-        for pending in pending {
-            let _ = pending.reply.send(Ok(pending.ids));
+        Ok(())
+    }
+
+    fn pending_topic_sync(&self, topic: &str) -> Option<PendingSync> {
+        self.inner
+            .topics
+            .read()
+            .get(topic)
+            .and_then(|handle| handle.state.lock().pending_sync())
+    }
+
+    fn worker_result(&self, error: BrokerError) -> Result<(), BrokerError> {
+        if is_storage_error(&error) {
+            let _ = self.observe_storage_result::<()>(Err(copy_error(&error)));
+            Err(BrokerError::StorageUnavailable)
+        } else {
+            Ok(())
         }
     }
 }
@@ -314,21 +426,68 @@ async fn run_worker(
     mut receiver: mpsc::Receiver<PublishRequest>,
 ) {
     let mut carry = None;
+    let mut pending_sync = None;
     loop {
+        let Some(inner) = broker.upgrade() else {
+            return;
+        };
+        let relaxed_ack_mode = inner.config.publish_ack_mode.is_relaxed();
+        let sync_interval = inner.config.relaxed_sync_interval;
+        let sync_messages = inner.config.relaxed_sync_messages as u64;
+        let sync_bytes = inner.config.relaxed_sync_bytes as u64;
+        drop(inner);
+
+        if pending_sync
+            .is_some_and(|pending| sync_is_due(pending, sync_messages, sync_bytes, sync_interval))
+        {
+            if !run_pending_sync(&broker, &topic).await {
+                return;
+            }
+            pending_sync = pending_topic_sync(&broker, &topic, relaxed_ack_mode);
+            continue;
+        }
+
         let first = match carry.take() {
             Some(request) => request,
-            None => match tokio::time::timeout(idle_timeout, receiver.recv()).await {
-                Ok(Some(request)) => request,
-                Ok(None) => return,
-                Err(_) => {
-                    let Some(inner) = broker.upgrade() else {
-                        return;
-                    };
-                    if inner.publish_groups.retire_idle(&topic, worker_id) {
-                        return;
+            None => match pending_sync {
+                Some(pending) => {
+                    let deadline = tokio::time::Instant::from_std(
+                        pending
+                            .since
+                            .checked_add(sync_interval)
+                            .expect("validated relaxed sync interval"),
+                    );
+                    tokio::select! {
+                        request = receiver.recv() => match request {
+                            Some(request) => request,
+                            None => {
+                                let _ = run_pending_sync(&broker, &topic).await;
+                                return;
+                            }
+                        },
+                        _ = tokio::time::sleep_until(deadline) => {
+                            if !run_pending_sync(&broker, &topic).await {
+                                return;
+                            }
+                            pending_sync =
+                                pending_topic_sync(&broker, &topic, relaxed_ack_mode);
+                            continue;
+                        }
                     }
-                    continue;
                 }
+                None => match tokio::time::timeout(idle_timeout, receiver.recv()).await {
+                    Ok(Some(request)) => request,
+                    Ok(None) => return,
+                    Err(_) => {
+                        let Some(inner) = broker.upgrade() else {
+                            return;
+                        };
+                        if inner.publish_groups.retire_idle(&topic, worker_id) {
+                            return;
+                        }
+                        continue;
+                    }
+                },
             },
         };
         let (requests, next) = collect_group(first, &mut receiver).await;
@@ -338,18 +497,63 @@ async fn run_worker(
         };
         let worker_broker = Broker { inner };
         let worker_topic = topic.clone();
-        if tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             worker_broker.commit_publish_group(&worker_topic, requests)
         })
         .await
-        .is_err()
         {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                if let Some(inner) = broker.upgrade() {
+                    inner.storage_healthy.store(false, Ordering::Release);
+                }
+                return;
+            }
+        }
+        pending_sync = pending_topic_sync(&broker, &topic, relaxed_ack_mode);
+    }
+}
+
+fn pending_topic_sync(
+    broker: &Weak<BrokerInner>,
+    topic: &str,
+    relaxed_ack_mode: bool,
+) -> Option<PendingSync> {
+    if !relaxed_ack_mode {
+        return None;
+    }
+    broker
+        .upgrade()
+        .and_then(|inner| Broker { inner }.pending_topic_sync(topic))
+}
+
+async fn run_pending_sync(broker: &Weak<BrokerInner>, topic: &str) -> bool {
+    let Some(inner) = broker.upgrade() else {
+        return false;
+    };
+    let worker_broker = Broker { inner };
+    let worker_topic = topic.to_owned();
+    match tokio::task::spawn_blocking(move || worker_broker.sync_pending_topic(&worker_topic)).await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) | Err(_) => {
             if let Some(inner) = broker.upgrade() {
                 inner.storage_healthy.store(false, Ordering::Release);
             }
-            return;
+            false
         }
     }
+}
+
+fn sync_is_due(
+    pending: PendingSync,
+    message_limit: u64,
+    byte_limit: u64,
+    interval: Duration,
+) -> bool {
+    pending.messages >= message_limit
+        || pending.bytes >= byte_limit
+        || pending.since.elapsed() >= interval
 }
 
 async fn collect_group(
@@ -483,5 +687,41 @@ mod tests {
         let (group, carry) = collect_group(request(6 * 1024 * 1024), &mut receiver).await;
         assert_eq!(group.len(), 1);
         assert_eq!(carry.unwrap().encoded_bytes, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn relaxed_sync_uses_the_first_reached_threshold() {
+        let interval = Duration::from_millis(10);
+        let now = Instant::now();
+        assert!(sync_is_due(
+            PendingSync {
+                messages: 2_500,
+                bytes: 1,
+                since: now,
+            },
+            2_500,
+            8 * 1024 * 1024,
+            interval,
+        ));
+        assert!(sync_is_due(
+            PendingSync {
+                messages: 1,
+                bytes: 8 * 1024 * 1024,
+                since: now,
+            },
+            2_500,
+            8 * 1024 * 1024,
+            interval,
+        ));
+        assert!(sync_is_due(
+            PendingSync {
+                messages: 1,
+                bytes: 1,
+                since: now - interval,
+            },
+            2_500,
+            8 * 1024 * 1024,
+            interval,
+        ));
     }
 }

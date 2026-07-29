@@ -20,7 +20,17 @@ impl Broker {
                 .sort_by_key(|topic| std::cmp::Reverse(topic.state.lock().active_metadata_count()));
             let mut progressed = false;
             for topic in topics {
-                if topic.state.lock().spill_message_metadata()? > 0 {
+                let _commit_gate = topic.commit_gate.lock();
+                let (spilled, visibility_advanced) = {
+                    let mut state = topic.state.lock();
+                    let deliverable_before = state.deliverable_position();
+                    let spilled = state.spill_message_metadata()?;
+                    (spilled, state.deliverable_position() > deliverable_before)
+                };
+                if visibility_advanced {
+                    topic.signal();
+                }
+                if spilled > 0 {
                     progressed = true;
                 }
                 if let Some(reservation) = self.inner.message_index_cache.try_reserve(messages) {

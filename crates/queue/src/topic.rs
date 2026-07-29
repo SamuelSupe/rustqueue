@@ -19,13 +19,22 @@ use parking_lot::Mutex;
 use rustqueue_protocol::validate_name;
 use rustqueue_storage::{RecordHeader, RecordKind, SegmentLog};
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const MAX_CHANNELS_PER_TOPIC: usize = 1_024;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingSync {
+    pub messages: u64,
+    pub bytes: u64,
+    pub since: Instant,
+}
+
 pub(crate) struct TopicHandle {
+    pub commit_gate: Mutex<()>,
     pub state: Mutex<Topic>,
     pub wake: tokio::sync::watch::Sender<u64>,
 }
@@ -37,6 +46,12 @@ pub(crate) struct Topic {
     manifest: TopicManifest,
     log: SegmentLog,
     messages: MessageIndex,
+    position_gaps: Arc<[(u64, u64)]>,
+    deliverable_position: u64,
+    durable_position: u64,
+    unsynced_messages: u64,
+    unsynced_bytes: u64,
+    unsynced_since: Option<Instant>,
     channels: HashMap<String, ChannelRuntime>,
     max_ack_gap: usize,
     durable_channel_counters: bool,
@@ -69,6 +84,7 @@ impl TopicHandle {
         }
         topic.reconcile_unrouted_boundary()?;
         Ok(Arc::new(Self {
+            commit_gate: Mutex::new(()),
             state: Mutex::new(topic),
             wake,
         }))
@@ -101,6 +117,7 @@ impl TopicHandle {
         )?;
         let (wake, _) = tokio::sync::watch::channel(0);
         Ok(Arc::new(Self {
+            commit_gate: Mutex::new(()),
             state: Mutex::new(Topic {
                 name: name.into(),
                 directory: directory.into(),
@@ -108,6 +125,12 @@ impl TopicHandle {
                 manifest,
                 log,
                 messages: MessageIndex::new(index_cache),
+                position_gaps: Arc::from(Vec::new()),
+                deliverable_position: 0,
+                durable_position: 0,
+                unsynced_messages: 0,
+                unsynced_bytes: 0,
+                unsynced_since: None,
                 channels: HashMap::new(),
                 max_ack_gap,
                 durable_channel_counters: storage_feature_level >= 2,
@@ -198,6 +221,7 @@ impl Topic {
         let recovered_next = messages
             .last_position()
             .map_or(1, |position| position.saturating_add(1));
+        let deliverable_position = messages.last_position().unwrap_or(0);
         if manifest.next_position < recovered_next {
             manifest.next_position = recovered_next;
             store_atomic(&manifest_path, &manifest)?;
@@ -210,6 +234,12 @@ impl Topic {
             manifest,
             log,
             messages,
+            position_gaps: Arc::from(Vec::new()),
+            deliverable_position,
+            durable_position: deliverable_position,
+            unsynced_messages: 0,
+            unsynced_bytes: 0,
+            unsynced_since: None,
             channels: HashMap::new(),
             max_ack_gap,
             durable_channel_counters: storage_feature_level >= 2,
@@ -238,6 +268,40 @@ impl Topic {
                     durable_counters: self.durable_channel_counters,
                 },
             );
+        }
+        let recovered_next = self
+            .messages
+            .last_position()
+            .map_or(1, |position| position.saturating_add(1));
+        let channel_next = self
+            .channels
+            .values()
+            .map(|channel| channel.state.recovered_position_high_watermark())
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                BrokerError::InvalidRecord("channel position range is exhausted".into())
+            })?;
+        if self.manifest.next_position < channel_next {
+            self.manifest.next_position = channel_next;
+            store_atomic(&self.manifest_path, &self.manifest)?;
+            self.published_count = self.manifest.next_position.saturating_sub(1);
+        }
+        self.position_gaps = Arc::from(
+            self.messages
+                .position_gaps(self.manifest.next_position.saturating_sub(1)),
+        );
+        for channel in self.channels.values_mut() {
+            channel
+                .state
+                .set_absent_ranges(Arc::clone(&self.position_gaps));
+        }
+        if self.manifest.next_position > recovered_next && self.active_metadata_count() > 0 {
+            // A relaxed tail can disappear after its position was recorded by
+            // Topic metadata or a durable Channel command. Put the surviving
+            // prefix in its own segment so later appends preserve that gap.
+            self.spill_message_metadata()?;
         }
         Ok(())
     }
@@ -271,6 +335,7 @@ impl Topic {
             message_id: first_id,
             available_at_ms,
         };
+        let previous_last_position = self.last_position();
         let previous_segment = self.log.current_segment_path().to_path_buf();
         let parts = batch.parts();
         let location = self
@@ -284,22 +349,67 @@ impl Topic {
             .saturating_add(batch.entries.len() as u64);
         if previous_segment != self.log.current_segment_path() {
             self.persist_segment_index(&previous_segment)?;
+            self.durable_position = self.durable_position.max(previous_last_position);
+            self.deliverable_position = self.deliverable_position.max(previous_last_position);
+            self.unsynced_messages = 0;
+            self.unsynced_bytes = 0;
+            self.unsynced_since = None;
         }
         self.manifest.next_position = self
             .manifest
             .next_position
             .saturating_add(batch.entries.len() as u64);
+        if durable {
+            self.mark_durable_through(self.last_position());
+        }
         Ok(ids)
     }
 
-    pub fn sync_log(&self) -> Result<(), BrokerError> {
-        self.log.sync()?;
-        Ok(())
+    pub fn clone_log_for_sync(&self) -> Result<File, BrokerError> {
+        Ok(self.log.clone_current_for_sync()?)
+    }
+
+    pub fn mark_log_sync_failed(&self) {
+        self.log.mark_sync_failed();
+    }
+
+    pub fn mark_deliverable_through(&mut self, position: u64) {
+        debug_assert!(position <= self.last_position());
+        self.deliverable_position = self.deliverable_position.max(position);
+    }
+
+    pub fn record_unsynced(&mut self, messages: usize, bytes: usize) {
+        if messages == 0 || self.durable_position >= self.written_position() {
+            return;
+        }
+        self.unsynced_messages = self.unsynced_messages.saturating_add(messages as u64);
+        self.unsynced_bytes = self.unsynced_bytes.saturating_add(bytes as u64);
+        self.unsynced_since.get_or_insert_with(Instant::now);
+    }
+
+    pub fn pending_sync(&self) -> Option<PendingSync> {
+        (self.unsynced_messages > 0).then(|| PendingSync {
+            messages: self.unsynced_messages,
+            bytes: self.unsynced_bytes,
+            since: self.unsynced_since.unwrap_or_else(Instant::now),
+        })
+    }
+
+    pub fn mark_durable_through(&mut self, position: u64) {
+        debug_assert!(position <= self.last_position());
+        self.durable_position = self.durable_position.max(position);
+        self.deliverable_position = self.deliverable_position.max(position);
+        if self.durable_position >= self.written_position() {
+            self.unsynced_messages = 0;
+            self.unsynced_bytes = 0;
+            self.unsynced_since = None;
+        }
     }
 
     fn seal_log(&mut self) -> Result<(), BrokerError> {
         let previous_segment = self.log.current_segment_path().to_path_buf();
         self.log.seal()?;
+        self.mark_durable_through(self.last_position());
         if previous_segment != self.log.current_segment_path() {
             self.persist_segment_index(&previous_segment)?;
         }
@@ -337,6 +447,12 @@ impl Topic {
     }
     pub fn last_position(&self) -> u64 {
         self.manifest.next_position.saturating_sub(1)
+    }
+    fn written_position(&self) -> u64 {
+        self.messages.last_position().unwrap_or(0)
+    }
+    pub fn deliverable_position(&self) -> u64 {
+        self.deliverable_position
     }
 
     fn has_durable_channels(&self) -> bool {
@@ -422,7 +538,8 @@ impl Topic {
                 .retain_from_timestamp(cutoff, self.manifest.next_position)
                 .saturating_sub(1)
         };
-        let state = ChannelState::new(name.into(), barrier, ephemeral, self.max_ack_gap);
+        let mut state = ChannelState::new(name.into(), barrier, ephemeral, self.max_ack_gap);
+        state.set_absent_ranges(Arc::clone(&self.position_gaps));
         let store = if ephemeral {
             None
         } else {
@@ -484,7 +601,7 @@ impl Topic {
     pub fn channel_counts(&mut self, channel: &str) -> Result<(u64, u64, u64), BrokerError> {
         let now_ms = now_ms();
         let scheduled = self.messages.deferred_positions(now_ms);
-        let last_position = self.last_position();
+        let last_position = self.deliverable_position;
         let channel = self
             .channels
             .get(channel)

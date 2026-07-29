@@ -84,7 +84,9 @@ impl Broker {
         let Some(handle) = self.inner.topics.read().get(name).cloned() else {
             return Ok(false);
         };
+        let commit_gate = handle.commit_gate.lock();
         handle.state.lock().mark_deleted()?;
+        drop(commit_gate);
         self.inner.topics.write().remove(name);
         let directory = topic_directory(&self.inner.config.data_path, name);
         if Arc::strong_count(&handle) == 1

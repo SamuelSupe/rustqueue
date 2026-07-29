@@ -48,6 +48,14 @@ max_topics = 10000
 # Each topic accepts at most 1024 channels to bound channel WAL/index growth.
 max_publish_workers = 1024
 publish_worker_idle_seconds = 60
+# "durable" returns PUB success and exposes messages only after local fsync.
+# "write_ack" returns after append but exposes messages only after background fsync.
+# "nsq_relaxed" returns and exposes messages after append, before background fsync.
+publish_ack_mode = "durable"
+# Relaxed modes sync when the first message, byte, or time threshold is reached.
+relaxed_sync_messages = 2500
+relaxed_sync_bytes = 8388608
+relaxed_sync_interval_ms = 10
 # Lets consumers discover a newly owning broker without losing the first messages.
 bootstrap_retention_seconds = 90
 message_retention_seconds = 0

@@ -8,16 +8,17 @@
 [![Kubernetes](https://img.shields.io/badge/kubernetes-1.28%2B-326CE5.svg)](https://kubernetes.io/)
 
 [Architecture](docs/architecture/share-nothing-v7.md) ·
+[NSQ performance boundaries](docs/architecture/nsq-performance.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.8.2 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2)
+[v0.8.3 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.3)
 
-RustQueue 0.8.2 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.8.3 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.8.2](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2).
+> Current release: [v0.8.3](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.3).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -29,7 +30,7 @@ The complete architecture and reliability contract is documented in
 
 | Area | Contract |
 | --- | --- |
-| Durability | `PUB`/`MPUB`/`DPUB` return only after local segment `fsync`; `FIN`/`REQ` use a durable channel WAL |
+| Durability | Default `PUB`/`MPUB`/`DPUB` return after local segment `fsync`; opt-in `write_ack` and `nsq_relaxed` return after append with explicit crash-loss windows; `FIN`/`REQ` use a durable channel WAL |
 | Delivery | At least once; a restart may redeliver a message without a durable `FIN` |
 | Compatibility | NSQ V2 core commands, lookup, standard Stats fields, TLS/mTLS, AUTH, Snappy, Deflate, fan-out and ephemeral channels |
 | Kodo | Default-off compatibility profile: stable publish Gateways from `/nodes`, real Broker owners from `/lookup`, and no upstream Kodo change |
@@ -43,56 +44,45 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.8.2
+## What's new in 0.8.3
 
-- **NSQ-aligned no-Channel durability.** A Topic with no durable Channel now
-  persists its unrouted start position and normal GC cannot cross it. The first
-  durable Channel receives every acknowledged publish from that interval, even
-  when creation happens after the bootstrap window or a Broker restart.
-- **Direct-Broker preflight.** Reproducible OrbStack tooling compares the exact
-  `v0.8.1` tag with one candidate commit using fresh volumes, fixed
-  2 vCPU / 2 GiB limits and alternating paired runs. RustQueue 0.8.2 completed
-  short correctness and regression preflights but does not claim completion of
-  the optional 60-run performance qualification.
-- **Bounded Channel coalescing.** The durable Channel worker now keeps
-  collecting `FIN` and `REQ` requests throughout its existing bounded 1 ms
-  window instead of committing at the first transient queue gap. The
-  64-request ceiling, channel WAL `fsync` boundary and at-least-once contract
-  are unchanged. The mechanism and short preflight are not a formal throughput
-  guarantee.
-- **Reliable benchmark shutdown and warmup.** The benchmark preserves a
-  partially read NSQ frame while closing consumers, and a consumer warmup is
-  fully drained before measurement. Missing, duplicate or non-drained delivery
-  remains a hard failure.
-- **Explicit regression policy.** Raw write and end-to-end sustainable
-  throughput fail only when a one-sided paired 95% bootstrap interval is
-  wholly below `0.95`. Fixed-rate PUB ACK p99 and comparable fixed-rate peak
-  RSS fail only when the interval is wholly above `1.10`.
+- **Deadline-indexed delivery.** Channel and TCP-session leases now use an
+  ordered deadline index instead of rescanning every in-flight delivery on
+  each fetch or session event. `TOUCH`, `FIN`, `REQ`, completion, and disconnect
+  update the same index, so high-RDY consumers avoid stale timer buildup.
+- **NSQ scheduler parity.** NSQ uses an in-flight priority queue; RustQueue now
+  matches that scheduler shape while keeping token-checked at-least-once
+  delivery and the durable Channel WAL acknowledgement boundary.
+- **Durability-aware comparison.** Benchmark documentation now distinguishes
+  RustQueue's acknowledgement-after-fsync semantics from NSQ diskqueue writes
+  and its optional memory queue. `--sync-every=1` is reported as an NSQ write
+  profile, not as an equal durability claim.
+- **No format migration.** The disk format remains v7, and the NSQ/Kodo wire
+  contract is unchanged from 0.8.2.
 
-The patch keeps disk format v7 and remains wire-compatible with the NSQ/Kodo
-contract from 0.8.1. See the
-[v0.8.2 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2)
-for the validation boundaries.
+See the [v0.8.3 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.3)
+and [NSQ performance boundaries](docs/architecture/nsq-performance.md) for
+the contract and benchmark interpretation.
 
-## Download 0.8.2
+## Download 0.8.3
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.8.2-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.2-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.2-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.8.2.tgz` | Helm Chart |
-| `SHA256SUMS-0.8.2` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.8.3-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.3-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.3-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.8.3.tgz` | Helm Chart |
+| `SHA256SUMS-0.8.3` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.2/rustqueue-0.8.2-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.2/SHA256SUMS-0.8.2"
-sha256sum --check --ignore-missing SHA256SUMS-0.8.2
-tar -xzf "rustqueue-0.8.2-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.3/rustqueue-0.8.3-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.3/SHA256SUMS-0.8.3"
+sha256sum --check --ignore-missing SHA256SUMS-0.8.3
+tar -xzf "rustqueue-0.8.3-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -111,7 +101,10 @@ consumer -> discovery /lookup -> every broker that owns the topic
 operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 ```
 
-- A successful `PUB`, `MPUB`, or `DPUB` has passed local segment `fsync`.
+- In the default `durable` mode, a successful `PUB`, `MPUB`, or `DPUB` has
+  passed local segment `fsync`. `write_ack` returns after append but delays
+  consumption until background fsync; `nsq_relaxed` returns and exposes the
+  append immediately. Both relaxed modes can lose their unsynced tail.
 - Concurrent publishes to one topic use a bounded group commit (up to 64
   requests or 8 MiB, with at most 1 ms coalescing delay) and all wait for the
   same durable boundary before receiving `OK`.
@@ -230,7 +223,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.8.2 \
+  --set queue.image=registry.example/rustqueue:0.8.3 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -467,7 +460,7 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.8.2 CI/CD workflow publishes a Release only after the non-Kubernetes
+The v0.8.3 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one
@@ -546,13 +539,24 @@ transfers only small revision/readiness heads; nevertheless a consumer still
 needs one connection per actual Topic owner. This is a share-nothing cost, not
 an unbounded or zero-cost scaling claim.
 
-Latency histograms cover publish and channel-WAL fsync, publish and FIN/REQ
-group-commit queueing, publish and channel ACK, payload reads, scrub/GC, proxy
-backend calls, and discovery registry polling. Queue aggregates have fixed
-cardinality by default; `[metrics].detailed_queue_metrics` enables bounded
+Latency histograms cover publish and channel-WAL fsync, Topic-lock wait/hold
+for publish and delivery reservation, publish and FIN/REQ group-commit
+queueing, publish and channel ACK, payload reads, scrub/GC, proxy backend
+calls, and discovery registry polling. Queue aggregates have fixed cardinality
+by default; `[metrics].detailed_queue_metrics` enables bounded
 per-topic/channel series up to `max_detailed_series`.
 Delivery-budget bytes, waiters and cumulative waits are exported as bounded
 aggregate gauges/counters.
+
+`[queue].publish_ack_mode` defaults to `"durable"`: successful publish commands
+follow local segment `fsync`. `"write_ack"` returns after append while consumers
+remain bounded by `last_durable_position`; `"nsq_relaxed"` also exposes the
+appended tail immediately. Background sync runs at the first of
+`relaxed_sync_messages`, `relaxed_sync_bytes`, or `relaxed_sync_interval_ms`.
+`rustqueue_publish_unsynced_messages`, `rustqueue_publish_unsynced_bytes`, and
+`rustqueue_publish_sync_lag_seconds` expose the crash-loss window, with bounded
+per-Topic variants when detailed metrics are enabled. A sync failure stops new
+writes. Keep both relaxed profiles separate from durable-PUB results.
 
 ## Storage and upgrades
 

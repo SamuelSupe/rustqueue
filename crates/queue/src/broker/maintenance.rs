@@ -48,13 +48,21 @@ impl Broker {
             };
             let mut removed = 0;
             for offset in 0..selected {
-                let (_, topic) = &topics[(start + offset) % topics.len()];
-                let mut topic = topic.state.lock();
+                let (_, handle) = &topics[(start + offset) % topics.len()];
+                let _commit_gate = handle.commit_gate.lock();
+                let mut topic = handle.state.lock();
                 let retained = broker.inner.payload_reader.retained_paths();
                 let name = topic.name.clone();
                 let ids = outbox_ids.get(&name).cloned().unwrap_or_default();
-                removed +=
+                let deliverable_before = topic.deliverable_position();
+                let compacted =
                     topic.compact(broker.inner.config.bootstrap_retention, &retained, &ids)?;
+                let visibility_advanced = topic.deliverable_position() > deliverable_before;
+                drop(topic);
+                if visibility_advanced {
+                    handle.signal();
+                }
+                removed += compacted;
             }
             broker.inner.payload_reader.prune_deleted_files();
             Ok(removed)
@@ -77,10 +85,17 @@ impl Broker {
             let Some((_, topic)) = candidate else {
                 return Ok(None);
             };
-            let mut topic = topic.state.lock();
+            let _commit_gate = topic.commit_gate.lock();
+            let mut state = topic.state.lock();
             let retained = broker.inner.payload_reader.retained_paths();
-            let result = topic
+            let deliverable_before = state.deliverable_position();
+            let result = state
                 .protective_evict_oldest(&broker.inner.config.data_path.join("audit"), &retained)?;
+            let visibility_advanced = state.deliverable_position() > deliverable_before;
+            drop(state);
+            if visibility_advanced {
+                topic.signal();
+            }
             broker.inner.payload_reader.prune_deleted_files();
             Ok(result)
         })
@@ -180,7 +195,9 @@ impl Broker {
         let broker = self.clone();
         self.storage_task(move || {
             for topic in broker.inner.topics.read().values() {
+                let _commit_gate = topic.commit_gate.lock();
                 topic.state.lock().sync()?;
+                topic.signal();
             }
             Ok(())
         })

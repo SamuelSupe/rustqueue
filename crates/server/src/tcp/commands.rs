@@ -240,14 +240,14 @@ pub(super) async fn process_command(
             if let Err(error) = result {
                 write_broker_error(writer, "E_FIN_FAILED", error).await?;
             } else {
-                state.in_flight.insert(
+                state.record_delivery(
                     id,
                     InFlightDelivery {
                         deadline,
                         ..delivery
                     },
                 );
-                state.pending_channel_ops.insert(id);
+                state.mark_channel_operation_pending(id);
             }
         }
         Command::Requeue { id, delay_ms } => {
@@ -284,14 +284,14 @@ pub(super) async fn process_command(
             if let Err(error) = result {
                 write_broker_error(writer, "E_REQ_FAILED", error).await?;
             } else {
-                state.in_flight.insert(
+                state.record_delivery(
                     id,
                     InFlightDelivery {
                         deadline,
                         ..delivery
                     },
                 );
-                state.pending_channel_ops.insert(id);
+                state.mark_channel_operation_pending(id);
             }
         }
         Command::Touch(id) => {
@@ -313,7 +313,7 @@ pub(super) async fn process_command(
             );
             match touch_result {
                 Ok(deadline) => {
-                    state.in_flight.insert(
+                    state.record_delivery(
                         id,
                         InFlightDelivery {
                             deadline,

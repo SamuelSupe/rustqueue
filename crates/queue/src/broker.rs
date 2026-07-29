@@ -31,14 +31,64 @@ use rustqueue_storage::{
     binary_capabilities, ensure_data_format, prepare_compatibility, BinaryCapabilities,
     CompatibilityState, StorageError, BASE_STORAGE_FEATURE_LEVEL,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const FEATURE_LEVEL_2_MAX_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
+pub const RELAXED_SYNC_MIN_BYTES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishAckMode {
+    #[default]
+    Durable,
+    /// Acknowledge after append, but do not expose the message to consumers
+    /// until a background fsync makes it durable.
+    WriteAck,
+    /// Acknowledge and expose the message after append, before background fsync.
+    NsqRelaxed,
+}
+
+impl PublishAckMode {
+    pub const fn is_relaxed(self) -> bool {
+        matches!(self, Self::WriteAck | Self::NsqRelaxed)
+    }
+
+    pub const fn exposes_unsynced(self) -> bool {
+        matches!(self, Self::NsqRelaxed)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::WriteAck => "write_ack",
+            Self::NsqRelaxed => "nsq_relaxed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error)]
+#[error("publish acknowledgement mode must be durable, write_ack, or nsq_relaxed")]
+pub struct InvalidPublishAckMode;
+
+impl FromStr for PublishAckMode {
+    type Err = InvalidPublishAckMode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "durable" => Ok(Self::Durable),
+            "write_ack" => Ok(Self::WriteAck),
+            "nsq_relaxed" => Ok(Self::NsqRelaxed),
+            _ => Err(InvalidPublishAckMode),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BrokerConfig {
@@ -52,6 +102,10 @@ pub struct BrokerConfig {
     pub max_topics: usize,
     pub max_publish_workers: usize,
     pub publish_worker_idle: Duration,
+    pub publish_ack_mode: PublishAckMode,
+    pub relaxed_sync_messages: usize,
+    pub relaxed_sync_bytes: usize,
+    pub relaxed_sync_interval: Duration,
     pub entry_cache_bytes: usize,
     pub message_index_cache_bytes: usize,
     pub payload_read_workers: usize,
@@ -75,6 +129,10 @@ impl Default for BrokerConfig {
             max_topics: 10_000,
             max_publish_workers: 1_024,
             publish_worker_idle: Duration::from_secs(60),
+            publish_ack_mode: PublishAckMode::Durable,
+            relaxed_sync_messages: 2_500,
+            relaxed_sync_bytes: 8 * 1024 * 1024,
+            relaxed_sync_interval: Duration::from_millis(10),
             entry_cache_bytes: 64 * 1024 * 1024,
             message_index_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
@@ -193,14 +251,20 @@ impl Broker {
         if config.max_topics == 0
             || config.max_publish_workers == 0
             || config.publish_worker_idle.is_zero()
+            || (config.publish_ack_mode.is_relaxed()
+                && (config.relaxed_sync_messages == 0
+                    || config.relaxed_sync_bytes < RELAXED_SYNC_MIN_BYTES
+                    || config.relaxed_sync_interval.is_zero()))
         {
             return Err(BrokerError::InvalidRecord(
-                "topic and publish worker limits must be greater than zero".into(),
+                "topic and publish worker limits must be greater than zero; relaxed sync requires at least one message, 4096 bytes, and a non-zero interval"
+                    .into(),
             ));
         }
         let now = Instant::now();
         if now.checked_add(config.message_timeout).is_none()
             || now.checked_add(config.publish_worker_idle).is_none()
+            || now.checked_add(config.relaxed_sync_interval).is_none()
         {
             return Err(BrokerError::InvalidRecord(
                 "broker timeouts exceed the platform timer range".into(),
@@ -399,6 +463,7 @@ impl Broker {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
             let handle = broker.get_or_create_topic_locked(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
             if handle
                 .state
                 .lock()
@@ -420,11 +485,9 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            broker
-                .topic(&topic)?
-                .state
-                .lock()
-                .delete_channel(&channel)?;
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            handle.state.lock().delete_channel(&channel)?;
             broker.bump_registry()?;
             Ok(())
         })
@@ -438,7 +501,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, None)?;
-            broker.topic(&topic)?.state.lock().set_paused(paused)
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().set_paused(paused);
+            result
         })
         .await
     }
@@ -456,11 +522,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            broker
-                .topic(&topic)?
-                .state
-                .lock()
-                .set_channel_paused(&channel, paused)
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().set_channel_paused(&channel, paused);
+            result
         })
         .await
     }
@@ -472,7 +537,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, None)?;
-            broker.topic(&topic)?.state.lock().empty_topic()
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().empty_topic();
+            result
         })
         .await
     }
@@ -485,7 +553,10 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            broker.topic(&topic)?.state.lock().empty_channel(&channel)
+            let handle = broker.topic(&topic)?;
+            let _commit_gate = handle.commit_gate.lock();
+            let result = handle.state.lock().empty_channel(&channel);
+            result
         })
         .await
     }

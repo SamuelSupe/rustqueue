@@ -5,6 +5,9 @@
 {{- if and .Values.queue.kodoCompatibility.enabled (ne .Values.queue.imagePullPolicy "Never") (not (regexMatch "@sha256:[a-f0-9]{64}$" .Values.queue.image)) }}
 {{- fail "queue.kodoCompatibility.enabled requires queue.image pinned by @sha256, or queue.imagePullPolicy=Never for a preloaded local image" }}
 {{- end }}
+{{- if and .Values.queue.kodoCompatibility.enabled (ne .Values.queue.publishAckMode "durable") }}
+{{- fail "queue.kodoCompatibility.enabled requires queue.publishAckMode=durable" }}
+{{- end }}
 apiVersion: rustqueue.io/v1alpha1
 kind: RustQueue
 metadata:
@@ -35,6 +38,10 @@ spec:
   maxTopics: {{ .Values.queue.maxTopics | int64 }}
   maxPublishWorkers: {{ .Values.queue.maxPublishWorkers | int64 }}
   publishWorkerIdleSeconds: {{ .Values.queue.publishWorkerIdleSeconds | int64 }}
+  publishAckMode: {{ .Values.queue.publishAckMode | quote }}
+  relaxedSyncMessages: {{ .Values.queue.relaxedSyncMessages | int64 }}
+  relaxedSyncBytes: {{ .Values.queue.relaxedSyncBytes | int64 }}
+  relaxedSyncIntervalMs: {{ .Values.queue.relaxedSyncIntervalMs | int64 }}
   detailedQueueMetrics: {{ .Values.queue.detailedQueueMetrics }}
   maxDetailedMetricSeries: {{ .Values.queue.maxDetailedMetricSeries | int64 }}
   consoleManagementEnabled: {{ and .Values.console.enabled .Values.console.management.enabled }}

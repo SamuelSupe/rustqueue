@@ -534,7 +534,7 @@ fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
         ""
     };
     let mut output = format!(
-        "{kodo_network}[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmax_segment_bytes = {max_segment_bytes}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\nmaintenance_startup_delay_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\n\n[limits]\nmax_body_bytes = {max_body_bytes}\nnode_publish_inflight_bytes = {node_publish_inflight_bytes}\nconnection_publish_inflight_bytes = {connection_publish_inflight_bytes}\nnode_delivery_inflight_bytes = {}\nconnection_delivery_inflight_bytes = {}\ndisconnect_on_retriable_publish_error = false\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\n{publish_token}registry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\n{kodo_cleanup_token}console_management_enabled = {}\nkodo_cleanup_enabled = {}\n# secret: {secret_name}\n",
+        "{kodo_network}[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmax_segment_bytes = {max_segment_bytes}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\nmaintenance_startup_delay_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\npublish_ack_mode = \"{}\"\nrelaxed_sync_messages = {}\nrelaxed_sync_bytes = {}\nrelaxed_sync_interval_ms = {}\n\n[limits]\nmax_body_bytes = {max_body_bytes}\nnode_publish_inflight_bytes = {node_publish_inflight_bytes}\nconnection_publish_inflight_bytes = {connection_publish_inflight_bytes}\nnode_delivery_inflight_bytes = {}\nconnection_delivery_inflight_bytes = {}\ndisconnect_on_retriable_publish_error = false\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\n{publish_token}registry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\n{kodo_cleanup_token}console_management_enabled = {}\nkodo_cleanup_enabled = {}\n# secret: {secret_name}\n",
         cluster.spec.storage_feature_level,
         cluster.spec.min_free_bytes,
         cluster.spec.disk_high_watermark_percent,
@@ -547,6 +547,10 @@ fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
         cluster.spec.max_topics,
         cluster.spec.max_publish_workers,
         cluster.spec.publish_worker_idle_seconds,
+        cluster.spec.publish_ack_mode,
+        cluster.spec.relaxed_sync_messages,
+        cluster.spec.relaxed_sync_bytes,
+        cluster.spec.relaxed_sync_interval_ms,
         cluster.spec.node_delivery_inflight_bytes,
         cluster.spec.connection_delivery_inflight_bytes,
         cluster.spec.detailed_queue_metrics,
@@ -650,6 +654,10 @@ mod tests {
                 max_topics: 10_000,
                 max_publish_workers: 1_024,
                 publish_worker_idle_seconds: 60,
+                publish_ack_mode: "durable".into(),
+                relaxed_sync_messages: 2_500,
+                relaxed_sync_bytes: 8 * 1024 * 1024,
+                relaxed_sync_interval_ms: 10,
                 detailed_queue_metrics: false,
                 max_detailed_metric_series: 1_000,
                 registry_secret_name: None,
@@ -710,6 +718,10 @@ mod tests {
                 config.contains("console_token_file")
                     && config.contains("detailed_queue_metrics = false")
                     && config.contains("max_detailed_series = 1000")
+                    && config.contains("publish_ack_mode = \"durable\"")
+                    && config.contains("relaxed_sync_messages = 2500")
+                    && config.contains("relaxed_sync_bytes = 8388608")
+                    && config.contains("relaxed_sync_interval_ms = 10")
                     && config.contains("maintenance_startup_delay_seconds = 30")
                     && config.contains("node_delivery_inflight_bytes = 536870912")
                     && config.contains("connection_delivery_inflight_bytes = 33554432")

@@ -80,6 +80,10 @@ helm-lint:
 		--set queue.imagePullPolicy=Never
 	! helm template rustqueue deploy/helm/rustqueue \
 		--set queue.kodoCompatibility.cleanupEnabled=true
+	! helm template rustqueue deploy/helm/rustqueue \
+		--set queue.kodoCompatibility.enabled=true \
+		--set queue.imagePullPolicy=Never \
+		--set queue.publishAckMode=nsq_relaxed
 	! rg -n 'x-kubernetes-preserve-unknown-fields:[[:space:]]*false' \
 		deploy/helm/rustqueue/crds
 

@@ -3,6 +3,7 @@ use crate::model::ChannelStats;
 use crate::BrokerError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,12 +78,16 @@ pub(crate) struct ChannelState {
     next_position: u64,
     in_flight: HashMap<u64, InFlight>,
     in_flight_ids: HashMap<u64, u64>,
+    in_flight_deadlines: BTreeSet<(Instant, u64, u64)>,
     redelivery: BTreeSet<u64>,
     attempts: HashMap<u64, u16>,
     next_token: u64,
     max_ack_gap: usize,
     requeue_count: u64,
     timeout_count: u64,
+    // Rebuilt from Topic segment ranges on open. Lost relaxed positions are
+    // never reused, so this shared index needs no additional v7 persistence.
+    absent_ranges: Arc<[(u64, u64)]>,
 }
 
 pub(crate) enum MessageAvailability {
@@ -111,12 +116,14 @@ impl ChannelState {
             next_position: barrier_position.saturating_add(1),
             in_flight: HashMap::new(),
             in_flight_ids: HashMap::new(),
+            in_flight_deadlines: BTreeSet::new(),
             redelivery: BTreeSet::new(),
             attempts: HashMap::new(),
             next_token: 1,
             max_ack_gap: max_ack_gap.max(1),
             requeue_count: 0,
             timeout_count: 0,
+            absent_ranges: Arc::from(Vec::new()),
         }
     }
 
@@ -149,12 +156,14 @@ impl ChannelState {
             next_position,
             in_flight: HashMap::new(),
             in_flight_ids: HashMap::new(),
+            in_flight_deadlines: BTreeSet::new(),
             redelivery,
             attempts: checkpoint.attempts.into_iter().collect(),
             next_token: 1,
             max_ack_gap: max_ack_gap.max(1),
             requeue_count: checkpoint.requeue_count,
             timeout_count: checkpoint.timeout_count,
+            absent_ranges: Arc::from(Vec::new()),
         })
     }
 
@@ -242,6 +251,13 @@ impl ChannelState {
         let mut absent = Vec::new();
         let redelivery: Vec<_> = self.redelivery.iter().copied().collect();
         for position in redelivery {
+            if self.is_absent(position) {
+                self.redelivery.remove(&position);
+                self.requeued_until.remove(&position);
+                self.attempts.remove(&position);
+                self.advance_ack_floor();
+                continue;
+            }
             if self
                 .requeued_until
                 .get(&position)
@@ -258,7 +274,10 @@ impl ChannelState {
                     return NextCandidate::Ready(position);
                 }
                 MessageAvailability::Missing => return NextCandidate::Load(position),
-                MessageAvailability::Absent => absent.push(position),
+                MessageAvailability::Absent => {
+                    absent.push(position);
+                    self.acknowledge(position);
+                }
                 MessageAvailability::Ready(_) => {}
             }
         }
@@ -267,11 +286,12 @@ impl ChannelState {
             self.requeued_until.remove(&position);
         }
         while self.next_position <= last_position {
-            if self.next_position
-                > self
-                    .ack_floor_position
-                    .saturating_add(self.max_ack_gap as u64)
-            {
+            if let Some(end) = self.absent_range_end(self.next_position) {
+                self.next_position = end.saturating_add(1);
+                self.advance_ack_floor();
+                continue;
+            }
+            if self.present_distance(self.next_position) > self.max_ack_gap as u64 {
                 return NextCandidate::None;
             }
             let position = self.next_position;
@@ -288,6 +308,7 @@ impl ChannelState {
                 MessageAvailability::Missing => return NextCandidate::Load(position),
                 MessageAvailability::Absent => {
                     self.next_position = self.next_position.saturating_add(1);
+                    self.acknowledge(position);
                     continue;
                 }
             };
@@ -302,19 +323,50 @@ impl ChannelState {
         NextCandidate::None
     }
 
+    pub fn set_absent_ranges(&mut self, ranges: Arc<[(u64, u64)]>) {
+        debug_assert!(ranges
+            .windows(2)
+            .all(|pair| pair[0].0 <= pair[0].1 && pair[0].1 < pair[1].0));
+        debug_assert!(ranges.last().is_none_or(|range| range.0 <= range.1));
+        debug_assert!(self.in_flight.is_empty());
+        self.acknowledged
+            .retain(|position| !position_in_ranges(&ranges, *position));
+        self.redelivery
+            .retain(|position| !position_in_ranges(&ranges, *position));
+        self.requeued_until
+            .retain(|position, _| !position_in_ranges(&ranges, *position));
+        self.attempts
+            .retain(|position, _| !position_in_ranges(&ranges, *position));
+        self.absent_ranges = ranges;
+        self.advance_ack_floor();
+    }
+
+    pub fn recovered_position_high_watermark(&self) -> u64 {
+        self.ack_floor_position
+            .max(self.acknowledged.last().copied().unwrap_or(0))
+            .max(
+                self.requeued_until
+                    .last_key_value()
+                    .map_or(0, |(position, _)| *position),
+            )
+            .max(self.attempts.keys().copied().max().unwrap_or(0))
+    }
+
     pub fn reserve(&mut self, position: u64, id: u64, timeout: Duration) -> (u64, u16) {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
         let attempts = self.attempts.entry(position).or_insert(0);
         *attempts = attempts.saturating_add(1);
+        let deadline = Instant::now() + timeout;
         self.in_flight.insert(
             position,
             InFlight {
                 id,
-                deadline: Instant::now() + timeout,
+                deadline,
                 token,
             },
         );
+        self.in_flight_deadlines.insert((deadline, position, token));
         self.in_flight_ids.insert(id, position);
         (token, *attempts)
     }
@@ -369,10 +421,17 @@ impl ChannelState {
     }
 
     pub fn touch_until(&mut self, position: u64, deadline: Instant) -> bool {
-        let Some(flight) = self.in_flight.get_mut(&position) else {
+        let Some(flight) = self.in_flight.get(&position) else {
             return false;
         };
-        flight.deadline = deadline;
+        self.in_flight_deadlines
+            .remove(&(flight.deadline, position, flight.token));
+        let token = flight.token;
+        self.in_flight
+            .get_mut(&position)
+            .expect("in-flight delivery remains present")
+            .deadline = deadline;
+        self.in_flight_deadlines.insert((deadline, position, token));
         true
     }
 
@@ -393,10 +452,16 @@ impl ChannelState {
     }
 
     fn expired_positions(&self, now: Instant) -> Vec<u64> {
-        self.in_flight
-            .iter()
-            .filter_map(|(position, flight)| (flight.deadline <= now).then_some(*position))
+        self.in_flight_deadlines
+            .range(..=(now, u64::MAX, u64::MAX))
+            .map(|(_, position, _)| *position)
             .collect()
+    }
+
+    fn has_expired_in_flight(&self, now: Instant) -> bool {
+        self.in_flight_deadlines
+            .first()
+            .is_some_and(|(deadline, _, _)| *deadline <= now)
     }
 
     fn expire_positions(&mut self, positions: &[u64]) {
@@ -439,7 +504,11 @@ impl ChannelState {
         scheduled: &BTreeSet<u64>,
         now_ms: i64,
     ) -> (u64, u64, u64, u64) {
-        let total = last_position.saturating_sub(self.ack_floor_position);
+        let total = last_position
+            .saturating_sub(self.ack_floor_position)
+            .saturating_sub(
+                self.absent_count(self.ack_floor_position.saturating_add(1), last_position),
+            );
         let scheduled_count = scheduled
             .iter()
             .filter(|position| self.is_outstanding(**position, last_position))
@@ -464,6 +533,7 @@ impl ChannelState {
     fn is_outstanding(&self, position: u64, last_position: u64) -> bool {
         position > self.ack_floor_position
             && position <= last_position
+            && !self.is_absent(position)
             && !self.acknowledged.contains(&position)
             && !self.in_flight.contains_key(&position)
     }
@@ -477,26 +547,89 @@ impl ChannelState {
             return;
         }
         self.acknowledged.insert(position);
-        while self
-            .acknowledged
-            .remove(&self.ack_floor_position.saturating_add(1))
-        {
-            self.ack_floor_position = self.ack_floor_position.saturating_add(1);
+        self.advance_ack_floor();
+    }
+
+    fn advance_ack_floor(&mut self) {
+        loop {
+            let next = self.ack_floor_position.saturating_add(1);
+            if next == self.ack_floor_position {
+                break;
+            }
+            if let Some(end) = self.absent_range_end(next) {
+                self.ack_floor_position = end;
+                continue;
+            }
+            if self.acknowledged.remove(&next) {
+                self.ack_floor_position = next;
+                continue;
+            }
+            break;
         }
+        self.next_position = self
+            .next_position
+            .max(self.ack_floor_position.saturating_add(1));
+    }
+
+    fn is_absent(&self, position: u64) -> bool {
+        self.absent_range_end(position).is_some()
+    }
+
+    fn absent_range_end(&self, position: u64) -> Option<u64> {
+        let index = self
+            .absent_ranges
+            .partition_point(|(_, end)| *end < position);
+        self.absent_ranges
+            .get(index)
+            .filter(|(start, _)| position >= *start)
+            .map(|(_, end)| *end)
+    }
+
+    fn absent_count(&self, first: u64, last: u64) -> u64 {
+        if first > last {
+            return 0;
+        }
+        self.absent_ranges
+            .iter()
+            .map(|(range_first, range_last)| {
+                let overlap_first = first.max(*range_first);
+                let overlap_last = last.min(*range_last);
+                if overlap_first <= overlap_last {
+                    overlap_last.saturating_sub(overlap_first).saturating_add(1)
+                } else {
+                    0
+                }
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+
+    fn present_distance(&self, position: u64) -> u64 {
+        position
+            .saturating_sub(self.ack_floor_position)
+            .saturating_sub(self.absent_count(self.ack_floor_position.saturating_add(1), position))
     }
 
     fn remove_in_flight(&mut self, position: u64) -> bool {
         let Some(delivery) = self.in_flight.remove(&position) else {
             return false;
         };
+        self.in_flight_deadlines
+            .remove(&(delivery.deadline, position, delivery.token));
         self.in_flight_ids.remove(&delivery.id);
         true
     }
 }
 
+fn position_in_ranges(ranges: &[(u64, u64)], position: u64) -> bool {
+    let index = ranges.partition_point(|(_, end)| *end < position);
+    ranges
+        .get(index)
+        .is_some_and(|(start, _)| position >= *start)
+}
+
 impl ChannelRuntime {
     pub fn has_expired_in_flight(&self) -> bool {
-        !self.state.expired_positions(Instant::now()).is_empty()
+        self.state.has_expired_in_flight(Instant::now())
     }
 
     pub fn expire_in_flight(&mut self) -> Result<usize, BrokerError> {
@@ -529,6 +662,45 @@ impl ChannelRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovered_position_gaps_do_not_consume_the_ack_window() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 2);
+        channel.set_absent_ranges(Arc::from(vec![(2, 10)]));
+        let stats = channel.stats(11, &BTreeSet::new(), i64::MAX);
+        assert_eq!(stats.depth, 2);
+        assert_eq!(stats.message_count, 11);
+
+        assert!(matches!(
+            channel.next_candidate(0, 11, |position| match position {
+                1 | 11 => MessageAvailability::Ready(0),
+                _ => panic!("known gaps must not be looked up"),
+            }),
+            NextCandidate::Ready(1)
+        ));
+        channel.reserve(1, 100, Duration::from_secs(30));
+        assert!(matches!(
+            channel.next_candidate(0, 11, |position| match position {
+                1 | 11 => MessageAvailability::Ready(0),
+                _ => panic!("known gaps must not be looked up"),
+            }),
+            NextCandidate::Ready(11)
+        ));
+        channel.reserve(11, 110, Duration::from_secs(30));
+        channel.apply(&ChannelCommand::Finish {
+            position: 11,
+            message_id: 110,
+        });
+        channel.apply(&ChannelCommand::Finish {
+            position: 1,
+            message_id: 100,
+        });
+
+        let stats = channel.stats(11, &BTreeSet::new(), i64::MAX);
+        assert_eq!(stats.ack_cursor, 11);
+        assert_eq!(stats.ack_gap, 0);
+        assert_eq!(stats.depth, 0);
+    }
 
     #[test]
     fn cancelling_an_unhanded_delivery_restores_attempt_count() {
@@ -573,6 +745,23 @@ mod tests {
             channel.stats(1, &BTreeSet::new(), i64::MAX).timeout_count,
             1
         );
+    }
+
+    #[test]
+    fn in_flight_deadline_index_tracks_touch_and_finish() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 16);
+        channel.reserve(1, 10, Duration::from_secs(60));
+        channel.reserve(2, 20, Duration::from_secs(60));
+
+        let now = Instant::now();
+        assert!(channel.touch_until(1, now - Duration::from_secs(1)));
+        assert_eq!(channel.expired_positions(now), vec![1]);
+
+        channel.apply(&ChannelCommand::Finish {
+            position: 1,
+            message_id: 10,
+        });
+        assert!(channel.expired_positions(now).is_empty());
     }
 
     #[test]

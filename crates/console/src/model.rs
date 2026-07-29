@@ -322,6 +322,10 @@ mod tests {
                 message_count: 1,
                 segment_count: 1,
                 segment_bytes: 128,
+                last_durable_position: 1,
+                unsynced_messages: 0,
+                unsynced_bytes: 0,
+                sync_lag_ms: 0,
                 channels: Vec::new(),
             });
         let mut head = BrokerObservationHead {

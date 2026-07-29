@@ -1,4 +1,4 @@
-use rustqueue_queue::{Broker, BrokerConfig};
+use rustqueue_queue::{Broker, BrokerConfig, PublishAckMode};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -91,6 +91,110 @@ async fn durable_fin_req_and_unfinished_delivery_recover_at_least_once() {
         .unwrap()
         .unwrap();
     assert_eq!(only_new.id, next);
+}
+
+#[tokio::test]
+async fn nsq_relaxed_preserves_a_gap_after_an_acknowledged_tail_is_lost() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.publish_ack_mode = PublishAckMode::NsqRelaxed;
+    cfg.relaxed_sync_messages = usize::MAX;
+    cfg.relaxed_sync_bytes = usize::MAX;
+    cfg.relaxed_sync_interval = Duration::from_secs(60);
+    cfg.max_ack_gap = 1;
+    let broker = Broker::open(cfg.clone()).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker.create_channel("events", "lagging").await.unwrap();
+    let durable_id = broker
+        .publish("events", vec![b"durable-prefix".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    broker.flush().await.unwrap();
+    let segment = root
+        .path()
+        .join("topics")
+        .join(hex::encode("events"))
+        .join("segments")
+        .join("segment-00000000000000000001.rqlog");
+    let durable_len = std::fs::metadata(&segment).unwrap().len();
+    let durable = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.id, durable_id);
+    broker
+        .finish("events", "workers", durable_id)
+        .await
+        .unwrap();
+    let durable = broker
+        .next_message("events", "lagging", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.id, durable_id);
+    broker
+        .finish("events", "lagging", durable_id)
+        .await
+        .unwrap();
+
+    let lost_id = broker
+        .publish("events", vec![b"lost-tail".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    let delivery = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.id, lost_id);
+    broker.finish("events", "workers", lost_id).await.unwrap();
+    drop(broker);
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(segment)
+        .unwrap()
+        .set_len(durable_len)
+        .unwrap();
+
+    let mut durable_cfg = config(root.path());
+    durable_cfg.max_ack_gap = 1;
+    let broker = Broker::open(durable_cfg.clone()).unwrap();
+    let replacement_id = broker
+        .publish("events", vec![b"replacement".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    assert_ne!(replacement_id, lost_id);
+    let lagging = broker.filtered_stats(Some("events"), Some("lagging"));
+    assert_eq!(lagging.topics[0].channels[0].depth, 1);
+    let replacement = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .expect("the durable FIN for the lost tail must not skip the next position");
+    assert_eq!(replacement.id, replacement_id);
+    assert_eq!(&*replacement.body, b"replacement");
+    let lagging = broker
+        .next_message("events", "lagging", None)
+        .await
+        .unwrap()
+        .expect("a lost position must not consume the Channel ACK window");
+    assert_eq!(lagging.id, replacement_id);
+    broker
+        .finish("events", "lagging", replacement_id)
+        .await
+        .unwrap();
+    broker.flush().await.unwrap();
+    drop(broker);
+
+    let broker = Broker::open(durable_cfg).unwrap();
+    let replacement = broker
+        .next_message("events", "workers", None)
+        .await
+        .unwrap()
+        .expect("message-index recovery must preserve the internal position gap");
+    assert_eq!(replacement.id, replacement_id);
 }
 
 #[tokio::test]

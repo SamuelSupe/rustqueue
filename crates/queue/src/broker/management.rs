@@ -100,15 +100,18 @@ impl Broker {
                     }
                 }
                 TopicManagementAction::Pause | TopicManagementAction::Unpause => {
-                    broker
-                        .topic(&topic)?
+                    let handle = broker.topic(&topic)?;
+                    let _commit_gate = handle.commit_gate.lock();
+                    handle
                         .state
                         .lock()
                         .set_paused(action == TopicManagementAction::Pause)?;
                     changed = true;
                 }
                 TopicManagementAction::Empty => {
-                    broker.topic(&topic)?.state.lock().empty_topic()?;
+                    let handle = broker.topic(&topic)?;
+                    let _commit_gate = handle.commit_gate.lock();
+                    handle.state.lock().empty_topic()?;
                     changed = true;
                 }
                 TopicManagementAction::Delete | TopicManagementAction::Tombstone => {
@@ -209,6 +212,7 @@ impl Broker {
             } else {
                 None
             };
+            let _idle_commit_gate = idle_handle.as_ref().map(|handle| handle.commit_gate.lock());
             let mut idle_state = idle_handle.as_ref().map(|handle| handle.state.lock());
             if let Some(topic_state) = idle_state.as_mut() {
                 let channel_exists = topic_state
@@ -246,6 +250,7 @@ impl Broker {
             match action {
                 ChannelManagementAction::Create => {
                     let handle = broker.get_or_create_topic_locked(&topic)?;
+                    let _commit_gate = handle.commit_gate.lock();
                     changed = handle
                         .state
                         .lock()
@@ -258,15 +263,18 @@ impl Broker {
                     handle.signal();
                 }
                 ChannelManagementAction::Pause | ChannelManagementAction::Unpause => {
-                    broker
-                        .topic(&topic)?
+                    let handle = broker.topic(&topic)?;
+                    let _commit_gate = handle.commit_gate.lock();
+                    handle
                         .state
                         .lock()
                         .set_channel_paused(&channel, action == ChannelManagementAction::Pause)?;
                     changed = true;
                 }
                 ChannelManagementAction::Empty => {
-                    broker.topic(&topic)?.state.lock().empty_channel(&channel)?;
+                    let handle = broker.topic(&topic)?;
+                    let _commit_gate = handle.commit_gate.lock();
+                    handle.state.lock().empty_channel(&channel)?;
                     changed = true;
                 }
                 ChannelManagementAction::Delete | ChannelManagementAction::Tombstone => {
@@ -288,6 +296,7 @@ impl Broker {
                             changed = true;
                         }
                     } else if let Ok(handle) = broker.topic(&topic) {
+                        let _commit_gate = handle.commit_gate.lock();
                         let mut topic_state = handle.state.lock();
                         let mut fences = broker.inner.fences.lock();
                         if set_channel_fence(&mut fences, &topic, &channel, until, require_idle) {
