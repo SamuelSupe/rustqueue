@@ -117,21 +117,22 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.warmup_seconds > 0 {
         let warmup_topic = isolated_topic(&args.topic, "warmup");
-        let mut warmup_group = if args.consumers == 0 {
-            None
-        } else {
-            let progress = Arc::new(ConsumerProgress::default());
-            let channel = benchmark_name("warmup-channel");
-            Some(
-                start_consumers(
-                    &args.address,
-                    &warmup_topic,
-                    &channel,
-                    args.consumers,
-                    progress,
+        let warmup_progress = (args.consumers > 0).then(|| Arc::new(ConsumerProgress::default()));
+        let mut warmup_group = match &warmup_progress {
+            None => None,
+            Some(progress) => {
+                let channel = benchmark_name("warmup-channel");
+                Some(
+                    start_consumers(
+                        &args.address,
+                        &warmup_topic,
+                        &channel,
+                        args.consumers,
+                        Arc::clone(progress),
+                    )
+                    .await?,
                 )
-                .await?,
-            )
+            }
         };
         let warmup = Arc::new(Mutex::new(Histogram::<u64>::new_with_max(60_000_000, 3)?));
         let warmup_result = if let Some(group) = warmup_group.as_mut() {
@@ -158,8 +159,27 @@ async fn main() -> anyhow::Result<()> {
             .await
         };
         if let Some(group) = warmup_group.take() {
+            let published = match warmup_result {
+                Ok(published) => published,
+                Err(error) => {
+                    let _ = group.stop().await;
+                    return Err(error);
+                }
+            };
+            let progress = warmup_progress
+                .as_ref()
+                .expect("warmup consumers have delivery progress");
+            let delivery = progress
+                .wait_for(published, Duration::from_secs(args.drain_timeout_seconds))
+                .await;
             let stop_result = group.stop().await;
-            warmup_result?;
+            require_complete_delivery(
+                true,
+                delivery.complete,
+                delivery.snapshot.unique,
+                delivery.snapshot.duplicates(),
+                published,
+            )?;
             stop_result?;
         } else {
             warmup_result?;
@@ -351,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
         report.delivery_verified,
         report.delivery_complete,
         report.received_unique_messages,
+        report.duplicate_messages,
         report.messages,
     )?;
     Ok(())
@@ -360,8 +381,14 @@ fn require_complete_delivery(
     verified: bool,
     complete: bool,
     received: u64,
+    duplicates: u64,
     published: u64,
 ) -> anyhow::Result<()> {
+    if verified && duplicates > 0 {
+        anyhow::bail!(
+            "delivery verification failed: observed {duplicates} unexpected duplicate deliveries"
+        );
+    }
     if verified && !complete {
         anyhow::bail!(
             "delivery verification failed: received {received} unique messages out of {published} before the drain timeout"
@@ -404,8 +431,13 @@ mod tests {
 
     #[test]
     fn incomplete_verified_delivery_fails_the_benchmark() {
-        assert!(require_complete_delivery(true, false, 99, 100).is_err());
-        assert!(require_complete_delivery(true, true, 100, 100).is_ok());
-        assert!(require_complete_delivery(false, false, 0, 100).is_ok());
+        assert!(require_complete_delivery(true, false, 99, 0, 100).is_err());
+        assert!(require_complete_delivery(true, true, 100, 0, 100).is_ok());
+        assert!(require_complete_delivery(false, false, 0, 0, 100).is_ok());
+    }
+
+    #[test]
+    fn unexpected_duplicate_delivery_fails_the_benchmark() {
+        assert!(require_complete_delivery(true, true, 100, 1, 100).is_err());
     }
 }

@@ -16,6 +16,7 @@ impl Topic {
 
     pub fn empty_topic(&mut self) -> Result<(), BrokerError> {
         let through = self.last_position();
+        let has_durable_channels = self.has_durable_channels();
         let channels: Vec<_> = self.channels.keys().cloned().collect();
         for channel in channels {
             self.persist_channel(
@@ -24,6 +25,9 @@ impl Topic {
                     through_position: through,
                 },
             )?;
+        }
+        if !has_durable_channels {
+            self.set_unrouted_from_position(Some(self.manifest.next_position))?;
         }
         Ok(())
     }
@@ -110,6 +114,13 @@ impl Topic {
         };
         store_atomic(&self.manifest_path, &self.manifest)?;
         eviction::write_intent(audit_directory, &report)?;
+        if !self.has_durable_channels() {
+            let retained_from = self
+                .unrouted_start_position()?
+                .max(through_position.saturating_add(1))
+                .min(self.manifest.next_position);
+            self.set_unrouted_from_position(Some(retained_from))?;
+        }
         let channels: Vec<_> = self.channels.keys().cloned().collect();
         for channel in channels {
             self.persist_channel(&channel, ChannelCommand::Evict { through_position })?;
@@ -143,8 +154,11 @@ impl Topic {
             .values()
             .filter(|channel| !channel.state.ephemeral)
             .map(|channel| channel.state.ack_floor_position.saturating_add(1))
-            .min()
-            .unwrap_or(self.manifest.next_position);
+            .min();
+        let channel_from = match channel_from {
+            Some(position) => position,
+            None => self.unrouted_start_position()?,
+        };
         let in_flight_from = self
             .channels
             .values()

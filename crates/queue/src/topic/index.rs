@@ -227,6 +227,13 @@ impl MessageIndex {
             .or_else(|| self.sealed.back().map(|segment| segment.last_position))
     }
 
+    pub(crate) fn first_position(&self) -> Option<u64> {
+        self.sealed
+            .front()
+            .map(|segment| segment.first_position)
+            .or_else(|| self.active.front().map(|message| message.position))
+    }
+
     pub(crate) fn last_timestamp_ns(&self) -> Option<i64> {
         self.active
             .back()

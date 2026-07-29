@@ -94,4 +94,65 @@ grep -Fq "Current release: [v$EXPECTED]" "$ROOT/README.md" || {
   exit 1
 }
 
+qualification="$ROOT/benchmarks/qualifications/v$EXPECTED-orbstack.json"
+if [[ "$EXPECTED" == "0.8.2" && -f "$qualification" ]]; then
+  command -v jq >/dev/null 2>&1 || {
+    echo "jq is required to verify Broker qualification evidence" >&2
+    exit 1
+  }
+  jq -e --arg version "$EXPECTED" '
+    .schema_version == 1
+    and .release == $version
+    and .baseline.revision == "v0.8.1"
+    and (.baseline.commit | test("^[0-9a-f]{40}$"))
+    and (.candidate.commit | test("^[0-9a-f]{40}$"))
+    and (.baseline.binary_sha256 | test("^[0-9a-f]{64}$"))
+    and (.candidate.binary_sha256 | test("^[0-9a-f]{64}$"))
+    and .environment.platform == "OrbStack on macOS"
+    and .environment.tool_source == .candidate.commit
+    and .environment.resource_limits.broker.cpus == 2
+    and .environment.resource_limits.broker.memory_bytes == 2147483648
+    and .environment.resource_limits.load_generator.cpus == 2
+    and .environment.resource_limits.load_generator.memory_bytes == 2147483648
+    and .protocol.pairs == 10
+    and .protocol.warmup_seconds == 30
+    and .protocol.measurement_seconds == 120
+    and .protocol.alternating_order == "AB_then_BA"
+    and .protocol.throughput_regression_ratio == 0.95
+    and .protocol.latency_rss_regression_ratio == 1.10
+    and ([.protocol.scenarios[].name] | sort)
+      == ["low_load_latency", "raw_write", "sustainable"]
+    and (.runs | length) == 60
+    and all(.runs[]; .benchmark_exit_code == 0)
+    and all(
+      .runs[]
+      | select(.case != "raw_write");
+      .metrics.delivery_verified == true
+      and .metrics.delivery_complete == true
+      and .metrics.drain_timed_out == false
+      and .metrics.missing_messages == 0
+      and .metrics.duplicate_messages == 0
+      and .metrics.final_channel_depth == 0
+      and .metrics.final_in_flight == 0
+      and .metrics.final_deferred == 0
+      and .metrics.broker_profile.aggregate_channel_depth == 0
+      and .metrics.broker_profile.aggregate_channel_in_flight == 0
+      and .metrics.broker_profile.aggregate_channel_deferred == 0
+    )
+    and ([.statistics[] | "\(.case):\(.metric)"] | sort) == [
+      "low_load_latency:pub_ack_p99_us",
+      "low_load_latency:rss_peak_bytes",
+      "raw_write:publish_messages_per_second",
+      "sustainable:receive_messages_per_second"
+    ]
+    and all(.statistics[]; .regression == false)
+    and .verdict.status == "pass"
+    and (.verdict.hard_failures | length) == 0
+    and (.verdict.regressions | length) == 0
+  ' "$qualification" >/dev/null || {
+    echo "Broker qualification evidence is invalid or failed" >&2
+    exit 1
+  }
+fi
+
 echo "RustQueue release metadata is consistent at $EXPECTED"

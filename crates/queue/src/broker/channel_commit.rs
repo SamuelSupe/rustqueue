@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 const QUEUE_CAPACITY: usize = 1024;
-const MAX_GROUP_REQUESTS: usize = 64;
+const MAX_GROUP_REQUESTS: usize = 256;
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) enum ChannelOperation {
@@ -297,6 +297,7 @@ async fn collect_group(
     first: ChannelRequest,
     receiver: &mut mpsc::Receiver<ChannelRequest>,
 ) -> Vec<ChannelRequest> {
+    let deadline = tokio::time::Instant::now() + COALESCE_DELAY;
     let mut requests = vec![first];
     loop {
         if requests.len() >= MAX_GROUP_REQUESTS {
@@ -305,13 +306,12 @@ async fn collect_group(
         let next = match receiver.try_recv() {
             Ok(request) => Some(request),
             Err(mpsc::error::TryRecvError::Disconnected) => None,
-            Err(mpsc::error::TryRecvError::Empty) if requests.len() == 1 => {
-                tokio::time::timeout(COALESCE_DELAY, receiver.recv())
+            Err(mpsc::error::TryRecvError::Empty) => {
+                tokio::time::timeout_at(deadline, receiver.recv())
                     .await
                     .ok()
                     .flatten()
             }
-            Err(mpsc::error::TryRecvError::Empty) => None,
         };
         let Some(next) = next else {
             return requests;
@@ -352,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_size_is_bounded() {
-        let (sender, mut receiver) = mpsc::channel(128);
+        let (sender, mut receiver) = mpsc::channel(MAX_GROUP_REQUESTS + 1);
         for _ in 0..=MAX_GROUP_REQUESTS {
             sender.send(request()).await.unwrap();
         }
@@ -362,5 +362,20 @@ mod tests {
             MAX_GROUP_REQUESTS
         );
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn group_collects_requests_arriving_anytime_within_the_window() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        sender.send(request()).await.unwrap();
+        sender.send(request()).await.unwrap();
+        let late_sender = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            sender.send(request()).await.unwrap();
+        });
+
+        let first = receiver.recv().await.unwrap();
+        assert_eq!(collect_group(first, &mut receiver).await.len(), 3);
+        late_sender.await.unwrap();
     }
 }

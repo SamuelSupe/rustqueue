@@ -54,6 +54,7 @@ pub(crate) struct ChannelCheckpoint {
 }
 
 struct InFlight {
+    id: u64,
     deadline: Instant,
     token: u64,
 }
@@ -309,6 +310,7 @@ impl ChannelState {
         self.in_flight.insert(
             position,
             InFlight {
+                id,
                 deadline: Instant::now() + timeout,
                 token,
             },
@@ -484,12 +486,11 @@ impl ChannelState {
     }
 
     fn remove_in_flight(&mut self, position: u64) -> bool {
-        let removed = self.in_flight.remove(&position).is_some();
-        if removed {
-            self.in_flight_ids
-                .retain(|_, candidate| *candidate != position);
-        }
-        removed
+        let Some(delivery) = self.in_flight.remove(&position) else {
+            return false;
+        };
+        self.in_flight_ids.remove(&delivery.id);
+        true
     }
 }
 
@@ -539,6 +540,21 @@ mod tests {
 
         let (_, attempts) = channel.reserve(1, 10, Duration::from_secs(30));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn removing_one_delivery_preserves_other_in_flight_id_lookups() {
+        let mut channel = ChannelState::new("workers".into(), 0, false, 16);
+        channel.reserve(1, 10, Duration::from_secs(30));
+        channel.reserve(2, 20, Duration::from_secs(30));
+
+        channel.apply(&ChannelCommand::Finish {
+            position: 1,
+            message_id: 10,
+        });
+
+        assert_eq!(channel.in_flight_position(10), None);
+        assert_eq!(channel.in_flight_position(20), Some(2));
     }
 
     #[test]

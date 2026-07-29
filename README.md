@@ -10,14 +10,14 @@
 [Architecture](docs/architecture/share-nothing-v7.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.8.1 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.1)
+[v0.8.2 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2)
 
-RustQueue 0.8.1 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.8.2 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.8.1](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.1).
+> Current release: [v0.8.2](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -43,53 +43,56 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.8.1
+## What's new in 0.8.2
 
-- **Truthful end-to-end benchmarks.** `rustqueue-bench` now starts durable,
-  isolated consumers before publishing, counts unique deliveries and
-  duplicates, reports publish and receive throughput separately, and fails if
-  the requested messages do not arrive before the drain deadline.
-- **Delivery-state correctness.** Generation tokens reject stale `FIN`, `REQ`
-  and `TOUCH` commands after redelivery. Initial leases cover buffered writes,
-  and disconnects no longer release messages while their durable channel
-  operation is still pending.
-- **Crash-safe DLQ and management operations.** Dead-letter transfers are
-  serialized as one durable transaction, recover without replaying a completed
-  copy, and respect Topic/Channel fences during concurrent administrative
-  changes.
-- **Cancellation-safe storage.** Payload and recovery-index workers retain
-  their guards and byte budgets until blocking I/O actually finishes.
-  Corruption marks storage unhealthy before a response can escape, while
-  retired Topics are reclaimed after their final reader drains.
-- **Bounded control planes.** AUTH responses, compiled authorization regexes,
-  Broker management bodies, Kodo Stats aggregation and proxy error bodies all
-  have explicit node-wide limits and timeouts. Invalid semaphore or timer
-  configurations fail during startup instead of panicking later.
+- **NSQ-aligned no-Channel durability.** A Topic with no durable Channel now
+  persists its unrouted start position and normal GC cannot cross it. The first
+  durable Channel receives every acknowledged publish from that interval, even
+  when creation happens after the bootstrap window or a Broker restart.
+- **Direct-Broker preflight.** Reproducible OrbStack tooling compares the exact
+  `v0.8.1` tag with one candidate commit using fresh volumes, fixed
+  2 vCPU / 2 GiB limits and alternating paired runs. RustQueue 0.8.2 completed
+  short correctness and regression preflights but does not claim completion of
+  the optional 60-run performance qualification.
+- **Bounded Channel coalescing.** The durable Channel worker now keeps
+  collecting `FIN` and `REQ` requests throughout its existing bounded 1 ms
+  window instead of committing at the first transient queue gap. The
+  64-request ceiling, channel WAL `fsync` boundary and at-least-once contract
+  are unchanged. The mechanism and short preflight are not a formal throughput
+  guarantee.
+- **Reliable benchmark shutdown and warmup.** The benchmark preserves a
+  partially read NSQ frame while closing consumers, and a consumer warmup is
+  fully drained before measurement. Missing, duplicate or non-drained delivery
+  remains a hard failure.
+- **Explicit regression policy.** Raw write and end-to-end sustainable
+  throughput fail only when a one-sided paired 95% bootstrap interval is
+  wholly below `0.95`. Fixed-rate PUB ACK p99 and comparable fixed-rate peak
+  RSS fail only when the interval is wholly above `1.10`.
 
-The patch keeps disk format v7 and the NSQ/Kodo compatibility contract from
-0.8.0. See the
-[v0.8.1 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.1)
-for the complete fix and validation record.
+The patch keeps disk format v7 and remains wire-compatible with the NSQ/Kodo
+contract from 0.8.1. See the
+[v0.8.2 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.2)
+for the validation boundaries.
 
-## Download 0.8.1
+## Download 0.8.2
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.8.1-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.1-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.1-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.8.1.tgz` | Helm Chart |
-| `SHA256SUMS-0.8.1` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.8.2-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.2-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.2-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.8.2.tgz` | Helm Chart |
+| `SHA256SUMS-0.8.2` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.1/rustqueue-0.8.1-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.1/SHA256SUMS-0.8.1"
-sha256sum --check --ignore-missing SHA256SUMS-0.8.1
-tar -xzf "rustqueue-0.8.1-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.2/rustqueue-0.8.2-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.2/SHA256SUMS-0.8.2"
+sha256sum --check --ignore-missing SHA256SUMS-0.8.2
+tar -xzf "rustqueue-0.8.2-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -124,11 +127,15 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 - Delivery is at least once. A restart redelivers messages without durable FIN.
 - The broker PVC is the only copy; permanent PVC loss loses its messages.
 - Topics and channels are broker-local. Lookup consumers union all owners.
-- Messages are retained for 90 seconds before a channel exists. This covers one
-  official Go client default 60-second lookup poll plus its 30% jitter and lets
-  `SUB` catch a newly selected owner without a normal-path miss. The Kodo
-  profile forces 180 seconds so one failed lookup request still gets a second
-  discovery opportunity before data can age out.
+- Normal GC retains every message accepted while no durable Channel exists,
+  across restart and without a bootstrap timeout. The first durable Channel
+  starts at that persisted unrouted boundary. Deleting the last durable Channel
+  starts a new boundary at the current Topic tail; ephemeral Channels do not
+  clear it.
+- Once a durable Channel exists, a later Channel can still bootstrap from the
+  last 90 seconds. This covers one official Go client default 60-second lookup
+  poll plus its 30% jitter. The Kodo profile forces 180 seconds so one failed
+  lookup request still gets a second discovery opportunity.
 - The stable v7 single-message limit is 100 MiB. The conservative defaults
   remain 20 MiB per message and 64 MiB per MPUB body; the opt-in Kodo profile
   raises them to 100 MiB and 128 MiB respectively.
@@ -223,7 +230,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.8.1 \
+  --set queue.image=registry.example/rustqueue:0.8.2 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -460,7 +467,7 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.8.1 CI/CD workflow publishes a Release only after the non-Kubernetes
+The v0.8.2 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one

@@ -1167,10 +1167,21 @@ async fn bounded_gc_rotates_across_topics() {
     })
     .unwrap();
     for topic in ["alpha", "beta", "gamma"] {
-        broker
+        broker.create_channel(topic, "workers").await.unwrap();
+        let id = broker
             .publish(topic, vec![b"expired".to_vec()], Duration::ZERO)
             .await
-            .unwrap();
+            .unwrap()[0];
+        assert_eq!(
+            broker
+                .next_message(topic, "workers", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        broker.finish(topic, "workers", id).await.unwrap();
     }
 
     assert_eq!(broker.compact_some(1).await.unwrap(), 1);
