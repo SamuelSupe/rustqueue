@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="RustQueue is a Kubernetes-native, NSQ V2-compatible message queue with durable local storage and a share-nothing broker model."
+    />
+    <meta name="theme-color" content="#101311" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f1f4ef" media="(prefers-color-scheme: light)" />
+    <meta property="og:title" content="RustQueue | Durable messaging for Kubernetes" />
+    <meta
+      property="og:description"
+      content="NSQ-compatible messaging with one durable PVC per broker and no central queue coordinator."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://samuelsupe.github.io/rustqueue/" />
+    <meta
+      property="og:image"
+      content="https://samuelsupe.github.io/rustqueue/assets/rustqueue-brokers.webp"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="canonical" href="https://samuelsupe.github.io/rustqueue/" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link
+      rel="preload"
+      as="image"
+      href="./assets/rustqueue-brokers.webp"
+      imagesrcset="
+        ./assets/rustqueue-brokers-720.webp   720w,
+        ./assets/rustqueue-brokers-1100.webp 1100w,
+        ./assets/rustqueue-brokers.webp      1586w
+      "
+      imagesizes="(max-width: 800px) calc(100vw - 2.3rem), (max-width: 1040px) 46vw, 50vw"
+      fetchpriority="high"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+    <title>RustQueue | Durable messaging for Kubernetes</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="nav-shell">
+        <a class="brand" href="#top">
+          <span class="brand-mark" aria-hidden="true">RQ</span>
+          <span>RustQueue</span>
+        </a>
+
+        <button
+          class="menu-button"
+          type="button"
+          aria-expanded="false"
+          aria-controls="site-nav"
+        >
+          <span class="menu-line"></span>
+          <span class="menu-line"></span>
+          <span class="sr-only">Toggle navigation</span>
+        </button>
+
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation">
+          <a href="#architecture">Architecture</a>
+          <a href="#durability">Durability</a>
+          <a href="#compatibility">Compatibility</a>
+          <a href="#install">Install</a>
+          <a
+            class="nav-action"
+            href="https://github.com/SamuelSupe/rustqueue"
+            rel="noreferrer"
+          >
+            GitHub
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section id="top" class="hero">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <p class="eyebrow">NSQ-compatible messaging for Kubernetes</p>
+            <h1><span>Durable queues.</span><span>Share nothing.</span></h1>
+            <p class="hero-summary">
+              NSQ-compatible messaging with one durable PVC per Kubernetes broker and no central
+              coordinator.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#install">Install with Helm</a>
+              <a
+                class="button button-secondary"
+                href="https://github.com/SamuelSupe/rustqueue/blob/main/docs/architecture/share-nothing-v7.md"
+                rel="noreferrer"
+              >
+                Explore architecture
+              </a>
+            </div>
+          </div>
+
+          <figure class="hero-visual" aria-labelledby="hero-visual-caption">
+            <img
+              src="./assets/rustqueue-brokers.webp"
+              srcset="
+                ./assets/rustqueue-brokers-720.webp   720w,
+                ./assets/rustqueue-brokers-1100.webp 1100w,
+                ./assets/rustqueue-brokers.webp      1586w
+              "
+              sizes="(max-width: 800px) calc(100vw - 2.3rem), (max-width: 1040px) 46vw, 50vw"
+              width="1586"
+              height="992"
+              fetchpriority="high"
+              alt="Independent broker nodes, each connected to its own storage disk"
+            />
+            <figcaption id="hero-visual-caption">
+              Independent brokers. Independent storage. One explicit failure boundary.
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="contract-strip" aria-label="Core product contract">
+        <dl>
+          <div>
+            <dt>ACK boundary</dt>
+            <dd>Local fsync by default</dd>
+          </div>
+          <div>
+            <dt>Delivery</dt>
+            <dd>At least once</dd>
+          </div>
+          <div>
+            <dt>Topology</dt>
+            <dd>Share-nothing brokers</dd>
+          </div>
+          <div>
+            <dt>Protocol</dt>
+            <dd>NSQ V2 core</dd>
+          </div>
+        </dl>
+      </section>
+
+      <section id="architecture" class="section architecture-section">
+        <div class="section-heading" data-reveal>
+          <h2>Every broker owns its queue.</h2>
+          <p>
+            Kubernetes handles placement and discovery. RustQueue keeps message ownership local,
+            visible, and operationally direct.
+          </p>
+        </div>
+
+        <div class="architecture-map" data-reveal>
+          <div class="map-source">
+            <span class="map-label">Publish</span>
+            <strong>NSQ producer</strong>
+            <small>Existing client</small>
+          </div>
+          <div class="map-route">
+            <span class="route-line" aria-hidden="true"></span>
+            <span>Proxy or Gateway</span>
+          </div>
+          <div class="broker-cluster" aria-label="Independent broker ownership">
+            <article class="broker-unit">
+              <span class="broker-index">Broker A</span>
+              <strong>Topic owner</strong>
+              <span class="disk">RWO PVC</span>
+            </article>
+            <article class="broker-unit">
+              <span class="broker-index">Broker B</span>
+              <strong>Topic owner</strong>
+              <span class="disk">RWO PVC</span>
+            </article>
+            <article class="broker-unit">
+              <span class="broker-index">Broker C</span>
+              <strong>Topic owner</strong>
+              <span class="disk">RWO PVC</span>
+            </article>
+          </div>
+        </div>
+
+        <div class="architecture-notes" data-reveal>
+          <p>
+            Consumers discover every broker that owns a Topic, then connect directly over the NSQ
+            protocol.
+          </p>
+          <a
+            class="text-link"
+            href="https://github.com/SamuelSupe/rustqueue/blob/main/docs/operations/kubernetes.md"
+            rel="noreferrer"
+          >
+            Read the Kubernetes runbook
+          </a>
+        </div>
+      </section>
+
+      <section id="durability" class="section durability-section">
+        <div class="durability-grid">
+          <figure class="storage-visual" data-reveal>
+            <img
+              src="./assets/rustqueue-storage.webp"
+              srcset="
+                ./assets/rustqueue-storage-640.webp  640w,
+                ./assets/rustqueue-storage.webp     1003w
+              "
+              sizes="(max-width: 800px) 90vw, 33rem"
+              width="1003"
+              height="1568"
+              loading="lazy"
+              alt="A broker module persisting message capsules to its local storage platter"
+            />
+          </figure>
+
+          <div class="durability-copy" data-reveal>
+            <p class="eyebrow">Choose the acknowledgement boundary</p>
+            <h2>Durability is a setting, not a footnote.</h2>
+            <p>
+              The default waits for local persistence. Two explicit relaxed modes are available
+              when the crash-loss window is an accepted tradeoff.
+            </p>
+
+            <div class="mode-tabs" role="tablist" aria-label="Publish acknowledgement modes">
+              <button
+                id="tab-durable"
+                type="button"
+                role="tab"
+                aria-selected="true"
+                aria-controls="panel-durable"
+                data-mode="durable"
+              >
+                Durable
+              </button>
+              <button
+                id="tab-write"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="panel-write"
+                data-mode="write"
+                tabindex="-1"
+              >
+                Write ACK
+              </button>
+              <button
+                id="tab-relaxed"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="panel-relaxed"
+                data-mode="relaxed"
+                tabindex="-1"
+              >
+                NSQ relaxed
+              </button>
+            </div>
+
+            <div class="mode-panels">
+              <article
+                id="panel-durable"
+                class="mode-panel"
+                role="tabpanel"
+                aria-labelledby="tab-durable"
+              >
+                <dl>
+                  <div>
+                    <dt>Response</dt>
+                    <dd>After local segment fsync</dd>
+                  </div>
+                  <div>
+                    <dt>Visibility</dt>
+                    <dd>Only committed data is delivered</dd>
+                  </div>
+                </dl>
+                <p>The production default and strongest local acknowledgement contract.</p>
+              </article>
+              <article
+                id="panel-write"
+                class="mode-panel"
+                role="tabpanel"
+                aria-labelledby="tab-write"
+                hidden
+              >
+                <dl>
+                  <div>
+                    <dt>Response</dt>
+                    <dd>After append and write</dd>
+                  </div>
+                  <div>
+                    <dt>Visibility</dt>
+                    <dd>Only through the last durable position</dd>
+                  </div>
+                </dl>
+                <p>A faster acknowledgement with an explicit unsynced crash-loss window.</p>
+              </article>
+              <article
+                id="panel-relaxed"
+                class="mode-panel"
+                role="tabpanel"
+                aria-labelledby="tab-relaxed"
+                hidden
+              >
+                <dl>
+                  <div>
+                    <dt>Response</dt>
+                    <dd>After append and write</dd>
+                  </div>
+                  <div>
+                    <dt>Visibility</dt>
+                    <dd>The unsynced tail is immediately consumable</dd>
+                  </div>
+                </dl>
+                <p>The closest profile to NSQ diskqueue semantics, with weaker crash durability.</p>
+              </article>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="compatibility" class="section compatibility-section">
+        <div class="compatibility-intro" data-reveal>
+          <h2>Keep the clients. Change the core.</h2>
+          <p>
+            Use official Go and Python NSQ clients across publish, consume, lookup, TLS, AUTH, and
+            compression paths.
+          </p>
+        </div>
+
+        <div class="command-rail" aria-label="Supported NSQ commands" data-reveal>
+          <span>IDENTIFY</span>
+          <span>AUTH</span>
+          <span>SUB</span>
+          <span>PUB</span>
+          <span>MPUB</span>
+          <span>DPUB</span>
+          <span>RDY</span>
+          <span>FIN</span>
+          <span>REQ</span>
+          <span>TOUCH</span>
+          <span>NOP</span>
+          <span>CLS</span>
+        </div>
+
+        <div class="compatibility-details" data-reveal>
+          <article>
+            <strong>TLS and mTLS</strong>
+            <p>Encrypted client paths with optional external AUTH.</p>
+          </article>
+          <article>
+            <strong>Snappy and Deflate</strong>
+            <p>Protocol compression without changing the client contract.</p>
+          </article>
+          <article>
+            <strong>Lookup and fan-out</strong>
+            <p>Discovery returns the real broker owners for each Topic.</p>
+          </article>
+          <article>
+            <strong>Kodo profile</strong>
+            <p>A default-off gateway and discovery compatibility boundary.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="section evidence-section">
+        <div class="evidence-statement" data-reveal>
+          <p>Performance only matters when the durability boundary is named.</p>
+          <a
+            class="text-link"
+            href="https://github.com/SamuelSupe/rustqueue/blob/main/docs/architecture/nsq-performance.md"
+            rel="noreferrer"
+          >
+            Review the NSQ comparison contract
+          </a>
+        </div>
+
+        <div class="evidence-facts" data-reveal>
+          <div>
+            <span>01</span>
+            <p>Strict and relaxed profiles are reported separately.</p>
+          </div>
+          <div>
+            <span>02</span>
+            <p>Consumer runs require complete unique delivery.</p>
+          </div>
+          <div>
+            <span>03</span>
+            <p>Unexpected duplicates invalidate a benchmark result.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="install" class="section install-section">
+        <div class="install-shell" data-reveal>
+          <div class="install-copy">
+            <p class="eyebrow">Start on Kubernetes</p>
+            <h2>One Helm command.</h2>
+            <p>
+              Point the chart at your image and an SSD-backed RWO StorageClass. RustQueue handles
+              the rest of the topology.
+            </p>
+          </div>
+
+          <div class="install-command">
+            <div class="code-header">
+              <span>shell</span>
+              <button class="copy-button" type="button" data-copy-target="helm-command">
+                Copy
+              </button>
+            </div>
+            <pre><code id="helm-command">helm upgrade --install rustqueue deploy/helm/rustqueue \
+  --namespace rustqueue --create-namespace \
+  --set queue.image=registry.example/rustqueue:0.8.3 \
+  --set queue.storageClassName=ssd-rwo</code></pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div>
+        <a class="brand footer-brand" href="#top">
+          <span class="brand-mark" aria-hidden="true">RQ</span>
+          <span>RustQueue</span>
+        </a>
+        <p>Durable, NSQ-compatible messaging for Kubernetes, built in Rust.</p>
+      </div>
+      <nav aria-label="Footer navigation">
+        <a href="https://github.com/SamuelSupe/rustqueue/releases/latest" rel="noreferrer">
+          Releases
+        </a>
+        <a
+          href="https://github.com/SamuelSupe/rustqueue/blob/main/docs/operations/console.md"
+          rel="noreferrer"
+        >
+          Console
+        </a>
+        <a href="https://github.com/SamuelSupe/rustqueue" rel="noreferrer">Source</a>
+      </nav>
+    </footer>
+
+    <div class="copy-status" role="status" aria-live="polite"></div>
+  </body>
+</html>
