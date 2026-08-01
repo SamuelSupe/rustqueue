@@ -3,6 +3,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+// Channel operations stay queued per session, but only this many hold active
+// broker futures while waiting for a durable group commit.
+const MAX_PENDING_CHANNEL_OPS: usize = 256;
+
 #[derive(Clone, Copy)]
 pub(super) enum ChannelOpKind {
     Finish,
@@ -21,15 +25,15 @@ impl ChannelOpKind {
 
 enum ChannelOp {
     Finish {
-        topic: String,
-        channel: String,
+        topic: Arc<str>,
+        channel: Arc<str>,
         id: u64,
         token: u64,
         sampled: bool,
     },
     Requeue {
-        topic: String,
-        channel: String,
+        topic: Arc<str>,
+        channel: Arc<str>,
         id: u64,
         token: u64,
         delay: Duration,
@@ -66,8 +70,8 @@ pub(super) struct ChannelOpSender {
 impl ChannelOpSender {
     pub(super) fn finish(
         &self,
-        topic: String,
-        channel: String,
+        topic: Arc<str>,
+        channel: Arc<str>,
         id: u64,
         token: u64,
     ) -> Result<(), BrokerError> {
@@ -82,8 +86,8 @@ impl ChannelOpSender {
 
     pub(super) fn finish_sampled(
         &self,
-        topic: String,
-        channel: String,
+        topic: Arc<str>,
+        channel: Arc<str>,
         id: u64,
         token: u64,
     ) -> Result<(), BrokerError> {
@@ -98,8 +102,8 @@ impl ChannelOpSender {
 
     pub(super) fn requeue(
         &self,
-        topic: String,
-        channel: String,
+        topic: Arc<str>,
+        channel: Arc<str>,
         id: u64,
         token: u64,
         delay: Duration,
@@ -146,19 +150,15 @@ async fn run_channel_ops(
     mut operations: mpsc::UnboundedReceiver<ChannelOp>,
     completions: mpsc::UnboundedSender<ChannelOpCompletion>,
 ) {
-    type Pending = Pin<Box<dyn Future<Output = ChannelOpCompletion> + Send>>;
-
-    let mut pending = FuturesUnordered::<Pending>::new();
+    let mut pending = FuturesUnordered::new();
     let mut receiving = true;
     while receiving || !pending.is_empty() {
         tokio::select! {
-            operation = operations.recv(), if receiving => {
+            operation = operations.recv(), if receiving && pending.len() < MAX_PENDING_CHANNEL_OPS => {
                 match operation {
                     Some(operation) => {
                         let broker = broker.clone();
-                        pending.push(Box::pin(async move {
-                            execute_channel_op(broker, operation).await
-                        }));
+                        pending.push(execute_channel_op(broker, operation));
                     }
                     None => receiving = false,
                 }
@@ -182,7 +182,11 @@ async fn execute_channel_op(broker: Broker, operation: ChannelOp) -> ChannelOpCo
             id,
             token,
             ..
-        } => broker.finish_delivery(&topic, &channel, id, token).await,
+        } => {
+            broker
+                .finish_delivery_shared(&topic, channel, id, token)
+                .await
+        }
         ChannelOp::Requeue {
             topic,
             channel,
@@ -191,7 +195,7 @@ async fn execute_channel_op(broker: Broker, operation: ChannelOp) -> ChannelOpCo
             delay,
         } => {
             broker
-                .requeue_delivery(&topic, &channel, id, token, delay)
+                .requeue_delivery_shared(&topic, channel, id, token, delay)
                 .await
         }
     };

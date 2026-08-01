@@ -91,8 +91,8 @@ enum Compression {
 }
 
 struct Subscription {
-    topic: String,
-    channel: String,
+    topic: Arc<str>,
+    channel: Arc<str>,
     lease: SubscriptionLease,
 }
 
@@ -101,8 +101,8 @@ const DEFAULT_FETCH_WAIT_MS: u32 = 100;
 
 #[derive(Clone, Debug)]
 struct FetchRequest {
-    topic: String,
-    channel: String,
+    topic: Arc<str>,
+    channel: Arc<str>,
     timeout_ms: u64,
     max_messages: u16,
     max_bytes: u32,

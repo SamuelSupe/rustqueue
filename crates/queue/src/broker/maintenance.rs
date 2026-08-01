@@ -50,6 +50,7 @@ impl Broker {
             for offset in 0..selected {
                 let (_, handle) = &topics[(start + offset) % topics.len()];
                 let _commit_gate = handle.commit_gate.lock();
+                let _channel_commit_gate = handle.channel_commit_gate.lock();
                 let mut topic = handle.state.lock();
                 let retained = broker.inner.payload_reader.retained_paths();
                 let name = topic.name.clone();
@@ -86,6 +87,7 @@ impl Broker {
                 return Ok(None);
             };
             let _commit_gate = topic.commit_gate.lock();
+            let _channel_commit_gate = topic.channel_commit_gate.lock();
             let mut state = topic.state.lock();
             let retained = broker.inner.payload_reader.retained_paths();
             let deliverable_before = state.deliverable_position();
@@ -158,6 +160,7 @@ impl Broker {
                 .read()
                 .values()
                 .try_fold(0usize, |total, topic| {
+                    let _channel_commit_gate = topic.channel_commit_gate.lock();
                     Ok(total.saturating_add(topic.state.lock().expire_in_flight()?))
                 })
         })
@@ -182,11 +185,10 @@ impl Broker {
         let topic = topic.to_owned();
         let channel = channel.to_owned();
         self.storage_task(move || {
-            broker
-                .topic(&topic)?
-                .state
-                .lock()
-                .expire_channel_in_flight(&channel)
+            let handle = broker.topic(&topic)?;
+            let _channel_commit_gate = handle.channel_commit_gate.lock();
+            let result = handle.state.lock().expire_channel_in_flight(&channel);
+            result
         })
         .await
     }
@@ -196,6 +198,7 @@ impl Broker {
         self.storage_task(move || {
             for topic in broker.inner.topics.read().values() {
                 let _commit_gate = topic.commit_gate.lock();
+                let _channel_commit_gate = topic.channel_commit_gate.lock();
                 topic.state.lock().sync()?;
                 topic.signal();
             }
@@ -209,6 +212,7 @@ impl Broker {
         let broker = self.clone();
         self.storage_task(move || {
             for topic in broker.inner.topics.read().values() {
+                let _channel_commit_gate = topic.channel_commit_gate.lock();
                 topic.state.lock().checkpoint_channels()?;
             }
             Ok(())

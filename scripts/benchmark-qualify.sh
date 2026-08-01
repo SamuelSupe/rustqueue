@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE="${RELEASE:-0.8.3}"
-BASELINE_REF="${BASELINE_REF:-v0.8.2}"
+RELEASE="${RELEASE:-0.8.4}"
+BASELINE_REF="${BASELINE_REF:-v0.8.3}"
 CANDIDATE_REF="${CANDIDATE_REF:-HEAD}"
 PAIRS="${PAIRS:-10}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
@@ -15,7 +15,7 @@ CASES="${CASES:-raw_write sustainable low_load_latency}"
 QUALIFICATION_DEV="${QUALIFICATION_DEV:-0}"
 KEEP_IMAGES="${KEEP_IMAGES:-0}"
 RESULT_ROOT="$ROOT/benchmarks/results"
-EVIDENCE_OUTPUT="${EVIDENCE_OUTPUT:-$ROOT/benchmarks/qualifications/v0.8.3-orbstack.json}"
+EVIDENCE_OUTPUT="${EVIDENCE_OUTPUT:-$ROOT/benchmarks/qualifications/v0.8.4-orbstack.json}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_DIR="$RESULT_ROOT/qualification-$RUN_ID"
 RUNS_FILE="$RUN_DIR/runs.ndjson"
@@ -37,6 +37,7 @@ ACTIVE_BROKER=""
 ACTIVE_VOLUME=""
 SAMPLER_PID=""
 SEQUENCE=0
+FINAL_DRAIN_ATTEMPTS=30
 
 die() {
   printf 'benchmark qualification: %s\n' "$*" >&2
@@ -103,15 +104,17 @@ if [[ "$docker_context" != "orbstack" && "$docker_os" != *OrbStack* ]]; then
   die "Docker must use OrbStack (context=$docker_context, os=$docker_os)"
 fi
 
-[[ "$BASELINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-  die "baseline reference must be a version tag"
 baseline_commit="$(git -C "$ROOT" rev-parse --verify "$BASELINE_REF^{commit}")"
 candidate_commit="$(git -C "$ROOT" rev-parse --verify "$CANDIDATE_REF^{commit}")"
-tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$BASELINE_REF^{commit}")"
 BASELINE_TARGET="$TARGET_ROOT/$baseline_commit"
 CANDIDATE_TARGET="$TARGET_ROOT/$candidate_commit"
-[[ "$baseline_commit" == "$tag_commit" ]] ||
-  die "baseline must resolve to the exact $BASELINE_REF tag commit"
+if [[ "$QUALIFICATION_DEV" == 0 ]]; then
+  [[ "$BASELINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+    die "baseline reference must be a version tag"
+  tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$BASELINE_REF^{commit}")"
+  [[ "$baseline_commit" == "$tag_commit" ]] ||
+    die "baseline must resolve to the exact $BASELINE_REF tag commit"
+fi
 
 case "$EVIDENCE_OUTPUT" in
   "$ROOT/benchmarks/qualifications/"*)
@@ -153,11 +156,12 @@ read_workspace_version() {
 
 baseline_version="$(read_workspace_version "$BASELINE_SOURCE")"
 candidate_version="$(read_workspace_version "$CANDIDATE_SOURCE")"
-expected_baseline_version="${BASELINE_REF#v}"
-[[ "$baseline_version" == "$expected_baseline_version" ]] ||
-  die "baseline workspace version is $baseline_version, expected $expected_baseline_version"
-if [[ "$QUALIFICATION_DEV" == 0 && "$candidate_version" != "$RELEASE" ]]; then
-  die "candidate workspace version is $candidate_version, expected $RELEASE"
+if [[ "$QUALIFICATION_DEV" == 0 ]]; then
+  expected_baseline_version="${BASELINE_REF#v}"
+  [[ "$baseline_version" == "$expected_baseline_version" ]] ||
+    die "baseline workspace version is $baseline_version, expected $expected_baseline_version"
+  [[ "$candidate_version" == "$RELEASE" ]] ||
+    die "candidate workspace version is $candidate_version, expected $RELEASE"
 fi
 
 candidate_context="$CANDIDATE_SOURCE"
@@ -269,7 +273,7 @@ wait_for_broker() {
 
 run_variant() {
   local scenario=$1 pair=$2 position=$3 variant=$4
-  local image commit producers consumers batch rate
+  local image commit producers consumers batch rate attempt
   case "$variant" in
     baseline)
       image="$BASELINE_IMAGE"
@@ -380,25 +384,35 @@ run_variant() {
   if [[ "$consumers" -gt 0 ]]; then
     topic="$(jq -r '.topic' "$report")"
     channel="$(jq -r '.channel' "$report")"
-    stats="$(
-      docker exec "$ACTIVE_BROKER" curl -fsS \
-        "http://127.0.0.1:4151/stats?format=json&include_clients=false&topic=$topic&channel=$channel"
-    )"
-    channel_stats="$(
-      jq -c --arg topic "$topic" --arg channel "$channel" '
-        [.topics[]
-          | select(.topic_name == $topic)
-          | .channels[]
-          | select(.channel_name == $channel)][0]
-      ' <<<"$stats"
-    )"
-    [[ "$channel_stats" != null ]] || {
-      cleanup_run
-      die "$label final Channel stats are missing"
-    }
-    final_depth="$(jq -r '.depth' <<<"$channel_stats")"
-    final_in_flight="$(jq -r '.in_flight_count' <<<"$channel_stats")"
-    final_deferred="$(jq -r '.deferred_count' <<<"$channel_stats")"
+    for ((attempt = 1; attempt <= FINAL_DRAIN_ATTEMPTS; attempt++)); do
+      stats="$(
+        docker exec "$ACTIVE_BROKER" curl -fsS \
+          "http://127.0.0.1:4151/stats?format=json&include_clients=false&topic=$topic&channel=$channel"
+      )"
+      channel_stats="$(
+        jq -c --arg topic "$topic" --arg channel "$channel" '
+          [.topics[]
+            | select(.topic_name == $topic)
+            | .channels[]
+            | select(.channel_name == $channel)][0]
+        ' <<<"$stats"
+      )"
+      [[ "$channel_stats" != null ]] || {
+        cleanup_run
+        die "$label final Channel stats are missing"
+      }
+      final_depth="$(jq -r '.depth' <<<"$channel_stats")"
+      final_in_flight="$(jq -r '.in_flight_count' <<<"$channel_stats")"
+      final_deferred="$(jq -r '.deferred_count' <<<"$channel_stats")"
+      if [[ "$final_depth" -eq 0 && "$final_in_flight" -eq 0 && "$final_deferred" -eq 0 ]]; then
+        break
+      fi
+      if [[ "$attempt" -eq "$FINAL_DRAIN_ATTEMPTS" ]]; then
+        cleanup_run
+        die "$label left Channel backlog after drain"
+      fi
+      sleep 1
+    done
   fi
 
   prometheus="$(

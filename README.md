@@ -11,14 +11,14 @@
 [NSQ performance boundaries](docs/architecture/nsq-performance.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.8.3 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.3)
+[v0.8.4 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.4)
 
-RustQueue 0.8.3 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.8.4 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.8.3](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.3).
+> Current release: [v0.8.4](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.4).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -44,45 +44,45 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.8.3
+## What's new in 0.8.4
 
-- **Deadline-indexed delivery.** Channel and TCP-session leases now use an
-  ordered deadline index instead of rescanning every in-flight delivery on
-  each fetch or session event. `TOUCH`, `FIN`, `REQ`, completion, and disconnect
-  update the same index, so high-RDY consumers avoid stale timer buildup.
-- **NSQ scheduler parity.** NSQ uses an in-flight priority queue; RustQueue now
-  matches that scheduler shape while keeping token-checked at-least-once
-  delivery and the durable Channel WAL acknowledgement boundary.
-- **Durability-aware comparison.** Benchmark documentation now distinguishes
-  RustQueue's acknowledgement-after-fsync semantics from NSQ diskqueue writes
-  and its optional memory queue. `--sync-every=1` is reported as an NSQ write
-  profile, not as an equal durability claim.
-- **No format migration.** The disk format remains v7, and the NSQ/Kodo wire
-  contract is unchanged from 0.8.2.
+- **Larger durable Channel groups.** `FIN` and `REQ` requests now share a
+  bounded 1 ms Channel WAL group commit of up to 1,024 requests. Every success
+  still crosses the affected WAL `fsync` before the client sees completion.
+- **More delivery concurrency.** Channel WAL `fsync` runs after releasing the
+  Topic state lock and uses an independent commit gate, so delivery reservations
+  can continue while the durable boundary is being written.
+- **Lower hot-path allocation cost.** WAL commands use stack encoding, TCP and
+  Channel operations share `Arc<str>` channel identities, Channel futures avoid
+  an extra `Box`, and each session bounds active Channel operations at 256.
+- **Stricter benchmark completion.** The benchmark consumer waits for EOF and
+  verifies a complete final drain before accepting a result.
+- **No compatibility change.** The v7 on-disk format and the durable `FIN`/`REQ`
+  fsync contract remain unchanged.
 
-See the [v0.8.3 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.3)
+See the [v0.8.4 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.4)
 and [NSQ performance boundaries](docs/architecture/nsq-performance.md) for
 the contract and benchmark interpretation.
 
-## Download 0.8.3
+## Download 0.8.4
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.8.3-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.3-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.3-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.8.3.tgz` | Helm Chart |
-| `SHA256SUMS-0.8.3` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.8.4-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.4-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.8.4-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.8.4.tgz` | Helm Chart |
+| `SHA256SUMS-0.8.4` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.3/rustqueue-0.8.3-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.3/SHA256SUMS-0.8.3"
-sha256sum --check --ignore-missing SHA256SUMS-0.8.3
-tar -xzf "rustqueue-0.8.3-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.4/rustqueue-0.8.4-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.4/SHA256SUMS-0.8.4"
+sha256sum --check --ignore-missing SHA256SUMS-0.8.4
+tar -xzf "rustqueue-0.8.4-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -115,8 +115,10 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 - IDs are durably reserved in blocks, so restarts may create harmless gaps but
   never reuse a broker-scoped message ID.
 - Concurrent `FIN` and `REQ` for one topic share a bounded group commit (up to
-  64 requests with at most 1 ms coalescing delay). A successful response has
-  passed every affected local channel WAL `fsync`.
+  1,024 requests with at most 1 ms coalescing delay). The Topic state lock is
+  released during the WAL `fsync`, while an independent gate serializes durable
+  Channel mutations. A successful response has passed every affected local
+  channel WAL `fsync`.
 - Delivery is at least once. A restart redelivers messages without durable FIN.
 - The broker PVC is the only copy; permanent PVC loss loses its messages.
 - Topics and channels are broker-local. Lookup consumers union all owners.
@@ -223,7 +225,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.8.3 \
+  --set queue.image=registry.example/rustqueue:0.8.4 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -460,7 +462,7 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.8.3 CI/CD workflow publishes a Release only after the non-Kubernetes
+The v0.8.4 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one

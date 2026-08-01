@@ -317,13 +317,28 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    // CLOSE_WAIT acknowledges CLS, while the server may still be making
+    // already-received FINs durable. EOF is the completed session boundary.
+    let mut close_wait = false;
     loop {
-        let (frame_type, response) = match pending.take() {
-            Some(frame) => frame,
-            None => read_frame(reader).await?,
+        let frame = match pending.take() {
+            Some(frame) => Ok(frame),
+            None => read_frame(reader).await,
+        };
+        let (frame_type, response) = match frame {
+            Ok(frame) => frame,
+            Err(error)
+                if close_wait
+                    && error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
         match frame_type {
-            0 if response == b"CLOSE_WAIT" => return Ok(()),
+            0 if response == b"CLOSE_WAIT" => close_wait = true,
             0 if response == b"_heartbeat_" => writer.write_all(b"NOP\n").await?,
             2 if response.len() >= 26 => {
                 writer.write_all(b"FIN ").await?;
@@ -418,6 +433,33 @@ mod tests {
 
         assert!(!result.complete);
         assert_eq!(result.snapshot.unique, 0);
+    }
+
+    #[tokio::test]
+    async fn close_wait_does_not_complete_before_the_server_closes() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let (close_tx, close_rx) = oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            server
+                .write_all(&test_frame(0, b"CLOSE_WAIT"))
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            close_rx.await.unwrap();
+        });
+        let mut client_task =
+            tokio::spawn(async move { close_consumer(&mut reader, &mut writer, None).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut client_task)
+                .await
+                .is_err(),
+            "CLOSE_WAIT must not be treated as the durable session boundary"
+        );
+        close_tx.send(()).unwrap();
+        client_task.await.unwrap().unwrap();
+        server_task.await.unwrap();
     }
 
     #[tokio::test]

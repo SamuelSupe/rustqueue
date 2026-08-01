@@ -112,8 +112,8 @@ pub(super) async fn process_command(
             match create_result {
                 Ok(()) => {
                     state.subscription = Some(Subscription {
-                        topic,
-                        channel,
+                        topic: topic.into(),
+                        channel: channel.into(),
                         lease,
                     });
                     write_frame(writer, FrameType::Response, OK).await?;
