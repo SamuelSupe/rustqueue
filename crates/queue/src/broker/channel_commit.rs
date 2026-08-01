@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 const QUEUE_CAPACITY: usize = 1024;
-const MAX_GROUP_REQUESTS: usize = 256;
+const MAX_GROUP_REQUESTS: usize = QUEUE_CAPACITY;
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) enum ChannelOperation {
@@ -43,7 +43,7 @@ struct WorkerEntry {
 }
 
 struct ChannelRequest {
-    channel: String,
+    channel: Arc<str>,
     operation: ChannelOperation,
     enqueued_at: Instant,
     reply: oneshot::Sender<Result<(), BrokerError>>,
@@ -72,7 +72,7 @@ impl ChannelGroups {
         &self,
         broker: &Broker,
         topic: &str,
-        channel: String,
+        channel: Arc<str>,
         operation: ChannelOperation,
     ) -> Result<(), BrokerError> {
         let sender = self.sender(broker, topic)?;
@@ -171,6 +171,7 @@ impl Broker {
                 return;
             }
         };
+        let _channel_commit_gate = handle.channel_commit_gate.lock();
         let mut topic_state = handle.state.lock();
         let mut pending = Vec::with_capacity(requests.len());
         let mut touched = BTreeSet::new();
@@ -187,7 +188,7 @@ impl Broker {
                 .metrics
                 .channel_group_commit_wait
                 .observe(enqueued_at.elapsed());
-            if let Err(error) = self.ensure_management_access(topic, Some(&channel)) {
+            if let Err(error) = self.ensure_management_access(topic, Some(channel.as_ref())) {
                 let _ = reply.send(Err(error));
                 continue;
             }
@@ -196,12 +197,12 @@ impl Broker {
                     id,
                     require_in_flight,
                     token,
-                } => topic_state.finish_buffered(&channel, id, require_in_flight, token),
+                } => topic_state.finish_buffered(channel.as_ref(), id, require_in_flight, token),
                 ChannelOperation::Requeue {
                     id,
                     available_at_ms,
                     token,
-                } => topic_state.requeue_buffered(&channel, id, available_at_ms, token),
+                } => topic_state.requeue_buffered(channel.as_ref(), id, available_at_ms, token),
             };
             match result {
                 Ok(()) => {
@@ -226,16 +227,35 @@ impl Broker {
         }
 
         rustqueue_storage::crash_failpoint("channel_group_after_append_before_fsync");
+        let syncs = match topic_state.prepare_channel_wal_syncs(touched.iter()) {
+            Ok(syncs) => syncs,
+            Err(error) => {
+                self.observe_storage_result::<()>(Err(copy_error(&error)))
+                    .ok();
+                fail_pending(pending);
+                return;
+            }
+        };
+        // Delivery reservations only need the Topic state lock. The Channel
+        // gate above keeps WAL/checkpoint writers serialized during this fsync.
+        drop(topic_state);
         let sync_result = {
             let _timer = self.inner.metrics.channel_fsync.timer();
-            topic_state.sync_channel_wals(touched.iter())
+            syncs
+                .into_iter()
+                .try_for_each(|wal| wal.sync_data().map_err(BrokerError::from))
         };
         if let Err(error) = sync_result {
+            handle
+                .state
+                .lock()
+                .mark_channel_wal_sync_failed(touched.iter());
             self.observe_storage_result::<()>(Err(copy_error(&error)))
                 .ok();
             fail_pending(pending);
             return;
         }
+        let mut topic_state = handle.state.lock();
         if let Err(error) = topic_state.checkpoint_channels_if_needed(touched.iter()) {
             self.observe_storage_result::<()>(Err(copy_error(&error)))
                 .ok();
@@ -273,7 +293,7 @@ async fn run_worker(
                 continue;
             }
         };
-        let requests = collect_group(first, &mut receiver).await;
+        let requests = collect_group(first, &mut receiver, COALESCE_DELAY).await;
         let Some(inner) = broker.upgrade() else {
             return;
         };
@@ -296,8 +316,9 @@ async fn run_worker(
 async fn collect_group(
     first: ChannelRequest,
     receiver: &mut mpsc::Receiver<ChannelRequest>,
+    coalesce_delay: Duration,
 ) -> Vec<ChannelRequest> {
-    let deadline = tokio::time::Instant::now() + COALESCE_DELAY;
+    let deadline = tokio::time::Instant::now() + coalesce_delay;
     let mut requests = vec![first];
     loop {
         if requests.len() >= MAX_GROUP_REQUESTS {
@@ -358,7 +379,9 @@ mod tests {
         }
         let first = receiver.recv().await.unwrap();
         assert_eq!(
-            collect_group(first, &mut receiver).await.len(),
+            collect_group(first, &mut receiver, COALESCE_DELAY)
+                .await
+                .len(),
             MAX_GROUP_REQUESTS
         );
         assert!(receiver.try_recv().is_ok());
@@ -369,13 +392,12 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(8);
         sender.send(request()).await.unwrap();
         sender.send(request()).await.unwrap();
-        let late_sender = tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            sender.send(request()).await.unwrap();
-        });
-
         let first = receiver.recv().await.unwrap();
-        assert_eq!(collect_group(first, &mut receiver).await.len(), 3);
-        late_sender.await.unwrap();
+        let collector = tokio::spawn(async move {
+            collect_group(first, &mut receiver, Duration::from_secs(1)).await
+        });
+        tokio::task::yield_now().await;
+        sender.send(request()).await.unwrap();
+        assert_eq!(collector.await.unwrap().len(), 3);
     }
 }

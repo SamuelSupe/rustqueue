@@ -464,6 +464,7 @@ impl Broker {
             broker.ensure_management_access(&topic, Some(&channel))?;
             let handle = broker.get_or_create_topic_locked(&topic)?;
             let _commit_gate = handle.commit_gate.lock();
+            let _channel_commit_gate = handle.channel_commit_gate.lock();
             if handle
                 .state
                 .lock()
@@ -487,6 +488,7 @@ impl Broker {
             broker.ensure_management_access(&topic, Some(&channel))?;
             let handle = broker.topic(&topic)?;
             let _commit_gate = handle.commit_gate.lock();
+            let _channel_commit_gate = handle.channel_commit_gate.lock();
             handle.state.lock().delete_channel(&channel)?;
             broker.bump_registry()?;
             Ok(())
@@ -524,6 +526,7 @@ impl Broker {
             broker.ensure_management_access(&topic, Some(&channel))?;
             let handle = broker.topic(&topic)?;
             let _commit_gate = handle.commit_gate.lock();
+            let _channel_commit_gate = handle.channel_commit_gate.lock();
             let result = handle.state.lock().set_channel_paused(&channel, paused);
             result
         })
@@ -539,6 +542,7 @@ impl Broker {
             broker.ensure_management_access(&topic, None)?;
             let handle = broker.topic(&topic)?;
             let _commit_gate = handle.commit_gate.lock();
+            let _channel_commit_gate = handle.channel_commit_gate.lock();
             let result = handle.state.lock().empty_topic();
             result
         })
@@ -555,6 +559,7 @@ impl Broker {
             broker.ensure_management_access(&topic, Some(&channel))?;
             let handle = broker.topic(&topic)?;
             let _commit_gate = handle.commit_gate.lock();
+            let _channel_commit_gate = handle.channel_commit_gate.lock();
             let result = handle.state.lock().empty_channel(&channel);
             result
         })

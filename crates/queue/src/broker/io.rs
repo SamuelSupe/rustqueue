@@ -11,13 +11,26 @@ pub(super) const SEQUENCE_RESERVATION: u64 = 1 << 20;
 
 impl Broker {
     pub async fn finish(&self, topic: &str, channel: &str, id: u64) -> Result<(), BrokerError> {
-        self.finish_with_token(topic, channel, id, None).await
+        self.finish_with_token(topic, Arc::from(channel), id, None)
+            .await
     }
 
     pub async fn finish_delivery(
         &self,
         topic: &str,
         channel: &str,
+        id: u64,
+        token: u64,
+    ) -> Result<(), BrokerError> {
+        self.finish_with_token(topic, Arc::from(channel), id, Some(token))
+            .await
+    }
+
+    /// Finishes a delivery while reusing a caller-owned shared Channel name.
+    pub async fn finish_delivery_shared(
+        &self,
+        topic: &str,
+        channel: Arc<str>,
         id: u64,
         token: u64,
     ) -> Result<(), BrokerError> {
@@ -28,19 +41,19 @@ impl Broker {
     async fn finish_with_token(
         &self,
         topic: &str,
-        channel: &str,
+        channel: Arc<str>,
         id: u64,
         token: Option<u64>,
     ) -> Result<(), BrokerError> {
         let _timer = self.inner.metrics.channel_ack.timer();
         self.ensure_storage_healthy()?;
-        self.ensure_management_access(topic, Some(channel))?;
+        self.ensure_management_access(topic, Some(channel.as_ref()))?;
         self.inner
             .channel_groups
             .submit(
                 self,
                 topic,
-                channel.to_owned(),
+                channel,
                 super::channel_commit::ChannelOperation::Finish {
                     id,
                     require_in_flight: true,
@@ -61,11 +74,10 @@ impl Broker {
         let channel = channel.to_owned();
         let result = self
             .storage_task(move || {
-                broker
-                    .topic(&topic)?
-                    .state
-                    .lock()
-                    .finish(&channel, id, false)
+                let handle = broker.topic(&topic)?;
+                let _channel_commit_gate = handle.channel_commit_gate.lock();
+                let result = handle.state.lock().finish(&channel, id, false);
+                result
             })
             .await;
         match result {
@@ -99,7 +111,7 @@ impl Broker {
         id: u64,
         delay: Duration,
     ) -> Result<(), BrokerError> {
-        self.requeue_with_token(topic, channel, id, None, delay)
+        self.requeue_with_token(topic, Arc::from(channel), id, None, delay)
             .await
     }
 
@@ -111,6 +123,19 @@ impl Broker {
         token: u64,
         delay: Duration,
     ) -> Result<(), BrokerError> {
+        self.requeue_with_token(topic, Arc::from(channel), id, Some(token), delay)
+            .await
+    }
+
+    /// Requeues a delivery while reusing a caller-owned shared Channel name.
+    pub async fn requeue_delivery_shared(
+        &self,
+        topic: &str,
+        channel: Arc<str>,
+        id: u64,
+        token: u64,
+        delay: Duration,
+    ) -> Result<(), BrokerError> {
         self.requeue_with_token(topic, channel, id, Some(token), delay)
             .await
     }
@@ -118,14 +143,14 @@ impl Broker {
     async fn requeue_with_token(
         &self,
         topic: &str,
-        channel: &str,
+        channel: Arc<str>,
         id: u64,
         token: Option<u64>,
         delay: Duration,
     ) -> Result<(), BrokerError> {
         let _timer = self.inner.metrics.channel_ack.timer();
         self.ensure_storage_healthy()?;
-        self.ensure_management_access(topic, Some(channel))?;
+        self.ensure_management_access(topic, Some(channel.as_ref()))?;
         let available = now_ms().saturating_add(delay.as_millis().min(i64::MAX as u128) as i64);
         let result = self
             .inner
@@ -133,7 +158,7 @@ impl Broker {
             .submit(
                 self,
                 topic,
-                channel.to_owned(),
+                channel,
                 super::channel_commit::ChannelOperation::Requeue {
                     id,
                     available_at_ms: available,
@@ -434,6 +459,7 @@ impl Broker {
                 return Err(error);
             }
             let finish = self.topic(&entry.source_topic).and_then(|topic| {
+                let _channel_commit_gate = topic.channel_commit_gate.lock();
                 topic
                     .state
                     .lock()

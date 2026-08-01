@@ -35,6 +35,9 @@ pub(crate) struct PendingSync {
 
 pub(crate) struct TopicHandle {
     pub commit_gate: Mutex<()>,
+    // Durable Channel mutations must hold this while the Topic state lock is
+    // released for WAL fsync, so checkpoints cannot include an uncommitted ACK.
+    pub channel_commit_gate: Mutex<()>,
     pub state: Mutex<Topic>,
     pub wake: tokio::sync::watch::Sender<u64>,
 }
@@ -85,6 +88,7 @@ impl TopicHandle {
         topic.reconcile_unrouted_boundary()?;
         Ok(Arc::new(Self {
             commit_gate: Mutex::new(()),
+            channel_commit_gate: Mutex::new(()),
             state: Mutex::new(topic),
             wake,
         }))
@@ -118,6 +122,7 @@ impl TopicHandle {
         let (wake, _) = tokio::sync::watch::channel(0);
         Ok(Arc::new(Self {
             commit_gate: Mutex::new(()),
+            channel_commit_gate: Mutex::new(()),
             state: Mutex::new(Topic {
                 name: name.into(),
                 directory: directory.into(),
@@ -653,30 +658,46 @@ impl Topic {
         Ok(())
     }
 
-    pub fn sync_channel_wals<'a>(
+    pub fn prepare_channel_wal_syncs<'a>(
         &mut self,
-        channels: impl Iterator<Item = &'a String>,
-    ) -> Result<(), BrokerError> {
+        channels: impl Iterator<Item = &'a Arc<str>>,
+    ) -> Result<Vec<File>, BrokerError> {
+        let mut syncs = Vec::new();
         for name in channels {
             let runtime = self
                 .channels
-                .get_mut(name)
+                .get_mut(name.as_ref())
                 .ok_or(BrokerError::ChannelNotFound)?;
             if let Some(store) = runtime.store.as_mut() {
-                store.sync()?;
+                syncs.push(store.prepare_sync()?);
             }
         }
-        Ok(())
+        Ok(syncs)
+    }
+
+    pub fn mark_channel_wal_sync_failed<'a>(
+        &mut self,
+        channels: impl Iterator<Item = &'a Arc<str>>,
+    ) {
+        for name in channels {
+            if let Some(store) = self
+                .channels
+                .get_mut(name.as_ref())
+                .and_then(|runtime| runtime.store.as_mut())
+            {
+                store.mark_sync_failed();
+            }
+        }
     }
 
     pub fn checkpoint_channels_if_needed<'a>(
         &mut self,
-        channels: impl Iterator<Item = &'a String>,
+        channels: impl Iterator<Item = &'a Arc<str>>,
     ) -> Result<(), BrokerError> {
         for name in channels {
             let runtime = self
                 .channels
-                .get_mut(name)
+                .get_mut(name.as_ref())
                 .ok_or(BrokerError::ChannelNotFound)?;
             if let Some(store) = runtime.store.as_mut() {
                 store.checkpoint_if_needed(&runtime.state)?;

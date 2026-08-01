@@ -85,7 +85,9 @@ impl Broker {
             return Ok(false);
         };
         let commit_gate = handle.commit_gate.lock();
+        let channel_commit_gate = handle.channel_commit_gate.lock();
         handle.state.lock().mark_deleted()?;
+        drop(channel_commit_gate);
         drop(commit_gate);
         self.inner.topics.write().remove(name);
         let directory = topic_directory(&self.inner.config.data_path, name);

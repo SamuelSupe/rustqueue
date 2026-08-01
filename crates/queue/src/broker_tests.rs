@@ -443,6 +443,48 @@ async fn delivery_reservation_does_not_wait_for_the_publish_commit_gate() {
     assert_eq!(&*message.body, b"already-durable");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_reservation_does_not_wait_for_channel_wal_sync() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![bytes::Bytes::from_static(b"already-durable")],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    let handle = broker.topic("events").unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let lock_thread = std::thread::spawn(move || {
+        // Channel commits retain this gate while their WAL is syncing, but
+        // must release the Topic state lock so delivery can continue.
+        let _channel_commit_gate = handle.channel_commit_gate.lock();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    let delivery = tokio::time::timeout(
+        Duration::from_secs(1),
+        broker.next_message("events", "workers", None),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    lock_thread.join().unwrap();
+
+    let message = delivery.unwrap().unwrap().unwrap();
+    assert_eq!(&*message.body, b"already-durable");
+}
+
 #[tokio::test]
 async fn startup_replays_dlq_outbox_before_finishing_the_source() {
     let root = tempdir().unwrap();

@@ -10,6 +10,7 @@ const WAL_MAGIC: &[u8; 4] = b"RCW7";
 const CHECKPOINT_MAGIC: &[u8; 4] = b"RCC7";
 const HEADER_LEN: usize = 12;
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
+const ENCODED_COMMAND_BYTES: usize = 35;
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 const CHECKPOINT_INTERVAL: usize = 8 * 1024;
 const MAX_RECOVERY_COMMANDS: usize = CHECKPOINT_INTERVAL * 2;
@@ -19,6 +20,7 @@ pub(crate) struct ChannelStore {
     checkpoint_path: PathBuf,
     wal_path: PathBuf,
     wal: File,
+    pending_wal: Vec<u8>,
     commands_since_checkpoint: usize,
     isolated: bool,
 }
@@ -47,6 +49,7 @@ impl ChannelStore {
             checkpoint_path,
             wal_path,
             wal,
+            pending_wal: Vec::new(),
             commands_since_checkpoint: 0,
             isolated: false,
         })
@@ -87,6 +90,7 @@ impl ChannelStore {
                 checkpoint_path: checkpoint_path.into(),
                 wal_path,
                 wal,
+                pending_wal: Vec::new(),
                 commands_since_checkpoint: commands.len(),
                 isolated: false,
             },
@@ -103,31 +107,41 @@ impl ChannelStore {
 
     pub fn append_buffered(&mut self, command: &ChannelCommand) -> Result<(), BrokerError> {
         self.ensure_available()?;
-        let body = encode_command(command);
-        if body.len() > MAX_COMMAND_BYTES {
-            return Err(BrokerError::InvalidRecord(
-                "channel command is too large".into(),
-            ));
-        }
+        let mut body = [0u8; ENCODED_COMMAND_BYTES];
+        let body_len = encode_command(command, &mut body);
+        let body = &body[..body_len];
         let mut header = [0u8; HEADER_LEN];
         header[0..4].copy_from_slice(WAL_MAGIC);
         header[4..8].copy_from_slice(&(body.len() as u32).to_be_bytes());
-        header[8..12].copy_from_slice(&crc32c::crc32c(&body).to_be_bytes());
-        if let Err(error) = self.append_bytes(&header, &body) {
-            self.isolated = true;
-            return Err(error);
-        }
+        header[8..12].copy_from_slice(&crc32c::crc32c(body).to_be_bytes());
+        self.pending_wal.reserve(HEADER_LEN + body.len());
+        self.pending_wal.extend_from_slice(&header);
+        self.pending_wal.extend_from_slice(body);
         self.commands_since_checkpoint += 1;
         Ok(())
     }
 
     pub fn sync(&mut self) -> Result<(), BrokerError> {
         self.ensure_available()?;
+        self.flush_pending()?;
         if let Err(error) = self.wal.sync_data() {
             self.isolated = true;
             return Err(error.into());
         }
         Ok(())
+    }
+
+    pub fn prepare_sync(&mut self) -> Result<File, BrokerError> {
+        self.ensure_available()?;
+        self.flush_pending()?;
+        self.wal.try_clone().map_err(|error| {
+            self.isolated = true;
+            error.into()
+        })
+    }
+
+    pub fn mark_sync_failed(&mut self) {
+        self.isolated = true;
     }
 
     pub fn checkpoint_if_needed(&mut self, state: &ChannelState) -> Result<(), BrokerError> {
@@ -147,13 +161,20 @@ impl ChannelStore {
         Ok(())
     }
 
-    fn append_bytes(&mut self, header: &[u8], body: &[u8]) -> Result<(), BrokerError> {
-        self.wal.write_all(header)?;
-        self.wal.write_all(body)?;
+    fn flush_pending(&mut self) -> Result<(), BrokerError> {
+        if self.pending_wal.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self.wal.write_all(&self.pending_wal) {
+            self.isolated = true;
+            return Err(error.into());
+        }
+        self.pending_wal.clear();
         Ok(())
     }
 
     fn write_checkpoint_and_reset(&mut self, state: &ChannelState) -> Result<(), BrokerError> {
+        debug_assert!(self.pending_wal.is_empty());
         write_checkpoint(&self.checkpoint_path, &state.checkpoint())?;
         self.wal = OpenOptions::new()
             .write(true)
@@ -357,16 +378,16 @@ fn recover_wal(path: &Path) -> Result<Vec<ChannelCommand>, BrokerError> {
     Ok(commands)
 }
 
-fn encode_command(command: &ChannelCommand) -> Vec<u8> {
-    let mut body = Vec::with_capacity(27);
+fn encode_command(command: &ChannelCommand, body: &mut [u8; ENCODED_COMMAND_BYTES]) -> usize {
     match *command {
         ChannelCommand::Finish {
             position,
             message_id,
         } => {
-            body.push(1);
-            body.extend_from_slice(&position.to_be_bytes());
-            body.extend_from_slice(&message_id.to_be_bytes());
+            body[0] = 1;
+            body[1..9].copy_from_slice(&position.to_be_bytes());
+            body[9..17].copy_from_slice(&message_id.to_be_bytes());
+            17
         }
         ChannelCommand::Requeue {
             position,
@@ -375,32 +396,38 @@ fn encode_command(command: &ChannelCommand) -> Vec<u8> {
             attempts,
             cumulative_count,
         } => {
-            body.push(if cumulative_count.is_some() { 7 } else { 2 });
-            body.extend_from_slice(&position.to_be_bytes());
-            body.extend_from_slice(&message_id.to_be_bytes());
-            body.extend_from_slice(&available_at_ms.to_be_bytes());
-            body.extend_from_slice(&attempts.to_be_bytes());
+            body[0] = if cumulative_count.is_some() { 7 } else { 2 };
+            body[1..9].copy_from_slice(&position.to_be_bytes());
+            body[9..17].copy_from_slice(&message_id.to_be_bytes());
+            body[17..25].copy_from_slice(&available_at_ms.to_be_bytes());
+            body[25..27].copy_from_slice(&attempts.to_be_bytes());
             if let Some(count) = cumulative_count {
-                body.extend_from_slice(&count.to_be_bytes());
+                body[27..35].copy_from_slice(&count.to_be_bytes());
+                35
+            } else {
+                27
             }
         }
         ChannelCommand::Pause { paused } => {
-            body.extend_from_slice(&[3, paused as u8]);
+            body[..2].copy_from_slice(&[3, paused as u8]);
+            2
         }
         ChannelCommand::Empty { through_position } => {
-            body.push(4);
-            body.extend_from_slice(&through_position.to_be_bytes());
+            body[0] = 4;
+            body[1..9].copy_from_slice(&through_position.to_be_bytes());
+            9
         }
         ChannelCommand::Evict { through_position } => {
-            body.push(5);
-            body.extend_from_slice(&through_position.to_be_bytes());
+            body[0] = 5;
+            body[1..9].copy_from_slice(&through_position.to_be_bytes());
+            9
         }
         ChannelCommand::Timeout { cumulative_count } => {
-            body.push(6);
-            body.extend_from_slice(&cumulative_count.to_be_bytes());
+            body[0] = 6;
+            body[1..9].copy_from_slice(&cumulative_count.to_be_bytes());
+            9
         }
     }
-    body
 }
 
 fn decode_command(body: &[u8]) -> Result<ChannelCommand, BrokerError> {
@@ -606,7 +633,9 @@ mod tests {
             position: 1,
             message_id: 7,
         };
-        let mut encoded = encode_command(&command);
+        let mut buffer = [0u8; ENCODED_COMMAND_BYTES];
+        let len = encode_command(&command, &mut buffer);
+        let mut encoded = buffer[..len].to_vec();
         encoded.push(0);
         assert!(decode_command(&encoded).is_err());
     }
@@ -620,11 +649,13 @@ mod tests {
             attempts: 1,
             cumulative_count: None,
         };
-        let encoded = encode_command(&legacy);
+        let mut encoded = [0u8; ENCODED_COMMAND_BYTES];
+        let len = encode_command(&legacy, &mut encoded);
+        let encoded = &encoded[..len];
         assert_eq!(encoded[0], 2);
         assert_eq!(encoded.len(), 27);
         assert!(matches!(
-            decode_command(&encoded).unwrap(),
+            decode_command(encoded).unwrap(),
             ChannelCommand::Requeue {
                 cumulative_count: None,
                 ..
@@ -638,7 +669,9 @@ mod tests {
             attempts: 1,
             cumulative_count: Some(1),
         };
-        let encoded = encode_command(&durable);
+        let mut encoded = [0u8; ENCODED_COMMAND_BYTES];
+        let len = encode_command(&durable, &mut encoded);
+        let encoded = &encoded[..len];
         assert_eq!(encoded[0], 7);
         assert_eq!(encoded.len(), 35);
     }
