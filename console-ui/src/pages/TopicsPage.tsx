@@ -3,6 +3,7 @@ import { Button, Column, Grid, InlineLoading, InlineNotification, Search, Table,
 import { useMemo, useState } from 'react';
 import { useManagement } from '../api/useManagement';
 import type { ManagementAction, Snapshot, Topic } from '../api/types';
+import { ConfigureTopicDialog } from '../components/ConfigureTopicDialog';
 import { CreateResourceDialog } from '../components/CreateResourceDialog';
 import { EmptyState } from '../components/EmptyState';
 import { ManagementAccess } from '../components/ManagementAccess';
@@ -20,6 +21,7 @@ export function TopicsPage({ snapshot, refresh }: { snapshot: Snapshot; refresh:
   const [query, setQuery] = useState('');
   const [createKind, setCreateKind] = useState<'topic' | 'channel'>();
   const [pending, setPending] = useState<ManagementAction>();
+  const [configuring, setConfiguring] = useState<Topic>();
   const [notice, setNotice] = useState<string>();
   const [settling, setSettling] = useState(false);
   const filtered = useMemo(() => snapshot.topics.filter((topic) => topic.name.toLowerCase().includes(query.toLowerCase())), [query, snapshot.topics]);
@@ -67,8 +69,8 @@ export function TopicsPage({ snapshot, refresh }: { snapshot: Snapshot; refresh:
           <Column sm={4} md={8} lg={9}>
             <TableContainer className="panel" title={t('topics.title')}>
               <Table size="md" useZebraStyles>
-                <TableHead><TableRow>{[t('topics.name'), t('common.status'), t('topics.messages'), t('topics.channels'), t('topics.segments'), t('common.owner'), ...(enabled ? [t('management.actions')] : [])].map((value) => <TableHeader key={value}>{value}</TableHeader>)}</TableRow></TableHead>
-                <TableBody>{filtered.map((item) => <TopicRow key={item.name} topic={item} selected={item.name === topic?.name} managementEnabled={enabled} managementUnlocked={unlocked && !settling} onAction={setPending} onSelect={() => setSelected(item.name)} />)}</TableBody>
+                <TableHead><TableRow>{[t('topics.name'), t('common.status'), t('topics.deliveryPolicy'), t('topics.messages'), t('topics.channels'), t('topics.segments'), t('common.owner'), ...(enabled ? [t('management.actions')] : [])].map((value) => <TableHeader key={value}>{value}</TableHeader>)}</TableRow></TableHead>
+                <TableBody>{filtered.map((item) => <TopicRow key={item.name} topic={item} selected={item.name === topic?.name} managementEnabled={enabled} managementUnlocked={unlocked && !settling} onConfigure={() => setConfiguring(item)} onAction={setPending} onSelect={() => setSelected(item.name)} />)}</TableBody>
               </Table>
             </TableContainer>
           </Column>
@@ -76,22 +78,24 @@ export function TopicsPage({ snapshot, refresh }: { snapshot: Snapshot; refresh:
         </Grid>
       )}
       <CreateResourceDialog open={Boolean(createKind)} kind={createKind || 'topic'} topic={topic?.name} onClose={() => setCreateKind(undefined)} onContinue={(action) => { setCreateKind(undefined); setPending(action); }} />
+      <ConfigureTopicDialog topic={configuring} onClose={() => setConfiguring(undefined)} onContinue={(action) => { setConfiguring(undefined); setPending(action); }} />
       <ManagementActionDialog action={pending} busy={management.busy || settling} onPreview={management.preview} onApply={management.apply} onClose={() => setPending(undefined)} onComplete={complete} />
     </>
   );
 }
 
-function TopicRow({ topic, selected, managementEnabled, managementUnlocked, onAction, onSelect }: { topic: Topic; selected: boolean; managementEnabled: boolean; managementUnlocked: boolean; onAction: (action: ManagementAction) => void; onSelect: () => void }) {
+function TopicRow({ topic, selected, managementEnabled, managementUnlocked, onConfigure, onAction, onSelect }: { topic: Topic; selected: boolean; managementEnabled: boolean; managementUnlocked: boolean; onConfigure: () => void; onAction: (action: ManagementAction) => void; onSelect: () => void }) {
   const { t } = useI18n();
   return (
     <TableRow className={selected ? 'selected-row' : ''} onClick={onSelect}>
       <TableCell><button className="table-link" onClick={onSelect}>{topic.name}</button></TableCell>
       <TableCell><ResourceStatus phase={topic.managed_phase} paused={topic.paused} tombstoneUntil={topic.tombstone_until_ms} /></TableCell>
+      <TableCell><div className="tag-row"><Tag size="sm" type={topic.delivery_mode === 'TTL_DISCARD' ? 'magenta' : 'cool-gray'}>{t(topic.delivery_mode === 'TTL_DISCARD' ? 'topics.mode.ttlDiscard' : 'topics.mode.reliable')}</Tag>{topic.message_ttl_seconds && <span>{number(topic.message_ttl_seconds)}s</span>}</div></TableCell>
       <TableCell>{number(topic.stored_messages)}</TableCell>
       <TableCell>{topic.channels.length}</TableCell>
       <TableCell>{topic.segment_count} / {bytes(topic.segment_bytes)}</TableCell>
       <TableCell><div className="tag-row">{topic.owners.map((owner) => <Tag key={owner} size="sm" type="outline">{owner}</Tag>)}</div></TableCell>
-      {managementEnabled && <TableCell><div onClick={(event) => event.stopPropagation()}><ResourceActionMenu kind="topic" topic={topic.name} paused={topic.paused} phase={topic.managed_phase} disabled={!managementUnlocked} onAction={onAction} /></div></TableCell>}
+      {managementEnabled && <TableCell><div onClick={(event) => event.stopPropagation()}><ResourceActionMenu kind="topic" topic={topic.name} paused={topic.paused} phase={topic.managed_phase} disabled={!managementUnlocked} onConfigure={onConfigure} onAction={onAction} /></div></TableCell>}
     </TableRow>
   );
 }

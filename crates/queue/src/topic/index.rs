@@ -207,6 +207,13 @@ impl MessageIndex {
             .collect()
     }
 
+    pub(crate) fn discard_scheduled_through(&mut self, through_position: u64) {
+        self.scheduled.retain(|_, positions| {
+            positions.retain(|position| *position > through_position);
+            !positions.is_empty()
+        });
+    }
+
     pub(crate) fn active_count(&self) -> usize {
         self.active.len()
     }
@@ -277,6 +284,124 @@ impl MessageIndex {
             .front()
             .map(|segment| segment.first_timestamp_ns)
             .or_else(|| self.active.front().map(|message| message.timestamp_ns))
+    }
+
+    pub(crate) fn first_message_after(
+        &self,
+        position: u64,
+    ) -> Result<Option<(u64, i64)>, BrokerError> {
+        let sealed_index = self
+            .sealed
+            .partition_point(|segment| segment.last_position <= position);
+        if let Some(segment) = self.sealed.get(sealed_index) {
+            let ordinal = position
+                .saturating_add(1)
+                .saturating_sub(segment.first_position)
+                .min(segment.count.saturating_sub(1));
+            let message = self.load_ordinal(segment, ordinal)?;
+            return Ok(Some((message.position, message.timestamp_ns)));
+        }
+        Ok(self
+            .active
+            .iter()
+            .find(|message| message.position > position)
+            .map(|message| (message.position, message.timestamp_ns)))
+    }
+
+    pub(crate) fn through_timestamp_after(
+        &self,
+        position: u64,
+        cutoff_ns: i64,
+        max_messages: u64,
+    ) -> Result<Option<(u64, u64)>, BrokerError> {
+        let mut through = None;
+        let mut messages = 0u64;
+        let sealed_index = self
+            .sealed
+            .partition_point(|segment| segment.last_position <= position);
+        for segment in self.sealed.iter().skip(sealed_index) {
+            let first_ordinal = position
+                .saturating_add(1)
+                .saturating_sub(segment.first_position)
+                .min(segment.count);
+            if first_ordinal >= segment.count || segment.first_timestamp_ns > cutoff_ns {
+                continue;
+            }
+            if segment.last_timestamp_ns <= cutoff_ns {
+                let expired = segment.count - first_ordinal;
+                let take = expired.min(max_messages.saturating_sub(messages));
+                if take == 0 {
+                    break;
+                }
+                through = if take == expired {
+                    Some(segment.last_position)
+                } else {
+                    Some(
+                        self.load_ordinal(segment, first_ordinal + take - 1)?
+                            .position,
+                    )
+                };
+                messages = messages.saturating_add(take);
+                if take < expired || messages >= max_messages {
+                    return Ok(through.map(|through| (through, messages)));
+                }
+                continue;
+            }
+            let mut low = first_ordinal;
+            let mut high = segment.count;
+            while low < high {
+                let ordinal = low + (high - low) / 2;
+                if self.load_ordinal(segment, ordinal)?.timestamp_ns <= cutoff_ns {
+                    low = ordinal + 1;
+                } else {
+                    high = ordinal;
+                }
+            }
+            if low > first_ordinal {
+                let take = (low - first_ordinal).min(max_messages.saturating_sub(messages));
+                let last = self.load_ordinal(segment, first_ordinal + take - 1)?;
+                through = Some(last.position);
+                messages = messages.saturating_add(take);
+            }
+            return Ok(through.map(|through| (through, messages)));
+        }
+        let first_active = self
+            .active
+            .partition_point(|message| message.position <= position);
+        let end = self
+            .active
+            .partition_point(|message| message.timestamp_ns <= cutoff_ns);
+        let take = ((end - first_active) as u64).min(max_messages.saturating_sub(messages));
+        if take > 0 {
+            through = self
+                .active
+                .get(first_active + take as usize - 1)
+                .map(|message| message.position);
+            messages = messages.saturating_add(take);
+        }
+        Ok(through.map(|through| (through, messages)))
+    }
+
+    pub(crate) fn count_after_position(&self, position: u64) -> u64 {
+        let sealed = self
+            .sealed
+            .iter()
+            .map(|segment| {
+                if position < segment.first_position {
+                    segment.count
+                } else if position < segment.last_position {
+                    segment.last_position.saturating_sub(position)
+                } else {
+                    0
+                }
+            })
+            .sum::<u64>();
+        sealed.saturating_add(
+            self.active
+                .iter()
+                .filter(|message| message.position > position)
+                .count() as u64,
+        )
     }
 
     /// Returns a conservative position at or before the first message newer

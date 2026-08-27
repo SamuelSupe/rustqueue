@@ -10,6 +10,7 @@ const FENCE_FORMAT: u8 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum TopicManagementAction {
     Create,
+    Configure,
     Pause,
     Unpause,
     Empty,

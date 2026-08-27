@@ -86,6 +86,12 @@ cookie, a CSRF token and a one-time 60-second action token bound to the resource
 UID, resource version, action and current owners.
 
 Durable Topics and Channels support create, pause, unpause, empty and delete.
+Topic creation also selects `RELIABLE` (the default) or `TTL_DISCARD` with a
+positive TTL in seconds. Existing Topics expose a **Configure TTL** action.
+Enabling or shortening TTL previews the current stored/deferred/in-flight
+impact and requires the exact Topic name because old backlog may expire
+immediately. Extending or disabling TTL affects only content that has not
+already expired. Policy changes are blocked while multiple owners are visible.
 Ephemeral Channels are observation-only. Empty and delete show an impact
 preview and require the exact resource name. Deletion first persists a
 tombstone, then synchronizes the fence to all brokers before removing data.

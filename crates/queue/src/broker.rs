@@ -2,6 +2,8 @@
 mod channel_commit;
 #[path = "broker/delivery.rs"]
 mod delivery;
+#[path = "broker/expiration.rs"]
+mod expiration;
 #[path = "broker/group_commit.rs"]
 mod group_commit;
 #[path = "broker/io.rs"]
@@ -32,7 +34,7 @@ use rustqueue_storage::{
     CompatibilityState, StorageError, BASE_STORAGE_FEATURE_LEVEL,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -175,6 +177,8 @@ pub enum BrokerError {
     OperationConflict,
     #[error("active tombstone deadline is required")]
     InvalidTombstone,
+    #[error("invalid topic delivery policy: {0}")]
+    InvalidTopicPolicy(String),
     #[error("message does not exist")]
     MessageNotFound,
     #[error("message is not in flight")]
@@ -230,6 +234,7 @@ struct BrokerInner {
     registry_revision: AtomicU64,
     storage_healthy: Arc<AtomicBool>,
     gc_cursor: AtomicUsize,
+    expiration_schedule: Mutex<ExpirationSchedule>,
     publish_groups: group_commit::PublishGroups,
     channel_groups: channel_commit::ChannelGroups,
     metrics: QueueMetrics,
@@ -239,6 +244,12 @@ struct BrokerInner {
 struct SequenceState {
     next: u64,
     reserved_exclusive: u64,
+}
+
+#[derive(Default)]
+struct ExpirationSchedule {
+    by_deadline: BTreeMap<i64, BTreeSet<String>>,
+    by_topic: HashMap<String, i64>,
 }
 
 impl Broker {
@@ -409,6 +420,7 @@ impl Broker {
                 registry_revision: AtomicU64::new(revision),
                 storage_healthy,
                 gc_cursor: AtomicUsize::new(0),
+                expiration_schedule: Mutex::new(ExpirationSchedule::default()),
                 publish_groups,
                 channel_groups,
                 metrics,
@@ -417,6 +429,7 @@ impl Broker {
         };
         broker.reserve_message_metadata(0)?;
         broker.recover_outbox()?;
+        broker.rebuild_expiration_schedule()?;
         Ok(broker)
     }
 

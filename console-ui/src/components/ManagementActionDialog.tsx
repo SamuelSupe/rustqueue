@@ -32,6 +32,7 @@ export function ManagementActionDialog({ action, busy, onPreview, onApply, onClo
   if (!action) return null;
   const destructive = action.action === 'empty' || action.action === 'delete' || action.action === 'retry';
   const expected = preview?.confirmation_required || '';
+  const caution = destructive || Boolean(expected);
   const submit = async () => {
     if (!preview) return;
     try {
@@ -44,7 +45,7 @@ export function ManagementActionDialog({ action, busy, onPreview, onApply, onClo
   return (
     <Modal
       open
-      danger={destructive}
+      danger={caution}
       modalHeading={t(`management.action.${action.action}`)}
       primaryButtonText={t(`management.action.${action.action}`)}
       secondaryButtonText={t('action.cancel')}
@@ -63,7 +64,7 @@ export function ManagementActionDialog({ action, busy, onPreview, onApply, onClo
             <div><dt>{t('topics.depth')}</dt><dd>{number(preview.impact.depth)}</dd></div>
             <div><dt>{t('topics.inFlight')}</dt><dd>{number(preview.impact.in_flight)}</dd></div>
           </dl>
-          {preview.impact.warnings.map((warning) => <InlineNotification key={warning} kind={destructive ? 'warning' : 'info'} lowContrast hideCloseButton title={t('management.impact')} subtitle={t(`management.warning.${warning}`)} />)}
+          {preview.impact.warnings.map((warning) => <InlineNotification key={warning} kind={caution ? 'warning' : 'info'} lowContrast hideCloseButton title={t('management.impact')} subtitle={t(`management.warning.${warning}`)} />)}
           {expected && (
             <TextInput
               id="management-action-confirmation"

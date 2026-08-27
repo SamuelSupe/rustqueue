@@ -13,6 +13,7 @@ use crate::batch::{self, EncodedBatch};
 use crate::channel::{ChannelCommand, ChannelRuntime, ChannelState};
 use crate::channel_store::{checkpoint_paths, ChannelStore};
 use crate::metadata::{load_topic_manifest, store_atomic, TopicManifest};
+use crate::model::{DeliveryMode, TopicPolicy};
 use crate::BrokerError;
 use index::{MessageIndex, MessageIndexCache, MetadataReservation};
 use parking_lot::Mutex;
@@ -40,6 +41,7 @@ pub(crate) struct TopicHandle {
     pub channel_commit_gate: Mutex<()>,
     pub state: Mutex<Topic>,
     pub wake: tokio::sync::watch::Sender<u64>,
+    policy_changes: tokio::sync::watch::Sender<TopicPolicy>,
 }
 
 pub(crate) struct Topic {
@@ -76,7 +78,6 @@ impl TopicHandle {
             storage_feature_level,
             index_cache,
         )?;
-        let (wake, _) = tokio::sync::watch::channel(0);
         topic.recover_channels()?;
         if topic.channels.len() > MAX_CHANNELS_PER_TOPIC {
             return Err(BrokerError::InvalidRecord(format!(
@@ -85,12 +86,17 @@ impl TopicHandle {
                 MAX_CHANNELS_PER_TOPIC
             )));
         }
+        topic.reconcile_expired_boundary()?;
         topic.reconcile_unrouted_boundary()?;
+        let policy = topic.policy();
+        let (wake, _) = tokio::sync::watch::channel(0);
+        let (policy_changes, _) = tokio::sync::watch::channel(policy);
         Ok(Arc::new(Self {
             commit_gate: Mutex::new(()),
             channel_commit_gate: Mutex::new(()),
             state: Mutex::new(topic),
             wake,
+            policy_changes,
         }))
     }
 
@@ -111,6 +117,10 @@ impl TopicHandle {
             deleted: false,
             next_position: 1,
             unrouted_from_position: Some(1),
+            delivery_mode: DeliveryMode::Reliable,
+            message_ttl_seconds: None,
+            expired_through_position: 0,
+            ttl_discarded_messages: 0,
         };
         store_atomic(&directory.join("manifest"), &manifest)?;
         let log = SegmentLog::open_with_feature_level(
@@ -120,6 +130,7 @@ impl TopicHandle {
             storage_feature_level,
         )?;
         let (wake, _) = tokio::sync::watch::channel(0);
+        let (policy_changes, _) = tokio::sync::watch::channel(TopicPolicy::default());
         Ok(Arc::new(Self {
             commit_gate: Mutex::new(()),
             channel_commit_gate: Mutex::new(()),
@@ -142,12 +153,26 @@ impl TopicHandle {
                 published_count: 0,
             }),
             wake,
+            policy_changes,
         }))
     }
 
     pub fn signal(&self) {
         self.wake
             .send_modify(|value| *value = value.wrapping_add(1));
+    }
+
+    pub fn set_policy(&self, topic: &mut Topic, policy: TopicPolicy) -> Result<bool, BrokerError> {
+        let changed = topic.set_policy(policy)?;
+        if changed {
+            self.policy_changes.send_replace(policy);
+            self.signal();
+        }
+        Ok(changed)
+    }
+
+    pub fn subscribe_policy(&self) -> tokio::sync::watch::Receiver<TopicPolicy> {
+        self.policy_changes.subscribe()
     }
 }
 
@@ -165,6 +190,17 @@ impl Topic {
         if manifest.format != 7 || manifest.deleted {
             return Err(BrokerError::InvalidRecord(
                 "topic manifest is not an active v7 topic".into(),
+            ));
+        }
+        TopicPolicy {
+            delivery_mode: manifest.delivery_mode,
+            message_ttl_seconds: manifest.message_ttl_seconds,
+        }
+        .validate()
+        .map_err(|error| BrokerError::InvalidRecord(error.into()))?;
+        if manifest.expired_through_position >= manifest.next_position {
+            return Err(BrokerError::InvalidRecord(
+                "topic manifest has an invalid TTL discard boundary".into(),
             ));
         }
         if manifest
@@ -501,10 +537,77 @@ impl Topic {
                     .unrouted_from_position
                     .unwrap_or(earliest)
                     .max(earliest)
+                    .max(self.manifest.expired_through_position.saturating_add(1))
                     .min(self.manifest.next_position),
             )
         };
         self.set_unrouted_from_position(position)
+    }
+
+    fn reconcile_expired_boundary(&mut self) -> Result<(), BrokerError> {
+        let through_position = self.manifest.expired_through_position;
+        if through_position == 0 {
+            return Ok(());
+        }
+        let channels: Vec<_> = self.channels.keys().cloned().collect();
+        for channel in channels {
+            if self
+                .channels
+                .get(&channel)
+                .is_some_and(|runtime| runtime.state.ack_floor_position < through_position)
+            {
+                self.persist_channel(&channel, ChannelCommand::Evict { through_position })?;
+            }
+        }
+        self.messages.discard_scheduled_through(through_position);
+        Ok(())
+    }
+
+    pub fn policy(&self) -> TopicPolicy {
+        TopicPolicy {
+            delivery_mode: self.manifest.delivery_mode,
+            message_ttl_seconds: self.manifest.message_ttl_seconds,
+        }
+    }
+
+    pub fn set_policy(&mut self, policy: TopicPolicy) -> Result<bool, BrokerError> {
+        let policy = policy
+            .validate()
+            .map_err(|error| BrokerError::InvalidTopicPolicy(error.into()))?;
+        if self.policy() == policy {
+            return Ok(false);
+        }
+        let mut manifest = self.manifest.clone();
+        manifest.delivery_mode = policy.delivery_mode;
+        manifest.message_ttl_seconds = policy.message_ttl_seconds;
+        store_atomic(&self.manifest_path, &manifest)?;
+        self.manifest = manifest;
+        Ok(true)
+    }
+
+    pub fn expiration_ns_for_timestamp(&self, timestamp_ns: i64) -> Option<i64> {
+        let ttl_ns = self
+            .policy()
+            .ttl_seconds()?
+            .saturating_mul(1_000_000_000)
+            .min(i64::MAX as u64) as i64;
+        Some(timestamp_ns.saturating_add(ttl_ns))
+    }
+
+    pub fn next_expiration_ns(&self) -> Result<Option<i64>, BrokerError> {
+        let Some(ttl_seconds) = self.policy().ttl_seconds() else {
+            return Ok(None);
+        };
+        let Some((_, timestamp_ns)) = self
+            .messages
+            .first_message_after(self.manifest.expired_through_position)?
+        else {
+            return Ok(None);
+        };
+        let ttl_ns = ttl_seconds
+            .saturating_mul(1_000_000_000)
+            .min(i64::MAX as u64) as i64;
+        Ok(Some(timestamp_ns.saturating_add(ttl_ns)))
     }
 
     pub fn set_paused(&mut self, paused: bool) -> Result<(), BrokerError> {
@@ -542,7 +645,8 @@ impl Topic {
             self.messages
                 .retain_from_timestamp(cutoff, self.manifest.next_position)
                 .saturating_sub(1)
-        };
+        }
+        .max(self.manifest.expired_through_position);
         let mut state = ChannelState::new(name.into(), barrier, ephemeral, self.max_ack_gap);
         state.set_absent_ranges(Arc::clone(&self.position_gaps));
         let store = if ephemeral {

@@ -86,6 +86,17 @@ async fn main() -> anyhow::Result<()> {
         storage_feature_level: config.storage.feature_level,
         require_management_fence_sync: config.security.console_management_enabled,
     })?);
+    loop {
+        let reports = broker
+            .expire_due_topics(usize::MAX)
+            .await
+            .context("reconcile expired Topic messages before readiness")?;
+        let complete = reports.is_empty();
+        log_ttl_discards(reports);
+        if complete {
+            break;
+        }
+    }
     let config = Arc::new(config);
     let metrics = Arc::new(Metrics::default());
     let accepting = Arc::new(AtomicBool::new(true));
@@ -151,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         initially_pressured,
     ));
     let mut storage_health_task = tokio::spawn(monitor_storage_health(Arc::clone(&broker)));
+    let mut ttl_expiration_task = tokio::spawn(run_ttl_expiration(Arc::clone(&broker)));
 
     let (completed_task, terminal_result) = tokio::select! {
         result = &mut tcp_task => (
@@ -176,6 +188,10 @@ async fn main() -> anyhow::Result<()> {
         result = &mut storage_health_task => (
             Some(RuntimeTask::StorageHealth),
             unexpected_task_exit("storage health", result),
+        ),
+        result = &mut ttl_expiration_task => (
+            Some(RuntimeTask::TtlExpiration),
+            unexpected_task_exit("TTL expiration", result),
         ),
         _ = shutdown_signal() => {
             info!("shutdown signal received");
@@ -241,6 +257,12 @@ async fn main() -> anyhow::Result<()> {
             stop_background_task(&mut storage_health_task, "storage health").await,
         );
     }
+    if completed_task != Some(RuntimeTask::TtlExpiration) {
+        record_cleanup_error(
+            &mut cleanup_error,
+            stop_background_task(&mut ttl_expiration_task, "TTL expiration").await,
+        );
+    }
     let released = broker.release_all_in_flight();
     record_cleanup_error(
         &mut cleanup_error,
@@ -262,6 +284,7 @@ enum RuntimeTask {
     Scrub,
     DiskGuard,
     StorageHealth,
+    TtlExpiration,
 }
 
 fn unexpected_task_exit(
@@ -338,6 +361,30 @@ async fn monitor_storage_health(broker: Arc<Broker>) -> anyhow::Result<()> {
         if !broker.storage_healthy() {
             anyhow::bail!("broker storage was isolated after an I/O or integrity failure");
         }
+    }
+}
+
+async fn run_ttl_expiration(broker: Arc<Broker>) -> anyhow::Result<()> {
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        let reports = broker
+            .expire_due_topics(128)
+            .await
+            .context("expire due Topic messages")?;
+        log_ttl_discards(reports);
+    }
+}
+
+fn log_ttl_discards(reports: Vec<rustqueue_queue::TtlDiscardReport>) {
+    for report in reports {
+        info!(
+            topic = report.topic,
+            through_position = report.through_position,
+            messages = report.messages,
+            "discarded Topic messages at their absolute TTL"
+        );
     }
 }
 

@@ -60,7 +60,12 @@ impl Topic {
                 channel.state.defer_candidate(position);
                 break;
             }
-            let (token, attempts) = channel.state.reserve(position, message.id, timeout);
+            let (token, attempts) = channel.state.reserve_timestamped(
+                position,
+                message.id,
+                message.timestamp_ns,
+                timeout,
+            );
             bytes = bytes.saturating_add(next_bytes);
             reserved.push(ReservedDelivery {
                 position,
@@ -118,6 +123,13 @@ impl Topic {
                 .get(channel)
                 .ok_or(BrokerError::ChannelNotFound)?
                 .state;
+            if state
+                .in_flight_timestamp(id, token)
+                .and_then(|timestamp| self.expiration_ns_for_timestamp(timestamp))
+                .is_some_and(|expires_at| expires_at <= now_ns())
+            {
+                return Err(BrokerError::MessageNotInFlight);
+            }
             match token {
                 Some(token) => state.in_flight_position_with_token(id, token),
                 None => state.in_flight_position(id),
@@ -155,6 +167,14 @@ impl Topic {
             .channels
             .get(channel)
             .ok_or(BrokerError::ChannelNotFound)?;
+        if runtime
+            .state
+            .in_flight_timestamp(id, token)
+            .and_then(|timestamp| self.expiration_ns_for_timestamp(timestamp))
+            .is_some_and(|expires_at| expires_at <= now_ns())
+        {
+            return Err(BrokerError::MessageNotInFlight);
+        }
         let position = match token {
             Some(token) => runtime.state.in_flight_position_with_token(id, token),
             None => runtime.state.in_flight_position(id),
@@ -183,10 +203,21 @@ impl Topic {
         token: Option<u64>,
         timeout: Duration,
     ) -> Result<(), BrokerError> {
+        let expired = self
+            .channels
+            .get(channel)
+            .ok_or(BrokerError::ChannelNotFound)?
+            .state
+            .in_flight_timestamp(id, token)
+            .and_then(|timestamp| self.expiration_ns_for_timestamp(timestamp))
+            .is_some_and(|expires_at| expires_at <= now_ns());
+        if expired {
+            return Err(BrokerError::MessageNotInFlight);
+        }
         let channel = self
             .channels
             .get_mut(channel)
-            .ok_or(BrokerError::ChannelNotFound)?;
+            .expect("validated channel remains present");
         let position = match token {
             Some(token) => channel.state.in_flight_position_with_token(id, token),
             None => channel.state.in_flight_position(id),
@@ -205,10 +236,23 @@ impl Topic {
         deliveries: &[(u64, u64)],
         timeout: Duration,
     ) -> Result<(), BrokerError> {
+        let expires_at = self
+            .channels
+            .get(channel)
+            .ok_or(BrokerError::ChannelNotFound)?;
+        if deliveries.iter().any(|(id, token)| {
+            expires_at
+                .state
+                .in_flight_timestamp(*id, Some(*token))
+                .and_then(|timestamp| self.expiration_ns_for_timestamp(timestamp))
+                .is_some_and(|expires_at| expires_at <= now_ns())
+        }) {
+            return Err(BrokerError::MessageNotInFlight);
+        }
         let channel = self
             .channels
             .get_mut(channel)
-            .ok_or(BrokerError::ChannelNotFound)?;
+            .expect("validated channel remains present");
         let positions: Vec<_> = deliveries
             .iter()
             .map(|(id, token)| {

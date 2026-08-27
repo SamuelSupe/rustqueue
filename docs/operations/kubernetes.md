@@ -46,6 +46,31 @@ finished. Every reconcile checks the current Pod, revision, readiness, drain
 state, PVC request/capacity and compatibility report before taking the next
 step.
 
+## Topic delivery policy
+
+`RustQueueTopic.spec` persists the desired delivery boundary:
+
+```yaml
+spec:
+  deliveryMode: TTL_DISCARD
+  messageTtlSeconds: 3600
+```
+
+`RELIABLE` requires `messageTtlSeconds` to be absent; `TTL_DISCARD` requires a
+positive value. Existing and automatically created Topics remain `RELIABLE`.
+Use the Console management flow for online changes so impact preview,
+single-owner fencing, operation replay, and typed confirmation are enforced.
+Do not edit the policy during a visible owner migration.
+
+Helm does not upgrade an already installed CRD. Before enabling this policy on
+an upgraded cluster, apply the checked-in CRDs and wait for them to become
+Established:
+
+```sh
+kubectl apply -f deploy/helm/rustqueue/crds
+kubectl wait --for=condition=Established crd/rustqueuetopics.rustqueue.io --timeout=60s
+```
+
 ## Targeted Broker maintenance
 
 ```sh
@@ -76,7 +101,7 @@ Canary approval is optional:
 ```sh
 helm upgrade rustqueue deploy/helm/rustqueue \
   --namespace rustqueue \
-  --set queue.image=registry.example/rustqueue:0.8.4 \
+  --set queue.image=registry.example/rustqueue:0.9.0 \
   --set queue.rollout.requireCanaryApproval=true
 
 rustqueuectl -n rustqueue rollout approve
@@ -88,7 +113,7 @@ Useful controls:
 rustqueuectl -n rustqueue rollout pause
 rustqueuectl -n rustqueue rollout resume
 rustqueuectl -n rustqueue rollout retry
-rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.8.4
+rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.9.0
 rustqueuectl -n rustqueue rollout forward
 ```
 

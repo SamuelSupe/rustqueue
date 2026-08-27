@@ -44,6 +44,9 @@ pub(super) async fn dead_letter_if_needed(
 }
 
 fn reason(config: &Config, topic: &str, delivery: &RemoteDelivery) -> Option<DeadLetterReason> {
+    if delivery.ttl_discard {
+        return None;
+    }
     if topic.ends_with(&config.queue.dead_letter_suffix) {
         return None;
     }
@@ -92,6 +95,7 @@ mod tests {
             timestamp_ns,
             attempts,
             body: Bytes::from_static(b"body"),
+            ttl_discard: false,
         }
     }
 
@@ -166,6 +170,7 @@ mod tests {
                 timestamp_ns: second.timestamp_ns,
                 attempts: second.attempts,
                 body: bytes::Bytes::from_owner(second.body),
+                ttl_discard: false,
             },
         )
         .await

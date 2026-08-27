@@ -56,6 +56,7 @@ pub(crate) struct ChannelCheckpoint {
 
 struct InFlight {
     id: u64,
+    timestamp_ns: i64,
     deadline: Instant,
     token: u64,
 }
@@ -352,7 +353,18 @@ impl ChannelState {
             .max(self.attempts.keys().copied().max().unwrap_or(0))
     }
 
+    #[cfg(test)]
     pub fn reserve(&mut self, position: u64, id: u64, timeout: Duration) -> (u64, u16) {
+        self.reserve_timestamped(position, id, 0, timeout)
+    }
+
+    pub fn reserve_timestamped(
+        &mut self,
+        position: u64,
+        id: u64,
+        timestamp_ns: i64,
+        timeout: Duration,
+    ) -> (u64, u16) {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
         let attempts = self.attempts.entry(position).or_insert(0);
@@ -362,6 +374,7 @@ impl ChannelState {
             position,
             InFlight {
                 id,
+                timestamp_ns,
                 deadline,
                 token,
             },
@@ -402,6 +415,15 @@ impl ChannelState {
             .get(&position)
             .is_some_and(|flight| flight.token == token)
             .then_some(position)
+    }
+
+    pub fn in_flight_timestamp(&self, id: u64, token: Option<u64>) -> Option<i64> {
+        let position = self.in_flight_position(id)?;
+        self.in_flight.get(&position).and_then(|flight| {
+            token
+                .is_none_or(|token| flight.token == token)
+                .then_some(flight.timestamp_ns)
+        })
     }
 
     pub fn is_unacknowledged(&self, position: u64) -> bool {

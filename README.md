@@ -11,14 +11,14 @@
 [NSQ performance boundaries](docs/architecture/nsq-performance.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.8.4 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.4)
+[v0.9.0 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.9.0)
 
-RustQueue 0.8.4 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.9.0 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.8.4](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.4).
+> Current release: [v0.9.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.9.0).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -44,45 +44,54 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.8.4
+## What's new in 0.9.0
 
-- **Larger durable Channel groups.** `FIN` and `REQ` requests now share a
-  bounded 1 ms Channel WAL group commit of up to 1,024 requests. Every success
-  still crosses the affected WAL `fsync` before the client sees completion.
-- **More delivery concurrency.** Channel WAL `fsync` runs after releasing the
-  Topic state lock and uses an independent commit gate, so delivery reservations
-  can continue while the durable boundary is being written.
-- **Lower hot-path allocation cost.** WAL commands use stack encoding, TCP and
-  Channel operations share `Arc<str>` channel identities, Channel futures avoid
-  an extra `Box`, and each session bounds active Channel operations at 256.
-- **Stricter benchmark completion.** The benchmark consumer waits for EOF and
-  verifies a complete final drain before accepting a result.
-- **No compatibility change.** The v7 on-disk format and the durable `FIN`/`REQ`
-  fsync contract remain unchanged.
+- **Topic-level TTL discard.** Managed Topics can choose `TTL_DISCARD` with a
+  positive whole-second `messageTtlSeconds`; `RELIABLE` remains the default and
+  requires no TTL. The TTL starts at the Broker write timestamp and is an
+  absolute lifetime.
+- **One final expiration boundary.** Expiry applies to unrouted, deferred,
+  requeued and in-flight messages. It evicts the message from every Channel,
+  never writes a DLQ entry, and lets `TTL_DISCARD` retry normally until the TTL
+  rather than ending through retention or maximum-attempt DLQ rules.
+- **Safe online policy changes.** Topic creation can set the policy, and
+  `/v1/manage/topics/configure` supports the `CONFIGURE` operation for existing
+  Topics. Enabling or shortening TTL previews possible backlog loss and
+  requires the exact Topic name; visible multi-owner migrations block policy
+  changes. Extending or disabling TTL cannot revive an already expired message.
+- **Deadline-bound delivery.** Reservation and socket handoff recheck the
+  absolute deadline. If a frame cannot finish before expiry, the consumer
+  connection closes instead of leaving a partially parseable NSQ frame; a
+  complete frame that is not `FIN`ed still expires at the same boundary.
+- **Wire and storage compatibility.** `PUB`, `MPUB` and `DPUB` keep their
+  existing `publish_ack_mode` acknowledgement behavior, and NSQ TCP/HTTP
+  publishing remains unchanged. Existing and auto-created Topics stay
+  `RELIABLE`; old manifests default to that mode, and disk format v7 needs no
+  migration.
 
-See the [v0.8.4 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.8.4)
+See the [v0.9.0 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.9.0)
 and [NSQ performance boundaries](docs/architecture/nsq-performance.md) for
 the contract and benchmark interpretation.
 
-## Download 0.8.4
+## Download 0.9.0
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.8.4-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.4-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.8.4-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.8.4.tgz` | Helm Chart |
-| `SHA256SUMS-0.8.4` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.9.0-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.9.0-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.9.0-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.9.0.tgz` | Helm Chart |
+| `SHA256SUMS-0.9.0` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.4/rustqueue-0.8.4-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.8.4/SHA256SUMS-0.8.4"
-sha256sum --check --ignore-missing SHA256SUMS-0.8.4
-tar -xzf "rustqueue-0.8.4-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.9.0/rustqueue-0.9.0-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.9.0/SHA256SUMS-0.9.0"
+sha256sum --check --ignore-missing SHA256SUMS-0.9.0
+tar -xzf "rustqueue-0.9.0-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -127,6 +136,12 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   starts at that persisted unrouted boundary. Deleting the last durable Channel
   starts a new boundary at the current Topic tail; ephemeral Channels do not
   clear it.
+- Topics default to `RELIABLE`. Managed Topics may opt into `TTL_DISCARD` with
+  a positive whole-second TTL measured from the Broker write timestamp. TTL is
+  an absolute lifetime across unrouted, deferred, requeued, and in-flight
+  states: expiry evicts the message from every Channel without writing a DLQ.
+  Logical expiry is deadline-bound; immutable Segment reclamation remains
+  asynchronous and reader-safe.
 - Once a durable Channel exists, a later Channel can still bootstrap from the
   last 90 seconds. This covers one official Go client default 60-second lookup
   poll plus its 30% jitter. The Kodo profile forces 180 seconds so one failed
@@ -167,7 +182,7 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   sent is returned as ambiguous and is never retried automatically.
 - `rustqueue-operator`: creates the StatefulSet, retained PVCs, discovery,
   proxy, RBAC, disruption budgets, PVC expansion and drain-aware one-at-a-time
-  rolling updates. The 0.8 Kodo profile adds atomic Discovery cutover,
+  rolling updates. The 0.9 Kodo profile adds atomic Discovery cutover,
   producer-restart fencing and fail-closed decommissioning.
 - `rustqueue-console`: Kubernetes and broker observability backend serving the
   bilingual Carbon UI, with default-off native Topic/Channel management.
@@ -225,7 +240,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.8.4 \
+  --set queue.image=registry.example/rustqueue:0.9.0 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -239,7 +254,7 @@ scrub, upgrade or the NSQ-compatible admin API. Client TLS is optional and
 always supplied through an existing Kubernetes Secret; the operator does not
 run a CA.
 
-### Kodo compatibility in 0.8
+### Kodo compatibility in 0.9
 
 Kodo compatibility is implemented entirely by RustQueue as a separate,
 default-off deployment profile. Kodo continues to use RustQueue Discovery:
@@ -462,7 +477,7 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.8.4 CI/CD workflow publishes a Release only after the non-Kubernetes
+The v0.9.0 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one
@@ -549,6 +564,9 @@ by default; `[metrics].detailed_queue_metrics` enables bounded
 per-topic/channel series up to `max_detailed_series`.
 Delivery-budget bytes, waiters and cumulative waits are exported as bounded
 aggregate gauges/counters.
+`rustqueue_ttl_discarded_messages_total` is label-free. When detailed queue
+metrics are enabled, `rustqueue_topic_ttl_discarded_messages_total` uses the
+same global series budget as the other per-Topic metrics.
 
 `[queue].publish_ack_mode` defaults to `"durable"`: successful publish commands
 follow local segment `fsync`. `"write_ack"` returns after append while consumers
@@ -562,7 +580,7 @@ writes. Keep both relaxed profiles separate from durable-PUB results.
 
 ## Storage and upgrades
 
-RustQueue 0.8 keeps disk format v7. Format v7 is a clean break: a v6 or older
+RustQueue 0.9 keeps disk format v7. Format v7 is a clean break: a v6 or older
 directory is refused and there is no in-place migration. Within v7, record tags
 and existing fields are append-only.
 Every binary declares its reader/writer feature range and protocol message/body
@@ -635,6 +653,6 @@ non-Kubernetes gate runs in GitHub Actions.
 
 ## Non-goals
 
-RustQueue 0.8 does not provide message replication, backups, exactly-once
+RustQueue 0.9 does not provide message replication, backups, exactly-once
 delivery, a global channel catalog, online data migration, cross-region
 replication, or Broker/PVC lifecycle controls in Console.

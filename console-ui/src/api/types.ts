@@ -34,6 +34,9 @@ export interface ChannelStats {
 export interface TopicStats {
   name: string;
   paused: boolean;
+  delivery_mode: 'RELIABLE' | 'TTL_DISCARD';
+  message_ttl_seconds?: number;
+  ttl_discarded_messages: number;
   message_count: number;
   segment_count: number;
   segment_bytes: number;
@@ -133,6 +136,9 @@ export interface Topic {
   name: string;
   owners: string[];
   paused: boolean;
+  delivery_mode: 'RELIABLE' | 'TTL_DISCARD';
+  message_ttl_seconds?: number;
+  ttl_discarded_messages: number;
   stored_messages: number;
   segment_count: number;
   segment_bytes: number;
@@ -257,9 +263,11 @@ export interface ManagementStatus {
 
 export interface ManagementAction {
   kind: 'topic' | 'channel';
-  action: 'create' | 'pause' | 'unpause' | 'empty' | 'delete' | 'retry';
+  action: 'create' | 'configure' | 'pause' | 'unpause' | 'empty' | 'delete' | 'retry';
   topic: string;
   channel?: string;
+  delivery_mode?: 'RELIABLE' | 'TTL_DISCARD';
+  message_ttl_seconds?: number;
 }
 
 export interface ActionPreview {

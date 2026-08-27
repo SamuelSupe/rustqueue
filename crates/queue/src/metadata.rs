@@ -24,6 +24,14 @@ pub(crate) struct TopicManifest {
     pub next_position: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrouted_from_position: Option<u64>,
+    #[serde(default)]
+    pub delivery_mode: crate::model::DeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub expired_through_position: u64,
+    #[serde(default)]
+    pub ttl_discarded_messages: u64,
 }
 
 pub(crate) fn load_optional<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -102,4 +110,23 @@ fn temporary_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".tmp");
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::DeliveryMode;
+
+    #[test]
+    fn legacy_topic_manifest_defaults_to_reliable_delivery() {
+        let manifest = parse_topic_manifest(
+            br#"{"format":7,"name":"events","paused":false,"next_position":2}"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.delivery_mode, DeliveryMode::Reliable);
+        assert_eq!(manifest.message_ttl_seconds, None);
+        assert_eq!(manifest.expired_through_position, 0);
+        assert_eq!(manifest.ttl_discarded_messages, 0);
+    }
 }

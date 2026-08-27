@@ -20,6 +20,10 @@ pub struct PreviewRequest {
     pub action: String,
     pub topic: String,
     pub channel: Option<String>,
+    #[serde(default, alias = "deliveryMode")]
+    pub delivery_mode: Option<String>,
+    #[serde(default, alias = "messageTtlSeconds")]
+    pub message_ttl_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -45,7 +49,9 @@ pub async fn preview(
     let target = resolve_target(&snapshot, &request)?;
     ensure_owners_healthy(&snapshot, &target.owners)?;
     let subject = subject(&state, &request).await?;
-    let confirmation = requires_confirmation(&request.action).then(|| {
+    let confirmation = (requires_confirmation(&request.action)
+        || policy_can_expire_existing(&snapshot, &request))
+    .then(|| {
         request
             .channel
             .clone()
@@ -61,6 +67,8 @@ pub async fn preview(
                 action: request.action.clone(),
                 topic: request.topic.clone(),
                 channel: request.channel.clone(),
+                delivery_mode: request.delivery_mode.clone(),
+                message_ttl_seconds: request.message_ttl_seconds,
                 subject_uid: subject.uid,
                 resource_version: subject.resource_version,
                 subject_kind: subject.kind,
@@ -147,7 +155,7 @@ pub fn validate_request(request: &PreviewRequest) -> Result<(), ManagementError>
     }
     if !matches!(
         request.action.as_str(),
-        "create" | "pause" | "unpause" | "empty" | "delete" | "retry"
+        "create" | "configure" | "pause" | "unpause" | "empty" | "delete" | "retry"
     ) {
         return Err(ManagementError::bad_request(
             "E_BAD_ACTION",
@@ -174,7 +182,52 @@ pub fn validate_request(request: &PreviewRequest) -> Result<(), ManagementError>
             "topic actions cannot include a channel",
         ));
     }
+    validate_topic_policy(request)?;
     Ok(())
+}
+
+fn validate_topic_policy(request: &PreviewRequest) -> Result<(), ManagementError> {
+    if request.kind == "channel" {
+        if request.delivery_mode.is_some() || request.message_ttl_seconds.is_some() {
+            return Err(ManagementError::bad_request(
+                "E_BAD_TOPIC_POLICY",
+                "channel actions cannot include a topic delivery policy",
+            ));
+        }
+        return Ok(());
+    }
+    if !matches!(request.action.as_str(), "create" | "configure") {
+        if request.delivery_mode.is_some() || request.message_ttl_seconds.is_some() {
+            return Err(ManagementError::bad_request(
+                "E_BAD_TOPIC_POLICY",
+                "topic policy is only accepted for create or configure",
+            ));
+        }
+        return Ok(());
+    }
+    let mode = request.delivery_mode.as_deref().unwrap_or("RELIABLE");
+    if request.action == "configure" && request.delivery_mode.is_none() {
+        return Err(ManagementError::bad_request(
+            "E_BAD_TOPIC_POLICY",
+            "delivery_mode is required when configuring a topic",
+        ));
+    }
+    match (mode, request.message_ttl_seconds) {
+        ("RELIABLE", None) => Ok(()),
+        ("TTL_DISCARD", Some(seconds)) if seconds > 0 => Ok(()),
+        ("RELIABLE", Some(_)) => Err(ManagementError::bad_request(
+            "E_BAD_TOPIC_POLICY",
+            "RELIABLE topics cannot define a message TTL",
+        )),
+        ("TTL_DISCARD", _) => Err(ManagementError::bad_request(
+            "E_BAD_TOPIC_POLICY",
+            "TTL_DISCARD requires a positive message TTL",
+        )),
+        _ => Err(ManagementError::bad_request(
+            "E_BAD_TOPIC_POLICY",
+            "delivery_mode must be RELIABLE or TTL_DISCARD",
+        )),
+    }
 }
 
 fn resolve_target(
@@ -193,14 +246,40 @@ fn resolve_target(
                     "topic already exists",
                 ));
             }
-            let owner = choose_broker(snapshot)?;
+            let visible_owners = topic.map(|topic| topic.owners.clone()).unwrap_or_default();
+            if visible_owners.len() > 1 {
+                return Err(ManagementError::conflict(
+                    "E_MIGRATION_IN_PROGRESS",
+                    "topic delivery policy cannot change while ownership is migrating",
+                ));
+            }
+            let owner = match visible_owners.into_iter().next() {
+                Some(owner) => owner,
+                None => choose_broker(snapshot)?,
+            };
+            let mut warnings = vec!["topic_requires_channel".into()];
+            if policy_can_expire_existing(snapshot, request) {
+                warnings.push("ttl_policy_may_discard_existing_messages".into());
+            }
+            let (stored_messages, depth, in_flight, deferred) =
+                topic.map_or((0, 0, 0, 0), |topic| {
+                    (
+                        topic.stored_messages,
+                        topic.channels.iter().map(|channel| channel.depth).sum(),
+                        topic.channels.iter().map(|channel| channel.in_flight).sum(),
+                        topic.channels.iter().map(|channel| channel.deferred).sum(),
+                    )
+                });
             return Ok(ResolvedTarget {
                 owners: vec![owner.clone()],
                 impact: Impact {
                     owners: vec![owner],
+                    stored_messages,
+                    depth,
+                    in_flight,
+                    deferred,
                     connections: snapshot.summary.connections,
-                    warnings: vec!["topic_requires_channel".into()],
-                    ..Impact::empty()
+                    warnings,
                 },
             });
         }
@@ -229,7 +308,7 @@ fn resolve_target(
             ));
         }
         let destructive = is_destructive(&request.action);
-        if destructive && topic.owners.len() > 1 {
+        if (destructive || request.action == "configure") && topic.owners.len() > 1 {
             return Err(ManagementError::conflict(
                 "E_MIGRATION_IN_PROGRESS",
                 "destructive topic operations are blocked while multiple owners are visible",
@@ -247,7 +326,9 @@ fn resolve_target(
                 in_flight,
                 deferred,
                 connections: snapshot.summary.connections,
-                warnings: if destructive {
+                warnings: if policy_can_expire_existing(snapshot, request) {
+                    vec!["ttl_policy_may_discard_existing_messages".into()]
+                } else if destructive {
                     vec!["immediate_irreversible".into()]
                 } else {
                     Vec::new()
@@ -430,6 +511,33 @@ fn requires_confirmation(action: &str) -> bool {
     is_destructive(action) || action == "retry"
 }
 
+fn policy_can_expire_existing(snapshot: &Snapshot, request: &PreviewRequest) -> bool {
+    if request.kind != "topic" || !matches!(request.action.as_str(), "create" | "configure") {
+        return false;
+    }
+    let Some(topic) = snapshot
+        .topics
+        .iter()
+        .find(|topic| topic.name == request.topic)
+    else {
+        return false;
+    };
+    if request.action == "create" {
+        return topic.stored_messages > 0
+            && request.delivery_mode.as_deref() == Some("TTL_DISCARD");
+    }
+    match (
+        topic.delivery_mode.as_str(),
+        topic.message_ttl_seconds,
+        request.delivery_mode.as_deref(),
+        request.message_ttl_seconds,
+    ) {
+        ("RELIABLE", _, Some("TTL_DISCARD"), Some(_)) => true,
+        ("TTL_DISCARD", Some(current), Some("TTL_DISCARD"), Some(next)) => next < current,
+        _ => false,
+    }
+}
+
 struct ResolvedTarget {
     owners: Vec<String>,
     impact: Impact,
@@ -453,4 +561,98 @@ struct Subject {
     kind: String,
     uid: String,
     resource_version: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::TopicView;
+
+    fn topic_request(action: &str, mode: Option<&str>, ttl: Option<u64>) -> PreviewRequest {
+        PreviewRequest {
+            kind: "topic".into(),
+            action: action.into(),
+            topic: "events".into(),
+            channel: None,
+            delivery_mode: mode.map(str::to_owned),
+            message_ttl_seconds: ttl,
+        }
+    }
+
+    #[test]
+    fn topic_policy_validation_enforces_mode_and_ttl_pairing() {
+        assert!(validate_request(&topic_request("create", None, None)).is_ok());
+        assert!(validate_request(&topic_request("create", Some("TTL_DISCARD"), Some(30))).is_ok());
+        assert!(validate_request(&topic_request("configure", None, None)).is_err());
+        assert!(validate_request(&topic_request("configure", Some("RELIABLE"), Some(30))).is_err());
+        assert!(
+            validate_request(&topic_request("configure", Some("TTL_DISCARD"), Some(0))).is_err()
+        );
+    }
+
+    #[test]
+    fn enabling_or_shortening_ttl_requires_destructive_confirmation() {
+        let mut snapshot = Snapshot::default();
+        snapshot.topics.push(TopicView {
+            name: "events".into(),
+            delivery_mode: "RELIABLE".into(),
+            ..TopicView::default()
+        });
+        assert!(policy_can_expire_existing(
+            &snapshot,
+            &topic_request("configure", Some("TTL_DISCARD"), Some(60))
+        ));
+
+        snapshot.topics[0].delivery_mode = "TTL_DISCARD".into();
+        snapshot.topics[0].message_ttl_seconds = Some(60);
+        assert!(policy_can_expire_existing(
+            &snapshot,
+            &topic_request("configure", Some("TTL_DISCARD"), Some(30))
+        ));
+        assert!(!policy_can_expire_existing(
+            &snapshot,
+            &topic_request("configure", Some("TTL_DISCARD"), Some(120))
+        ));
+        assert!(!policy_can_expire_existing(
+            &snapshot,
+            &topic_request("configure", Some("RELIABLE"), None)
+        ));
+
+        snapshot.topics[0].managed_phase = "TOMBSTONED".into();
+        snapshot.topics[0].stored_messages = 1;
+        assert!(policy_can_expire_existing(
+            &snapshot,
+            &topic_request("create", Some("TTL_DISCARD"), Some(120))
+        ));
+    }
+
+    #[test]
+    fn configure_is_blocked_while_multiple_topic_owners_are_visible() {
+        let mut snapshot = Snapshot::default();
+        snapshot.topics.push(TopicView {
+            name: "events".into(),
+            owners: vec!["one".into(), "two".into()],
+            managed_phase: "ACTIVE".into(),
+            ..TopicView::default()
+        });
+
+        let result = resolve_target(
+            &snapshot,
+            &topic_request("configure", Some("TTL_DISCARD"), Some(60)),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn recreate_is_blocked_while_multiple_topic_owners_are_visible() {
+        let mut snapshot = Snapshot::default();
+        snapshot.topics.push(TopicView {
+            name: "events".into(),
+            owners: vec!["one".into(), "two".into()],
+            managed_phase: "TOMBSTONED".into(),
+            ..TopicView::default()
+        });
+
+        assert!(resolve_target(&snapshot, &topic_request("create", None, None)).is_err());
+    }
 }

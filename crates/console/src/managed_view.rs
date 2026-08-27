@@ -1,7 +1,7 @@
 use crate::model::{ChannelView, TopicView};
 use crate::resources::ManagedResources;
 use kube::ResourceExt;
-use rustqueue_operator::{ManagedResourcePhase, RustQueueTopic};
+use rustqueue_operator::{ManagedResourcePhase, RustQueueTopic, TopicDeliveryMode};
 use std::collections::BTreeMap;
 
 pub fn merge(topics: &mut Vec<TopicView>, managed: &ManagedResources) {
@@ -63,6 +63,12 @@ pub fn merge(topics: &mut Vec<TopicView>, managed: &ManagedResources) {
 }
 
 fn apply_topic(topic: &mut TopicView, resource: &RustQueueTopic) {
+    topic.delivery_mode = match resource.spec.delivery_mode {
+        TopicDeliveryMode::Reliable => "RELIABLE",
+        TopicDeliveryMode::TtlDiscard => "TTL_DISCARD",
+    }
+    .into();
+    topic.message_ttl_seconds = resource.spec.message_ttl_seconds;
     topic.managed_phase = phase_name(&resource.spec.phase).into();
     topic.management_revision = resource.spec.revision;
     topic.tombstone_until_ms = resource.spec.tombstone_until_ms;

@@ -1,4 +1,4 @@
-use rustqueue_queue::{Broker, BrokerConfig};
+use rustqueue_queue::{Broker, BrokerConfig, DeliveryMode, TopicPolicy};
 use std::path::Path;
 use std::time::Duration;
 
@@ -39,6 +39,18 @@ async fn main() -> anyhow::Result<()> {
         "checkpoint" => broker.checkpoint().await?,
         "gc" => {
             broker.compact().await?;
+        }
+        "ttl" => {
+            broker
+                .configure_topic_policy(
+                    "events",
+                    TopicPolicy {
+                        delivery_mode: DeliveryMode::TtlDiscard,
+                        message_ttl_seconds: Some(1),
+                    },
+                )
+                .await?;
+            broker.expire_topic_if_due("events").await?;
         }
         _ => anyhow::bail!("unknown crash scenario {scenario}"),
     }

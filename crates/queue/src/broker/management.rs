@@ -4,6 +4,7 @@ use crate::management::{
     TopicManagementAction,
 };
 use crate::management_ops::OperationLookup;
+use crate::model::TopicPolicy;
 
 impl Broker {
     pub fn management_fences_ready(&self) -> bool {
@@ -36,110 +37,183 @@ impl Broker {
         action: TopicManagementAction,
         expected_revision: u64,
         tombstone_until_ms: Option<i64>,
+        policy: Option<TopicPolicy>,
     ) -> Result<ManagementResult, BrokerError> {
         validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
+        let policy = match action {
+            TopicManagementAction::Create => Some(
+                policy
+                    .unwrap_or_default()
+                    .validate()
+                    .map_err(|error| BrokerError::InvalidTopicPolicy(error.into()))?,
+            ),
+            TopicManagementAction::Configure => Some(
+                policy
+                    .ok_or_else(|| {
+                        BrokerError::InvalidTopicPolicy(
+                            "CONFIGURE requires a complete topic policy".into(),
+                        )
+                    })?
+                    .validate()
+                    .map_err(|error| BrokerError::InvalidTopicPolicy(error.into()))?,
+            ),
+            _ if policy.is_some() => {
+                return Err(BrokerError::InvalidTopicPolicy(
+                    "topic policy is only accepted for CREATE or CONFIGURE".into(),
+                ));
+            }
+            _ => None,
+        };
+        let _outbox_guard = if matches!(
+            action,
+            TopicManagementAction::Create | TopicManagementAction::Configure
+        ) {
+            Some(self.inner.outbox_moves.lock().await)
+        } else {
+            None
+        };
         let broker = self.clone();
         let operation_id = operation_id.to_owned();
         let topic = topic.to_owned();
-        self.storage_task(move || {
-            let _lifecycle = broker.inner.topic_lifecycle.lock();
-            let fingerprint = serde_json::to_string(&("topic", &topic, action))
-                .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
-            let pending_operation = {
-                let operations = broker.inner.management_ops.lock();
-                match operations
-                    .lookup(&operation_id, &fingerprint)
-                    .map_err(operation_catalog_error)?
+        let topic_after = topic.clone();
+        let result = self
+            .storage_task(move || {
+                let _lifecycle = broker.inner.topic_lifecycle.lock();
+                let fingerprint = serde_json::to_string(&("topic", &topic, action, policy))
+                    .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
+                let pending_operation = {
+                    let operations = broker.inner.management_ops.lock();
+                    match operations
+                        .lookup(&operation_id, &fingerprint)
+                        .map_err(operation_catalog_error)?
+                    {
+                        OperationLookup::Completed(result) => return Ok(result),
+                        OperationLookup::Pending => Some(operation_id.clone()),
+                        OperationLookup::New => operations.pending_id(&topic, &fingerprint),
+                    }
+                };
+                if pending_operation.is_none()
+                    && matches!(
+                        action,
+                        TopicManagementAction::Delete | TopicManagementAction::Tombstone
+                    )
                 {
-                    OperationLookup::Completed(result) => return Ok(result),
-                    OperationLookup::Pending => Some(operation_id.clone()),
-                    OperationLookup::New => operations.pending_id(&topic, &fingerprint),
+                    valid_tombstone(tombstone_until_ms, false)?;
                 }
-            };
-            if pending_operation.is_none()
-                && matches!(
-                    action,
-                    TopicManagementAction::Delete | TopicManagementAction::Tombstone
-                )
-            {
-                valid_tombstone(tombstone_until_ms, false)?;
-            }
-            if pending_operation.is_none()
-                && matches!(
-                    action,
-                    TopicManagementAction::Pause
-                        | TopicManagementAction::Unpause
-                        | TopicManagementAction::Empty
-                )
-            {
-                broker.topic(&topic)?;
-            }
-            let (replayed, operation_id) = match pending_operation {
-                Some(id) => (true, id),
-                None => match broker.prepare_management_operation(
-                    &operation_id,
-                    &fingerprint,
-                    &topic,
-                    expected_revision,
-                )? {
-                    PreparedOperation::Completed(result) => return Ok(result),
-                    PreparedOperation::New(id) => (false, id),
-                    PreparedOperation::Pending(id) => (true, id),
-                },
-            };
-            let mut changed = false;
-            match action {
-                TopicManagementAction::Create => {
-                    let existed = broker.inner.topics.read().contains_key(&topic);
-                    broker.get_or_create_topic_locked(&topic)?;
-                    changed = !existed;
-                    let mut fences = broker.inner.fences.lock();
-                    if fences.clear_topic(&topic) {
-                        fences.store(&broker.inner.fences_path)?;
+                if pending_operation.is_none()
+                    && matches!(
+                        action,
+                        TopicManagementAction::Pause
+                            | TopicManagementAction::Unpause
+                            | TopicManagementAction::Empty
+                            | TopicManagementAction::Configure
+                    )
+                {
+                    broker.topic(&topic)?;
+                }
+                let (replayed, operation_id) = match pending_operation {
+                    Some(id) => (true, id),
+                    None => match broker.prepare_management_operation(
+                        &operation_id,
+                        &fingerprint,
+                        &topic,
+                        expected_revision,
+                    )? {
+                        PreparedOperation::Completed(result) => return Ok(result),
+                        PreparedOperation::New(id) => (false, id),
+                        PreparedOperation::Pending(id) => (true, id),
+                    },
+                };
+                let mut changed = false;
+                match action {
+                    TopicManagementAction::Create => {
+                        let existed = broker.inner.topics.read().contains_key(&topic);
+                        let handle = broker.get_or_create_topic_locked_with_policy(
+                            &topic,
+                            (!existed).then_some(policy.expect("create policy validated")),
+                        )?;
+                        changed = !existed;
+                        let _commit_gate = handle.commit_gate.lock();
+                        let _channel_commit_gate = handle.channel_commit_gate.lock();
+                        let mut state = handle.state.lock();
+                        changed |= handle
+                            .set_policy(&mut state, policy.expect("create policy validated"))?;
+                        broker.replace_expiration_schedule_locked(&topic, &state)?;
+                        drop(state);
+                        let mut fences = broker.inner.fences.lock();
+                        if fences.clear_topic(&topic) {
+                            fences.store(&broker.inner.fences_path)?;
+                            changed = true;
+                        }
+                    }
+                    TopicManagementAction::Configure => {
+                        let handle = broker.topic(&topic)?;
+                        let _commit_gate = handle.commit_gate.lock();
+                        let _channel_commit_gate = handle.channel_commit_gate.lock();
+                        let mut state = handle.state.lock();
+                        changed = handle
+                            .set_policy(&mut state, policy.expect("configure policy validated"))?;
+                        broker.replace_expiration_schedule_locked(&topic, &state)?;
+                    }
+                    TopicManagementAction::Pause | TopicManagementAction::Unpause => {
+                        let handle = broker.topic(&topic)?;
+                        let _commit_gate = handle.commit_gate.lock();
+                        handle
+                            .state
+                            .lock()
+                            .set_paused(action == TopicManagementAction::Pause)?;
                         changed = true;
                     }
-                }
-                TopicManagementAction::Pause | TopicManagementAction::Unpause => {
-                    let handle = broker.topic(&topic)?;
-                    let _commit_gate = handle.commit_gate.lock();
-                    handle
-                        .state
-                        .lock()
-                        .set_paused(action == TopicManagementAction::Pause)?;
-                    changed = true;
-                }
-                TopicManagementAction::Empty => {
-                    let handle = broker.topic(&topic)?;
-                    let _commit_gate = handle.commit_gate.lock();
-                    let _channel_commit_gate = handle.channel_commit_gate.lock();
-                    handle.state.lock().empty_topic()?;
-                    changed = true;
-                }
-                TopicManagementAction::Delete | TopicManagementAction::Tombstone => {
-                    let until = valid_tombstone(tombstone_until_ms, replayed)?;
-                    let mut fences = broker.inner.fences.lock();
-                    if fences.set_topic(&topic, until) {
-                        fences.store(&broker.inner.fences_path)?;
+                    TopicManagementAction::Empty => {
+                        let handle = broker.topic(&topic)?;
+                        let _commit_gate = handle.commit_gate.lock();
+                        let _channel_commit_gate = handle.channel_commit_gate.lock();
+                        handle.state.lock().empty_topic()?;
                         changed = true;
                     }
-                    drop(fences);
-                    if action == TopicManagementAction::Delete {
-                        changed |= broker.delete_topic_locked(&topic)?;
+                    TopicManagementAction::Delete | TopicManagementAction::Tombstone => {
+                        let until = valid_tombstone(tombstone_until_ms, replayed)?;
+                        let mut fences = broker.inner.fences.lock();
+                        if fences.set_topic(&topic, until) {
+                            fences.store(&broker.inner.fences_path)?;
+                            changed = true;
+                        }
+                        drop(fences);
+                        if action == TopicManagementAction::Delete {
+                            changed |= broker.delete_topic_locked(&topic)?;
+                        }
                     }
                 }
-            }
-            if changed || replayed {
-                broker.bump_registry()?;
-            }
-            let result = ManagementResult {
-                revision: broker.registry_revision(),
-                changed,
-            };
-            rustqueue_storage::crash_failpoint("management_after_action_before_complete");
-            broker.complete_management_operation(&operation_id, result.clone())?;
-            Ok(result)
-        })
-        .await
+                if changed || replayed {
+                    broker.bump_registry()?;
+                }
+                let result = ManagementResult {
+                    revision: broker.registry_revision(),
+                    changed,
+                };
+                rustqueue_storage::crash_failpoint("management_after_action_before_complete");
+                broker.complete_management_operation(&operation_id, result.clone())?;
+                Ok(result)
+            })
+            .await?;
+        if self
+            .topic_policy(&topic_after)
+            .is_ok_and(|value| value.delivery_mode == crate::model::DeliveryMode::TtlDiscard)
+        {
+            let directory = self.inner.config.data_path.join("dlq-outbox");
+            let source_topic = topic_after.clone();
+            self.storage_task(move || {
+                crate::outbox::remove_source_topic(&directory, &source_topic)
+            })
+            .await?;
+        }
+        if matches!(
+            action,
+            TopicManagementAction::Create | TopicManagementAction::Configure
+        ) {
+            let _ = self.expire_topic_if_due(&topic_after).await?;
+        }
+        Ok(result)
     }
 
     pub async fn manage_channel(

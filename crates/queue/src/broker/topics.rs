@@ -16,6 +16,14 @@ impl Broker {
         &self,
         name: &str,
     ) -> Result<Arc<TopicHandle>, BrokerError> {
+        self.get_or_create_topic_locked_with_policy(name, None)
+    }
+
+    pub(super) fn get_or_create_topic_locked_with_policy(
+        &self,
+        name: &str,
+        initial_policy: Option<crate::model::TopicPolicy>,
+    ) -> Result<Arc<TopicHandle>, BrokerError> {
         self.cleanup_retired_topic(name)?;
         let mut topics = self.inner.topics.write();
         if let Some(topic) = topics.get(name).cloned() {
@@ -33,6 +41,10 @@ impl Broker {
             self.inner.compatibility.active_writer_feature_level,
             Arc::clone(&self.inner.message_index_cache),
         )?;
+        if let Some(policy) = initial_policy {
+            let mut state = topic.state.lock();
+            topic.set_policy(&mut state, policy)?;
+        }
         topics.insert(name.into(), Arc::clone(&topic));
         drop(topics);
         self.bump_registry()?;
@@ -90,6 +102,7 @@ impl Broker {
         drop(channel_commit_gate);
         drop(commit_gate);
         self.inner.topics.write().remove(name);
+        self.inner.expiration_schedule.lock().update(name, None);
         let directory = topic_directory(&self.inner.config.data_path, name);
         if Arc::strong_count(&handle) == 1
             && !self.inner.payload_reader.has_active_under(&directory)
