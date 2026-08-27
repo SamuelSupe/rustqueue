@@ -5,6 +5,7 @@ mod manage;
 mod native;
 mod nsq_stats;
 mod tokens;
+mod websocket;
 
 use compat::*;
 use helpers::*;
@@ -12,11 +13,14 @@ use manage::*;
 use native::*;
 use nsq_stats::*;
 use tokens::TokenSet;
+use websocket::{lookup_cors, WebSocketRuntime};
 
 use crate::admission::PublishAdmission;
+use crate::auth::Authenticator;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::subscriptions::SubscriptionRegistry;
+use crate::tcp::EphemeralConsumers;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
@@ -45,6 +49,10 @@ struct AppState {
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
     subscriptions: SubscriptionRegistry,
+    authenticator: Option<Arc<Authenticator>>,
+    ephemeral_consumers: EphemeralConsumers,
+    websocket: WebSocketRuntime,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     started_at: i64,
 }
 
@@ -115,6 +123,8 @@ pub async fn serve(
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
     subscriptions: SubscriptionRegistry,
+    authenticator: Option<Arc<Authenticator>>,
+    ephemeral_consumers: EphemeralConsumers,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let state = app_state(
@@ -125,14 +135,21 @@ pub async fn serve(
         delivering,
         publish_admission,
         subscriptions,
+        authenticator,
+        ephemeral_consumers,
+        shutdown.clone(),
     )?;
+    let lookup_route = match lookup_cors(&state.config.websocket.allowed_origins) {
+        Some(cors) => get(lookup).layer(cors),
+        None => get(lookup),
+    };
     let mut router = Router::new()
         .route("/ping", get(ping))
         .route("/info", get(info_handler))
         .route("/pub", post(publish))
         .route("/mpub", post(multi_publish))
         .route("/stats", get(stats))
-        .route("/lookup", get(lookup))
+        .route("/lookup", lookup_route)
         .route("/topics", get(topics))
         .route("/channels", get(channels))
         .route("/nodes", get(nodes))
@@ -157,6 +174,9 @@ pub async fn serve(
         .route("/v1/observe/head", get(observe_head))
         .route("/v1/storage/scrub", post(scrub))
         .layer(middleware::from_fn(nsq_content_negotiation));
+    if state.config.websocket.enabled {
+        router = router.route("/v1/ws/topics/{topic}", get(websocket::subscribe_topic));
+    }
     if state.config.security.console_management_enabled {
         router = router
             .route("/v1/manage/topics/{action}", post(manage_topic))
@@ -178,9 +198,12 @@ pub async fn serve(
     let listener = TcpListener::bind(address).await?;
     info!(%address, "HTTP API listening");
     let reloader = tokio::spawn(tokens.reload(token_shutdown));
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown))
-        .await;
+    let result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown))
+    .await;
     reloader.abort();
     result?;
     Ok(())
@@ -197,6 +220,7 @@ async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn app_state(
     config: Arc<Config>,
     broker: Arc<Broker>,
@@ -205,6 +229,9 @@ fn app_state(
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
     subscriptions: SubscriptionRegistry,
+    authenticator: Option<Arc<Authenticator>>,
+    ephemeral_consumers: EphemeralConsumers,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<AppState> {
     Ok(AppState {
         tokens: TokenSet::from_config(&config)?,
@@ -215,6 +242,10 @@ fn app_state(
         delivering,
         publish_admission,
         subscriptions,
+        authenticator,
+        ephemeral_consumers,
+        websocket: WebSocketRuntime::new(&config.websocket),
+        shutdown,
         started_at: unix_seconds(),
     })
 }

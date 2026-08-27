@@ -10,6 +10,13 @@ Producer endpoints (node-local proxy Service):
 
 Consumer lookup endpoint:
   http://{{ .Values.queue.name }}-discovery.{{ .Release.Namespace }}.svc:4161
+
+WebSocket TTL live subscriptions (when enabled) connect directly to each
+Broker HTTP address returned by Discovery /lookup:
+  ws://<broker-http-address>/v1/ws/topics/<topic>
+  (use wss:// when the Broker HTTP endpoint is served with TLS)
+  Subprotocol: rustqueue.live.v1
+  Only existing TTL_DISCARD Topics are accepted; there is no replay or ACK.
 {{- end }}
 {{- if and .Values.queue.create .Values.console.enabled }}
 RustQueue Console is available inside the cluster at:

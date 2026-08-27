@@ -13,6 +13,15 @@ snappy_enabled = true
 deflate_enabled = true
 max_deflate_level = 6
 
+[websocket]
+# Best-effort live subscriptions are opt-in and only accept TTL_DISCARD Topics.
+enabled = false
+max_connections = 1024
+max_connections_per_topic = 256
+frame_inflight_bytes = 134217728
+# Browser Origin values are exact matches; service clients without Origin are allowed.
+allowed_origins = []
+
 [storage]
 data_path = "/data"
 feature_level = 1

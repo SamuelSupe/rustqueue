@@ -131,6 +131,10 @@ impl Broker {
         Ok(self.topic(topic)?.subscribe_policy())
     }
 
+    pub fn topic_reliable_policy_epoch(&self, topic: &str) -> Result<u64, BrokerError> {
+        Ok(self.topic(topic)?.reliable_policy_epoch())
+    }
+
     pub async fn configure_topic_policy(
         &self,
         topic: &str,

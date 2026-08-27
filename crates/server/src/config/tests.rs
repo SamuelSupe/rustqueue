@@ -67,6 +67,19 @@ fn binary_capabilities_advertise_protocol_limits() {
 }
 
 #[test]
+fn websocket_defaults_are_opt_in_and_capability_is_advertised() {
+    let config = Config::default();
+    assert!(!config.websocket.enabled);
+    assert_eq!(config.websocket.max_connections, 1_024);
+    assert_eq!(config.websocket.max_connections_per_topic, 256);
+    assert_eq!(config.websocket.frame_inflight_bytes, 128 * 1024 * 1024);
+    assert!(config.websocket.allowed_origins.is_empty());
+
+    let capabilities = serde_json::to_value(runtime_capabilities()).unwrap();
+    assert_eq!(capabilities["websocket_ttl_live_v1"], true);
+}
+
+#[test]
 fn kodo_cleanup_is_disabled_until_cluster_wide_deletion_is_atomic() {
     let root = tempfile::tempdir().unwrap();
     let cleanup = root.path().join("cleanup-token");

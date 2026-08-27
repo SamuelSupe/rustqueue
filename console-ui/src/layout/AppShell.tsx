@@ -57,7 +57,7 @@ export function AppShell({ page, onPage, dark, onTheme, onRefresh, children }: {
             onClick={(event) => { event.preventDefault(); onPage(item.id); }}
           >{t(`nav.${item.id}`)}</SideNavLink>)}
         </SideNavItems>
-        <div className="sidenav-foot"><span>{t('app.readOnly')}</span><small>v0.9.0</small></div>
+        <div className="sidenav-foot"><span>{t('app.readOnly')}</span><small>v0.10.0</small></div>
       </SideNav>
       <main id="main-content" className="main-content">{children}</main>
     </div>

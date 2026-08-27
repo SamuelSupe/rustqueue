@@ -225,6 +225,7 @@ mod tests {
                 proxy_node_selector: BTreeMap::new(),
                 proxy_tcp_max_connection_age_seconds: 300,
                 discovery_replicas: 2,
+                websocket: crate::crd::WebSocketSpec::default(),
                 kodo_compatibility: crate::crd::KodoCompatibility::default(),
                 maintenance: None,
                 rollout: RolloutPolicy::default(),

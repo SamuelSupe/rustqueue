@@ -1,16 +1,35 @@
 use super::*;
 
 #[derive(Clone, Default)]
-pub(super) struct EphemeralConsumers {
+pub(crate) struct EphemeralConsumers {
     counts: Arc<tokio::sync::Mutex<HashMap<(String, String), usize>>>,
 }
 
 impl EphemeralConsumers {
-    pub async fn register(
+    pub(crate) async fn register(
         &self,
         broker: &Broker,
         topic: &str,
         channel: &str,
+    ) -> Result<(), BrokerError> {
+        self.register_inner(broker, topic, channel, true).await
+    }
+
+    pub(crate) async fn register_existing(
+        &self,
+        broker: &Broker,
+        topic: &str,
+        channel: &str,
+    ) -> Result<(), BrokerError> {
+        self.register_inner(broker, topic, channel, false).await
+    }
+
+    async fn register_inner(
+        &self,
+        broker: &Broker,
+        topic: &str,
+        channel: &str,
+        create_topic: bool,
     ) -> Result<(), BrokerError> {
         let counts = Arc::clone(&self.counts);
         let broker = broker.clone();
@@ -19,7 +38,11 @@ impl EphemeralConsumers {
         let (reply, result) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut counts = counts.lock().await;
-            let outcome = broker.create_channel(&topic, &channel).await;
+            let outcome = if create_topic {
+                broker.create_channel(&topic, &channel).await
+            } else {
+                broker.create_channel_existing(&topic, &channel).await
+            };
             complete_registration(&mut counts, &broker, &topic, &channel, outcome, reply).await;
         });
         let commit = result
@@ -28,7 +51,7 @@ impl EphemeralConsumers {
         commit.send(()).map_err(|_| BrokerError::StorageUnavailable)
     }
 
-    pub async fn unregister(&self, broker: &Broker, topic: &str, channel: &str) {
+    pub(crate) async fn unregister(&self, broker: &Broker, topic: &str, channel: &str) {
         let counts = Arc::clone(&self.counts);
         let broker = broker.clone();
         let topic = topic.to_owned();

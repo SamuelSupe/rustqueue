@@ -22,6 +22,7 @@ use rustqueue_storage::{RecordHeader, RecordKind, SegmentLog};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -42,6 +43,7 @@ pub(crate) struct TopicHandle {
     pub state: Mutex<Topic>,
     pub wake: tokio::sync::watch::Sender<u64>,
     policy_changes: tokio::sync::watch::Sender<TopicPolicy>,
+    reliable_policy_epoch: AtomicU64,
 }
 
 pub(crate) struct Topic {
@@ -97,6 +99,7 @@ impl TopicHandle {
             state: Mutex::new(topic),
             wake,
             policy_changes,
+            reliable_policy_epoch: AtomicU64::new(0),
         }))
     }
 
@@ -154,6 +157,7 @@ impl TopicHandle {
             }),
             wake,
             policy_changes,
+            reliable_policy_epoch: AtomicU64::new(0),
         }))
     }
 
@@ -165,6 +169,9 @@ impl TopicHandle {
     pub fn set_policy(&self, topic: &mut Topic, policy: TopicPolicy) -> Result<bool, BrokerError> {
         let changed = topic.set_policy(policy)?;
         if changed {
+            if policy.delivery_mode == DeliveryMode::Reliable {
+                self.reliable_policy_epoch.fetch_add(1, Ordering::AcqRel);
+            }
             self.policy_changes.send_replace(policy);
             self.signal();
         }
@@ -173,6 +180,10 @@ impl TopicHandle {
 
     pub fn subscribe_policy(&self) -> tokio::sync::watch::Receiver<TopicPolicy> {
         self.policy_changes.subscribe()
+    }
+
+    pub fn reliable_policy_epoch(&self) -> u64 {
+        self.reliable_policy_epoch.load(Ordering::Acquire)
     }
 }
 

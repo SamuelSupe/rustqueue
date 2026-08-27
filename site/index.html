@@ -183,6 +183,10 @@
             Consumers discover every broker that owns a Topic, then connect directly over the NSQ
             protocol.
           </p>
+          <p>
+            TTL_DISCARD Topics also support an optional <code>rustqueue.live.v1</code> WebSocket
+            live feed: best effort, current-tail only, and direct to each discovered owner.
+          </p>
           <a
             class="text-link"
             href="https://github.com/SamuelSupe/rustqueue/blob/main/docs/operations/kubernetes.md"
@@ -407,7 +411,7 @@
             </div>
             <pre><code id="helm-command">helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.9.0 \
+  --set queue.image=registry.example/rustqueue:0.10.0 \
   --set queue.storageClassName=ssd-rwo</code></pre>
           </div>
         </div>

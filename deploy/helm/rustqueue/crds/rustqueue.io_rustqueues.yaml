@@ -68,6 +68,23 @@ spec:
                   default: {}
                 proxyTcpMaxConnectionAgeSeconds: {type: integer, format: int64, minimum: 0, default: 300}
                 discoveryReplicas: {type: integer, format: int32, minimum: 2, default: 2}
+                websocket:
+                  type: object
+                  default:
+                    enabled: false
+                    maxConnections: 1024
+                    maxConnectionsPerTopic: 256
+                    frameInflightBytes: 134217728
+                    allowedOrigins: []
+                  properties:
+                    enabled: {type: boolean, default: false}
+                    maxConnections: {type: integer, format: int64, minimum: 1, default: 1024}
+                    maxConnectionsPerTopic: {type: integer, format: int64, minimum: 1, default: 256}
+                    frameInflightBytes: {type: integer, format: int64, minimum: 25, maximum: 4294967295, default: 134217728}
+                    allowedOrigins:
+                      type: array
+                      default: []
+                      items: {type: string, pattern: '^https?://[^/?#,\s]+$'}
                 kodoCompatibility:
                   type: object
                   default:
