@@ -31,6 +31,7 @@ impl Broker {
     ) -> Result<DeliveryBatch, BrokerError> {
         self.ensure_storage_healthy()?;
         self.ensure_management_access(topic, Some(channel))?;
+        self.expire_topic_if_due(topic).await?;
         self.expire_channel_in_flight(topic, channel).await?;
         let handle = self.topic(topic)?;
         let mut wake = handle.wake.subscribe();
@@ -80,6 +81,13 @@ impl Broker {
             Err(error) => return self.observe_storage_result(Err(error.into())),
         };
         let hold = hold.expect("delivery payload read returns its byte-budget hold");
+        self.expire_topic_if_due(topic).await?;
+        if batch.items.iter().any(|reservation| {
+            self.delivery_expiration_ns(topic, reservation.timestamp_ns)
+                .is_ok_and(|deadline| deadline.is_some_and(|deadline| deadline <= now_ns()))
+        }) {
+            return Ok(DeliveryBatch::new(Vec::new(), DeliveryGuard::empty()));
+        }
         let handle = Arc::clone(&batch.handle);
         let channel = batch.channel.clone();
         let reservations = batch.disarm();

@@ -1,9 +1,11 @@
 use crate::model::BrokerLatencyStats;
 use rustqueue_telemetry::LatencyHistogram;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 #[derive(Default)]
 pub(crate) struct QueueMetrics {
+    pub ttl_discarded_messages: AtomicU64,
     pub fsync: Arc<LatencyHistogram>,
     pub group_commit_wait: Arc<LatencyHistogram>,
     pub publish_topic_lock_wait: Arc<LatencyHistogram>,

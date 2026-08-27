@@ -15,6 +15,8 @@ pub struct OwnerOperation<'a> {
     pub channel: Option<&'a str>,
     pub action: &'a str,
     pub tombstone_until_ms: Option<i64>,
+    pub delivery_mode: Option<&'a str>,
+    pub message_ttl_seconds: Option<u64>,
 }
 
 struct BackendError {
@@ -47,6 +49,8 @@ pub async fn apply_owner(
         "channel": operation.channel,
         "expected_revision": revision,
         "tombstone_until_ms": operation.tombstone_until_ms,
+        "delivery_mode": operation.delivery_mode,
+        "message_ttl_seconds": operation.message_ttl_seconds,
     });
     post(state, &token, &broker, &path, &body).await
 }

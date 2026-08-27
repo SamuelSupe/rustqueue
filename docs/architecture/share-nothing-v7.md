@@ -1,7 +1,7 @@
 # RustQueue format v7 share-nothing architecture
 
 Status: accepted implementation contract
-Target release: 0.8.4
+Target release: 0.9.0
 Data format: v7, clean directories only
 
 ## 1. Goal
@@ -96,6 +96,16 @@ This separates two guarantees:
 - Explicit Topic empty/delete and opt-in protective eviction remain
   intentional destructive operations; protective eviction writes an audit
   record before advancing the unrouted boundary.
+
+These guarantees describe the default `RELIABLE` mode. A Topic whose persisted
+policy is `TTL_DISCARD` instead has a positive whole-second absolute lifetime
+measured from its Broker-assigned publish timestamp. The same deadline applies
+before routing, during DPUB/deferred and requeue delay, and after delivery while
+the message is in flight. Expiry advances a persisted Topic prefix and evicts
+that prefix from every durable and ephemeral Channel; late `FIN`, `REQ`, and
+`TOUCH` therefore observe the normal not-in-flight error. Enabling or shortening
+TTL applies to existing backlog by original publish time. Extending or disabling
+TTL cannot restore an already expired prefix.
 
 ### 2.4 Routing and scale
 
@@ -305,6 +315,12 @@ A complete segment may be deleted only when it is older than:
 - every active reader reference;
 - every pending DLQ outbox reference.
 
+`TTL_DISCARD` first persists the Channel eviction WALs and Topic
+`expiredThroughPosition`; ordinary GC later reclaims Segments once active
+readers and other references release them. Scheduler work is deadline-ordered
+and bounded per batch. Delivery reservation and socket handoff recheck the
+absolute deadline, so scheduler delay cannot expose an expired message.
+
 High disk watermark first rejects publishes with retryable `429`. Protective
 eviction remains opt-in and local: after the configured grace period it may
 delete the oldest complete segment, persist the resulting channel gaps, and
@@ -332,6 +348,11 @@ DLQ transfer uses a compact CRC-protected binary local outbox. The source messag
 finished until the DLQ message append is durable. Recovery retries incomplete
 outbox work. A crash may duplicate the DLQ entry but must not delete the source
 first.
+
+DLQ termination applies only to `RELIABLE` Topics. `TTL_DISCARD` continues
+normal retries until its absolute deadline, bypasses retention/max-attempt DLQ
+rules, and removes any incomplete source outbox intent when the policy is
+enabled. Expiry itself never publishes a DLQ message.
 
 ## 5. Public behavior
 

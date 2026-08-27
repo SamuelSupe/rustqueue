@@ -16,10 +16,19 @@ pub enum ManagedResourcePhase {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ManagedResourceAction {
     Create,
+    Configure,
     Pause,
     Unpause,
     Empty,
     Delete,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TopicDeliveryMode {
+    #[default]
+    Reliable,
+    TtlDiscard,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -54,6 +63,11 @@ pub struct RustQueueTopicSpec {
     pub revision: u64,
     #[serde(default)]
     pub paused: bool,
+    #[serde(default)]
+    pub delivery_mode: TopicDeliveryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub message_ttl_seconds: Option<u64>,
     #[serde(default)]
     pub tombstone_until_ms: Option<i64>,
     #[serde(default)]
@@ -106,6 +120,11 @@ mod tests {
         assert!(spec.get("tombstone_until_ms").is_none());
         assert!(spec.get("operation").is_some());
         assert_eq!(
+            spec["deliveryMode"]["enum"],
+            serde_json::json!(["RELIABLE", "TTL_DISCARD"])
+        );
+        assert_eq!(spec["messageTtlSeconds"]["minimum"], 1.0);
+        assert_eq!(
             spec["phase"]["enum"],
             serde_json::json!(["PREPARING", "ACTIVE", "APPLYING", "FAILED", "TOMBSTONED"])
         );
@@ -116,7 +135,7 @@ mod tests {
         assert!(channel_spec.get("ephemeral").is_some());
         assert!(channel_spec.get("lastError").is_some());
         let schema = channel.to_string();
-        for action in ["CREATE", "PAUSE", "UNPAUSE", "EMPTY", "DELETE"] {
+        for action in ["CREATE", "CONFIGURE", "PAUSE", "UNPAUSE", "EMPTY", "DELETE"] {
             assert!(schema.contains(action));
         }
     }

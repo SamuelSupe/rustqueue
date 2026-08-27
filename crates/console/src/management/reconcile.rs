@@ -70,6 +70,12 @@ impl Reconciler {
         let action = resource_state::action_name(operation.action);
         let target = resource.spec.topic.clone();
         let result = async {
+            if matches!(
+                operation.action,
+                ManagedResourceAction::Create | ManagedResourceAction::Configure
+            ) {
+                ensure_policy_owner_stable(snapshot, &resource.spec.topic, &resource.spec.owners)?;
+            }
             ensure_owners_healthy(snapshot, &resource.spec.owners)?;
             if matches!(
                 operation.action,
@@ -88,6 +94,20 @@ impl Reconciler {
                         channel: None,
                         action,
                         tombstone_until_ms: resource.spec.tombstone_until_ms,
+                        delivery_mode: matches!(
+                            operation.action,
+                            ManagedResourceAction::Create | ManagedResourceAction::Configure
+                        )
+                        .then(|| match resource.spec.delivery_mode {
+                            rustqueue_operator::TopicDeliveryMode::Reliable => "RELIABLE",
+                            rustqueue_operator::TopicDeliveryMode::TtlDiscard => "TTL_DISCARD",
+                        }),
+                        message_ttl_seconds: matches!(
+                            operation.action,
+                            ManagedResourceAction::Create | ManagedResourceAction::Configure
+                        )
+                        .then_some(resource.spec.message_ttl_seconds)
+                        .flatten(),
                     },
                 )
                 .await?;
@@ -137,6 +157,8 @@ impl Reconciler {
                         channel: Some(&resource.spec.channel),
                         action,
                         tombstone_until_ms: resource.spec.tombstone_until_ms,
+                        delivery_mode: None,
+                        message_ttl_seconds: None,
                     },
                 )
                 .await?;
@@ -245,6 +267,25 @@ fn next_owner<'a>(owners: &'a [String], completed: &[String]) -> Option<&'a str>
         .map(String::as_str)
 }
 
+fn ensure_policy_owner_stable(
+    snapshot: &crate::model::Snapshot,
+    topic: &str,
+    expected_owners: &[String],
+) -> Result<(), ManagementError> {
+    let observed = snapshot
+        .topics
+        .iter()
+        .find(|candidate| candidate.name == topic)
+        .ok_or_else(|| ManagementError::unavailable("policy target topic is not observable"))?;
+    if expected_owners.len() != 1 || observed.owners != expected_owners {
+        return Err(ManagementError::conflict(
+            "E_MIGRATION_IN_PROGRESS",
+            "topic delivery policy cannot change while ownership is migrating",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +295,20 @@ mod tests {
         let owners = vec!["one".into(), "two".into(), "three".into()];
         let completed = vec!["one".into(), "three".into()];
         assert_eq!(next_owner(&owners, &completed), Some("two"));
+    }
+
+    #[test]
+    fn policy_operations_require_the_same_single_observed_owner() {
+        let mut snapshot = crate::model::Snapshot::default();
+        snapshot.topics.push(crate::model::TopicView {
+            name: "events".into(),
+            owners: vec!["one".into()],
+            ..Default::default()
+        });
+        assert!(ensure_policy_owner_stable(&snapshot, "events", &["one".into()]).is_ok());
+
+        snapshot.topics[0].owners.push("two".into());
+        assert!(ensure_policy_owner_stable(&snapshot, "events", &["one".into()]).is_err());
+        assert!(ensure_policy_owner_stable(&snapshot, "events", &["two".into()]).is_err());
     }
 }

@@ -141,34 +141,34 @@ pub(crate) fn load(path: &Path) -> Result<OutboxEntry, BrokerError> {
 pub(crate) fn retained_sources(directory: &Path) -> Result<Vec<(String, u64)>, BrokerError> {
     paths(directory)?
         .into_iter()
-        .map(|path| {
-            let mut file = File::open(&path)?;
-            let file_len = file.metadata()?.len();
-            if file_len > MAX_OUTBOX_BYTES {
-                return Err(BrokerError::InvalidRecord(
-                    "DLQ outbox file exceeds the maximum record size".into(),
-                ));
-            }
-            let mut bytes = [0u8; HEADER_LEN];
-            file.read_exact(&mut bytes)?;
-            let header = parse_header(&bytes)?;
-            validate_layout(header, file_len)?;
-            let names_len = header
-                .source_topic_len
-                .checked_add(header.source_channel_len)
-                .and_then(|len| len.checked_add(header.target_topic_len))
-                .ok_or_else(|| {
-                    BrokerError::InvalidRecord("DLQ outbox name length overflow".into())
-                })?;
-            let mut names = vec![0u8; names_len];
-            file.read_exact(&mut names)?;
-            let mut cursor = 0;
-            let source_topic = read_string(&names, &mut cursor, header.source_topic_len)?;
-            let source_channel = read_string(&names, &mut cursor, header.source_channel_len)?;
-            validate_path(&path, header.message_id, &source_topic, &source_channel)?;
-            Ok((source_topic, header.message_id))
-        })
+        .map(|path| retained_source(&path))
         .collect()
+}
+
+fn retained_source(path: &Path) -> Result<(String, u64), BrokerError> {
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > MAX_OUTBOX_BYTES {
+        return Err(BrokerError::InvalidRecord(
+            "DLQ outbox file exceeds the maximum record size".into(),
+        ));
+    }
+    let mut bytes = [0u8; HEADER_LEN];
+    file.read_exact(&mut bytes)?;
+    let header = parse_header(&bytes)?;
+    validate_layout(header, file_len)?;
+    let names_len = header
+        .source_topic_len
+        .checked_add(header.source_channel_len)
+        .and_then(|len| len.checked_add(header.target_topic_len))
+        .ok_or_else(|| BrokerError::InvalidRecord("DLQ outbox name length overflow".into()))?;
+    let mut names = vec![0u8; names_len];
+    file.read_exact(&mut names)?;
+    let mut cursor = 0;
+    let source_topic = read_string(&names, &mut cursor, header.source_topic_len)?;
+    let source_channel = read_string(&names, &mut cursor, header.source_channel_len)?;
+    validate_path(path, header.message_id, &source_topic, &source_channel)?;
+    Ok((source_topic, header.message_id))
 }
 
 pub(crate) fn cleanup_temporary(directory: &Path) -> Result<(), BrokerError> {
@@ -278,6 +278,15 @@ pub(crate) fn remove(path: &Path) -> Result<(), BrokerError> {
         Ok(()) => File::open(parent)?.sync_all()?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_source_topic(directory: &Path, topic: &str) -> Result<(), BrokerError> {
+    for path in paths(directory)? {
+        if retained_source(&path)?.0 == topic {
+            remove(&path)?;
+        }
     }
     Ok(())
 }

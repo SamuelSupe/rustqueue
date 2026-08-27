@@ -10,5 +10,5 @@ pub use crd::{
 };
 pub use management_crd::{
     ManagedResourceAction, ManagedResourceOperation, ManagedResourcePhase, RustQueueChannel,
-    RustQueueChannelSpec, RustQueueTopic, RustQueueTopicSpec,
+    RustQueueChannelSpec, RustQueueTopic, RustQueueTopicSpec, TopicDeliveryMode,
 };

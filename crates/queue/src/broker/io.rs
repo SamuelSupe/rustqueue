@@ -283,6 +283,10 @@ impl Broker {
         target_topic: &str,
         body: Bytes,
     ) -> Result<bool, BrokerError> {
+        if self.topic_policy(source_topic)?.delivery_mode == crate::model::DeliveryMode::TtlDiscard
+        {
+            return Ok(false);
+        }
         if !self
             .source_message_is_unacknowledged(source_topic, source_channel, message_id)?
             .unwrap_or(false)
@@ -329,6 +333,7 @@ impl Broker {
         let mut state = handle.state.lock();
         self.ensure_management_access(topic, None)?;
         let ids = self.append_publish_to_topic(&mut state, bodies, delay, true, &mut metadata)?;
+        self.refresh_expiration_schedule_locked(topic, &state)?;
         if self.inner.message_index_cache.over_budget() {
             state.spill_message_metadata()?;
         }
@@ -432,6 +437,14 @@ impl Broker {
     pub(super) fn recover_outbox(&self) -> Result<(), BrokerError> {
         for path in crate::outbox::paths(&self.inner.config.data_path.join("dlq-outbox"))? {
             let entry = crate::outbox::load(&path)?;
+            match self.topic_policy(&entry.source_topic) {
+                Ok(policy) if policy.delivery_mode == crate::model::DeliveryMode::TtlDiscard => {
+                    crate::outbox::remove(&path)?;
+                    continue;
+                }
+                Ok(_) | Err(BrokerError::TopicNotFound) => {}
+                Err(error) => return Err(error),
+            }
             if self.source_message_is_unacknowledged(
                 &entry.source_topic,
                 &entry.source_channel,

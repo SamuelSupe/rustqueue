@@ -335,6 +335,10 @@ impl Broker {
             let topic_lock_hold = self.inner.metrics.publish_topic_lock_hold.timer();
             topic_state.mark_durable_through(durable_through);
             visibility_advanced = topic_state.deliverable_position() > deliverable_before;
+            if let Err(error) = self.refresh_expiration_schedule_locked(topic, &topic_state) {
+                fail_pending(pending);
+                return self.worker_result(error);
+            }
             drop(topic_state);
             drop(topic_lock_hold);
             rustqueue_storage::crash_failpoint("publish_after_fsync_before_reply");
@@ -344,6 +348,10 @@ impl Broker {
                 topic_state.mark_deliverable_through(deliverable_through);
             }
             visibility_advanced = topic_state.deliverable_position() > deliverable_before;
+            if let Err(error) = self.refresh_expiration_schedule_locked(topic, &topic_state) {
+                fail_pending(pending);
+                return self.worker_result(error);
+            }
             drop(topic_state);
             drop(topic_lock_hold);
         }
@@ -635,6 +643,9 @@ pub(super) fn copy_error(error: &BrokerError) -> BrokerError {
         },
         BrokerError::OperationConflict => BrokerError::OperationConflict,
         BrokerError::InvalidTombstone => BrokerError::InvalidTombstone,
+        BrokerError::InvalidTopicPolicy(message) => {
+            BrokerError::InvalidTopicPolicy(message.clone())
+        }
         BrokerError::MessageNotFound => BrokerError::MessageNotFound,
         BrokerError::MessageNotInFlight => BrokerError::MessageNotInFlight,
         BrokerError::MessageTooLarge => BrokerError::MessageTooLarge,

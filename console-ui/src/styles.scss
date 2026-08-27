@@ -80,6 +80,7 @@ button, input { font: inherit; }
 .management-access__copy span { color: var(--cds-text-secondary); font-size: .75rem; margin-top: .2rem; }
 .panel__actions { display: flex; align-items: center; gap: .5rem; }
 .modal-copy { margin: 0 0 1.25rem; color: var(--cds-text-secondary); line-height: 1.5; }
+.topic-policy-fields { display: grid; gap: 1rem; margin-top: 1rem; }
 .impact-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0 0 1rem; border: 1px solid var(--cds-border-subtle); border-radius: 8px; overflow: hidden; }
 .impact-grid > div { padding: .75rem; min-height: 4.25rem; background: var(--cds-layer-01); }
 .impact-grid > div:nth-child(odd) { border-right: 1px solid var(--cds-border-subtle); }

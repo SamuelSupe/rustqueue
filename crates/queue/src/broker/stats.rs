@@ -26,9 +26,9 @@ impl Broker {
             let _commit_gate = handle.commit_gate.lock();
             let mut topic = handle.state.lock();
             topic.add_aggregate_stats(&mut aggregate);
-            if detailed && remaining >= 5 {
+            if detailed && remaining >= 6 {
                 let mut stats = topic.stats();
-                remaining = remaining.saturating_sub(5);
+                remaining = remaining.saturating_sub(6);
                 let channel_limit = remaining / 4;
                 stats.channels.truncate(channel_limit);
                 remaining = remaining.saturating_sub(stats.channels.len().saturating_mul(4));
@@ -73,6 +73,11 @@ impl Broker {
             channel_group_commit: self.inner.channel_groups.stats(),
             latency: self.inner.metrics.snapshot(),
             delivery_budget: self.inner.delivery_budget.snapshot(),
+            ttl_discarded_messages: self
+                .inner
+                .metrics
+                .ttl_discarded_messages
+                .load(Ordering::Relaxed),
             aggregate,
             topics,
         }
@@ -108,5 +113,19 @@ mod tests {
             .filtered_stats(Some("missing"), None)
             .topics
             .is_empty());
+    }
+
+    #[test]
+    fn detailed_topic_metrics_reserve_all_six_topic_series() {
+        let root = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig {
+            data_path: root.path().into(),
+            ..BrokerConfig::default()
+        })
+        .unwrap();
+        broker.get_or_create_topic("events").unwrap();
+
+        assert!(broker.metrics_stats(true, 5).topics.is_empty());
+        assert_eq!(broker.metrics_stats(true, 6).topics.len(), 1);
     }
 }

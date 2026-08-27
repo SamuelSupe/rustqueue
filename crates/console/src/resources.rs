@@ -5,7 +5,7 @@ use kube::api::{Api, ListParams, ObjectMeta, PostParams};
 use kube::{Resource, ResourceExt};
 use rustqueue_operator::{
     ManagedResourcePhase, RustQueue, RustQueueChannel, RustQueueChannelSpec, RustQueueTopic,
-    RustQueueTopicSpec,
+    RustQueueTopicSpec, TopicDeliveryMode,
 };
 use rustqueue_queue::{ChannelFence, ManagementFenceSnapshot};
 use sha2::{Digest, Sha256};
@@ -111,13 +111,7 @@ pub async fn reconcile(
             Some(mut resource)
                 if may_reconcile(&resource.spec.phase, resource.spec.tombstone_until_ms) =>
             {
-                if resource.spec.owners != topic.owners || resource.spec.paused != topic.paused {
-                    resource.spec.owners = topic.owners.clone();
-                    resource.spec.paused = topic.paused;
-                    resource.spec.phase = ManagedResourcePhase::Active;
-                    resource.spec.tombstone_until_ms = None;
-                    resource.spec.last_error = None;
-                    resource.spec.revision = resource.spec.revision.saturating_add(1);
+                if apply_observed_topic(&mut resource, topic) {
                     topic_api
                         .replace(&resource.name_any(), &PostParams::default(), &resource)
                         .await?;
@@ -134,6 +128,8 @@ pub async fn reconcile(
                         phase: ManagedResourcePhase::Active,
                         revision: 1,
                         paused: topic.paused,
+                        delivery_mode: topic_delivery_mode(&topic.delivery_mode),
+                        message_ttl_seconds: topic.message_ttl_seconds,
                         tombstone_until_ms: None,
                         last_error: None,
                         operation: None,
@@ -152,17 +148,7 @@ pub async fn reconcile(
                 Some(mut resource)
                     if may_reconcile(&resource.spec.phase, resource.spec.tombstone_until_ms) =>
                 {
-                    if resource.spec.owners != channel.owners
-                        || resource.spec.paused != channel.paused
-                        || resource.spec.ephemeral != channel.ephemeral
-                    {
-                        resource.spec.owners = channel.owners.clone();
-                        resource.spec.paused = channel.paused;
-                        resource.spec.ephemeral = channel.ephemeral;
-                        resource.spec.phase = ManagedResourcePhase::Active;
-                        resource.spec.tombstone_until_ms = None;
-                        resource.spec.last_error = None;
-                        resource.spec.revision = resource.spec.revision.saturating_add(1);
+                    if apply_observed_channel(&mut resource, channel) {
                         channel_api
                             .replace(&resource.name_any(), &PostParams::default(), &resource)
                             .await?;
@@ -207,6 +193,63 @@ pub async fn reconcile(
         }
     }
     list(client, &namespace, &queue).await
+}
+
+fn topic_delivery_mode(value: &str) -> TopicDeliveryMode {
+    if value == "TTL_DISCARD" {
+        TopicDeliveryMode::TtlDiscard
+    } else {
+        TopicDeliveryMode::Reliable
+    }
+}
+
+fn apply_observed_topic(resource: &mut RustQueueTopic, topic: &TopicView) -> bool {
+    let stable_owner = topic.owners.len() == 1;
+    let delivery_mode = topic_delivery_mode(&topic.delivery_mode);
+    let policy_changed = stable_owner
+        && (resource.spec.delivery_mode != delivery_mode
+            || resource.spec.message_ttl_seconds != topic.message_ttl_seconds);
+    let changed = resource.spec.owners != topic.owners
+        || resource.spec.paused != topic.paused
+        || resource.spec.phase != ManagedResourcePhase::Active
+        || resource.spec.tombstone_until_ms.is_some()
+        || policy_changed;
+    if !changed {
+        return false;
+    }
+    resource.spec.owners = topic.owners.clone();
+    resource.spec.paused = topic.paused;
+    if stable_owner {
+        resource.spec.delivery_mode = delivery_mode;
+        resource.spec.message_ttl_seconds = topic.message_ttl_seconds;
+    }
+    resource.spec.phase = ManagedResourcePhase::Active;
+    resource.spec.tombstone_until_ms = None;
+    resource.spec.last_error = None;
+    resource.spec.revision = resource.spec.revision.saturating_add(1);
+    true
+}
+
+fn apply_observed_channel(
+    resource: &mut RustQueueChannel,
+    channel: &crate::model::ChannelView,
+) -> bool {
+    let changed = resource.spec.owners != channel.owners
+        || resource.spec.paused != channel.paused
+        || resource.spec.ephemeral != channel.ephemeral
+        || resource.spec.phase != ManagedResourcePhase::Active
+        || resource.spec.tombstone_until_ms.is_some();
+    if !changed {
+        return false;
+    }
+    resource.spec.owners = channel.owners.clone();
+    resource.spec.paused = channel.paused;
+    resource.spec.ephemeral = channel.ephemeral;
+    resource.spec.phase = ManagedResourcePhase::Active;
+    resource.spec.tombstone_until_ms = None;
+    resource.spec.last_error = None;
+    resource.spec.revision = resource.spec.revision.saturating_add(1);
+    true
 }
 
 pub async fn get_topic(
@@ -297,5 +340,96 @@ mod tests {
             channel_resource_name("q", "a:b", "c"),
             channel_resource_name("q", "a", "b:c")
         );
+    }
+
+    #[test]
+    fn multi_owner_observation_does_not_rewrite_topic_policy() {
+        let mut resource = RustQueueTopic::new(
+            "topic",
+            RustQueueTopicSpec {
+                queue: "queue".into(),
+                topic: "orders".into(),
+                owners: vec!["broker-a".into()],
+                phase: ManagedResourcePhase::Active,
+                revision: 1,
+                paused: false,
+                delivery_mode: TopicDeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(60),
+                tombstone_until_ms: None,
+                last_error: None,
+                operation: None,
+            },
+        );
+        let mut observed = TopicView {
+            name: "orders".into(),
+            owners: vec!["broker-a".into(), "broker-b".into()],
+            delivery_mode: "RELIABLE".into(),
+            ..Default::default()
+        };
+
+        assert!(apply_observed_topic(&mut resource, &observed));
+        assert_eq!(resource.spec.delivery_mode, TopicDeliveryMode::TtlDiscard);
+        assert_eq!(resource.spec.message_ttl_seconds, Some(60));
+
+        observed.owners.pop();
+        assert!(apply_observed_topic(&mut resource, &observed));
+        assert_eq!(resource.spec.delivery_mode, TopicDeliveryMode::Reliable);
+        assert_eq!(resource.spec.message_ttl_seconds, None);
+    }
+
+    #[test]
+    fn observed_resources_reactivate_expired_tombstones_without_field_drift() {
+        let mut topic = RustQueueTopic::new(
+            "topic",
+            RustQueueTopicSpec {
+                queue: "queue".into(),
+                topic: "orders".into(),
+                owners: vec!["broker-a".into()],
+                phase: ManagedResourcePhase::Tombstoned,
+                revision: 1,
+                paused: false,
+                delivery_mode: TopicDeliveryMode::Reliable,
+                message_ttl_seconds: None,
+                tombstone_until_ms: Some(1),
+                last_error: None,
+                operation: None,
+            },
+        );
+        let observed = TopicView {
+            name: "orders".into(),
+            owners: vec!["broker-a".into()],
+            delivery_mode: "RELIABLE".into(),
+            ..Default::default()
+        };
+
+        assert!(apply_observed_topic(&mut topic, &observed));
+        assert_eq!(topic.spec.phase, ManagedResourcePhase::Active);
+        assert_eq!(topic.spec.tombstone_until_ms, None);
+
+        let mut channel = RustQueueChannel::new(
+            "channel",
+            RustQueueChannelSpec {
+                queue: "queue".into(),
+                topic: "orders".into(),
+                channel: "workers".into(),
+                owners: vec!["broker-a".into()],
+                phase: ManagedResourcePhase::Tombstoned,
+                revision: 1,
+                paused: false,
+                ephemeral: false,
+                tombstone_until_ms: Some(1),
+                last_error: None,
+                operation: None,
+            },
+        );
+        let observed = crate::model::ChannelView {
+            name: "workers".into(),
+            owners: vec!["broker-a".into()],
+            ..Default::default()
+        };
+
+        assert!(apply_observed_channel(&mut channel, &observed));
+        assert_eq!(channel.spec.phase, ManagedResourcePhase::Active);
+        assert_eq!(channel.spec.tombstone_until_ms, None);
     }
 }

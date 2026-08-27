@@ -297,6 +297,7 @@ impl From<BrokerError> for ApiError {
             BrokerError::RevisionConflict { .. } => (StatusCode::CONFLICT, "E_REVISION_CONFLICT"),
             BrokerError::OperationConflict => (StatusCode::CONFLICT, "E_OPERATION_CONFLICT"),
             BrokerError::InvalidTombstone => (StatusCode::BAD_REQUEST, "E_BAD_TOMBSTONE"),
+            BrokerError::InvalidTopicPolicy(_) => (StatusCode::BAD_REQUEST, "E_BAD_TOPIC_POLICY"),
             BrokerError::InvalidChannel => (StatusCode::BAD_REQUEST, "E_BAD_CHANNEL"),
             BrokerError::MessageTooLarge | BrokerError::BatchTooLarge => {
                 (StatusCode::BAD_REQUEST, "E_BAD_MESSAGE")
@@ -373,9 +374,13 @@ mod tests {
             latency: Default::default(),
             delivery_budget: Default::default(),
             aggregate: Default::default(),
+            ttl_discarded_messages: 0,
             topics: vec![TopicStats {
                 name: "events".into(),
                 paused: false,
+                delivery_mode: Default::default(),
+                message_ttl_seconds: None,
+                ttl_discarded_messages: 0,
                 published_count: 3,
                 message_count: 3,
                 segment_count: 1,

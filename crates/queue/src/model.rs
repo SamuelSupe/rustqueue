@@ -3,6 +3,49 @@ use rustqueue_telemetry::HistogramSnapshot;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DeliveryMode {
+    #[default]
+    Reliable,
+    TtlDiscard,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TopicPolicy {
+    pub delivery_mode: DeliveryMode,
+    pub message_ttl_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TtlDiscardReport {
+    pub topic: String,
+    pub through_position: u64,
+    pub messages: u64,
+}
+
+impl TopicPolicy {
+    pub fn validate(self) -> Result<Self, &'static str> {
+        match (self.delivery_mode, self.message_ttl_seconds) {
+            (DeliveryMode::Reliable, None) => Ok(self),
+            (DeliveryMode::TtlDiscard, Some(seconds)) if seconds > 0 => Ok(self),
+            (DeliveryMode::Reliable, Some(_)) => {
+                Err("RELIABLE topics cannot define message_ttl_seconds")
+            }
+            (DeliveryMode::TtlDiscard, _) => {
+                Err("TTL_DISCARD topics require message_ttl_seconds greater than zero")
+            }
+        }
+    }
+
+    pub const fn ttl_seconds(self) -> Option<u64> {
+        match self.delivery_mode {
+            DeliveryMode::Reliable => None,
+            DeliveryMode::TtlDiscard => self.message_ttl_seconds,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Delivery {
     pub id: u64,
@@ -65,6 +108,8 @@ pub struct BrokerStats {
     pub delivery_budget: DeliveryBudgetStats,
     #[serde(default)]
     pub aggregate: QueueAggregateStats,
+    #[serde(default)]
+    pub ttl_discarded_messages: u64,
     pub topics: Vec<TopicStats>,
 }
 
@@ -151,6 +196,12 @@ pub struct ChannelGroupCommitStats {
 pub struct TopicStats {
     pub name: String,
     pub paused: bool,
+    #[serde(default)]
+    pub delivery_mode: DeliveryMode,
+    #[serde(default)]
+    pub message_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub ttl_discarded_messages: u64,
     #[serde(default)]
     pub published_count: u64,
     pub message_count: u64,

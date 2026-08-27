@@ -1,6 +1,6 @@
 #![cfg(all(unix, feature = "crash-injection"))]
 
-use rustqueue_queue::{Broker, BrokerConfig};
+use rustqueue_queue::{Broker, BrokerConfig, DeliveryMode, TopicPolicy};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
@@ -61,6 +61,27 @@ async fn bodies(path: &Path) -> BTreeSet<Vec<u8>> {
         .into_iter()
         .map(|message| message.body.to_vec())
         .collect()
+}
+
+async fn ttl_fixture(path: &Path) {
+    let broker = Broker::open(config(path)).unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .configure_topic_policy(
+            "events",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    broker
+        .publish("events", vec![b"expires".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    drop(broker);
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
 }
 
 #[tokio::test]
@@ -179,5 +200,31 @@ async fn sigkill_gc_boundaries_reopen_without_corrupting_the_topic() {
                 .id,
             id
         );
+    }
+}
+
+#[tokio::test]
+async fn sigkill_ttl_boundaries_never_redeliver_or_double_count() {
+    for failpoint in [
+        "ttl_discard_after_wal_append_before_fsync",
+        "ttl_discard_after_wal_fsync_before_manifest",
+        "ttl_discard_after_manifest_before_metric",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        ttl_fixture(root.path()).await;
+        spawn_until_marker(root.path(), "ttl", failpoint);
+
+        assert!(bodies(root.path()).await.is_empty());
+        for _ in 0..2 {
+            let broker = Broker::open(config(root.path())).unwrap();
+            let topic = broker
+                .stats()
+                .topics
+                .into_iter()
+                .find(|topic| topic.name == "events")
+                .unwrap();
+            assert_eq!(topic.ttl_discarded_messages, 1);
+            drop(broker);
+        }
     }
 }

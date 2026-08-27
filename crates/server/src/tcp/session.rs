@@ -76,10 +76,20 @@ pub(super) async fn run_session(
     output_buffer_tick.tick().await;
     let mut last_command = Instant::now();
     let mut pending_fetch: Option<PendingFetch<'_>> = None;
+    let mut subscription_policy_changes = None;
     let (channel_ops, mut channel_op_results, channel_ops_task) = start_channel_ops(broker.clone());
 
     let session_result: anyhow::Result<()> = async {
         loop {
+            if subscription_policy_changes.is_none() {
+                if let Some(subscription) = state.subscription.as_ref() {
+                    subscription_policy_changes = Some(
+                        broker
+                            .subscribe_topic_policy(&subscription.topic)
+                            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                    );
+                }
+            }
             let expired = expire_client_deadlines(
                 &mut state.in_flight,
                 &mut state.in_flight_deadlines,
@@ -99,6 +109,12 @@ pub(super) async fn run_session(
                 break;
             }
             if let Some(command) = pending.take() {
+                flush_timed(
+                    &mut writer,
+                    state.heartbeat,
+                    subscription_policy_changes.as_mut(),
+                )
+                .await?;
                 if !accepting.load(Ordering::Acquire) && publish_command(&command.command) {
                     if config.limits.disconnect_on_retriable_publish_error {
                         break;
@@ -203,6 +219,11 @@ pub(super) async fn run_session(
                     let Some(command) = command else {
                         break;
                     };
+                    flush_timed(
+                        &mut writer,
+                        state.heartbeat,
+                        subscription_policy_changes.as_mut(),
+                    ).await?;
                     let command = match command {
                         Ok(command) => command,
                         Err(CommandReadError::Io(_)) => break,
@@ -274,6 +295,11 @@ pub(super) async fn run_session(
                     if let Err((code, error)) =
                         apply_channel_op_completion(completion, &mut state, metrics)
                     {
+                        flush_timed(
+                            &mut writer,
+                            state.heartbeat,
+                            subscription_policy_changes.as_mut(),
+                        ).await?;
                         write_broker_error(&mut writer, code, error).await?;
                     }
                 }
@@ -307,7 +333,11 @@ pub(super) async fn run_session(
                                 .fetch_add(batch_bytes as u64, Ordering::Relaxed);
                             if deliveries.is_empty() {
                                 metrics.fetch_empty.fetch_add(1, Ordering::Relaxed);
-                                flush_timed(&mut writer, state.heartbeat).await?;
+                                flush_timed(
+                                    &mut writer,
+                                    state.heartbeat,
+                                    subscription_policy_changes.as_mut(),
+                                ).await?;
                                 continue;
                             }
                             let write_timeout = delivery_write_timeout(state.heartbeat);
@@ -337,11 +367,34 @@ pub(super) async fn run_session(
                                 )
                                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                             let mut handed_off = Vec::with_capacity(deliveries.len());
-                            for delivery in deliveries {
+                            for mut delivery in deliveries {
                                 if delivery_is_outstanding(
                                     &state.in_flight,
                                     delivery.id,
                                 ) {
+                                    continue;
+                                }
+                                let mut policy_changes = broker
+                                    .subscribe_topic_policy(&delivery_topic)
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                ensure_buffered_policy_is_current(
+                                    &writer,
+                                    subscription_policy_changes.as_mut(),
+                                )?;
+                                let expiration_ns = broker
+                                    .delivery_expiration_ns(
+                                        &delivery_topic,
+                                        delivery.timestamp_ns,
+                                    )
+                                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                delivery.ttl_discard = expiration_ns.is_some();
+                                let ttl_remaining = expiration_ns.map(remaining_until_ns);
+                                if ttl_remaining.is_some_and(|remaining| remaining.is_zero()) {
+                                    broker
+                                        .expire_topic_if_due(&delivery_topic)
+                                        .await
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    delivery_guard.accept(delivery.id);
                                     continue;
                                 }
                                 if dead_letter_if_needed(
@@ -362,7 +415,7 @@ pub(super) async fn run_session(
                                     let token = delivery_guard
                                         .token(delivery.id)
                                         .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
-                                    let deadline = renew_delivery_lease(
+                                    let mut deadline = renew_delivery_lease(
                                         broker,
                                         &delivery_topic,
                                         &delivery_channel,
@@ -371,6 +424,9 @@ pub(super) async fn run_session(
                                         state.message_timeout,
                                     )
                                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                                    if let Some(remaining) = ttl_remaining {
+                                        deadline = cap_deadline_at_ttl(deadline, remaining);
+                                    }
                                     channel_ops
                                         .finish_sampled(
                                             delivery_topic.clone(),
@@ -399,20 +455,28 @@ pub(super) async fn run_session(
                                 let token = delivery_guard
                                     .token(delivery.id)
                                     .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
-                                tokio::time::timeout(
+                                write_message_timed(
+                                    &mut writer,
+                                    &header,
+                                    &delivery.body,
                                     write_timeout,
-                                    writer.write_message_parts(&header, &delivery.body),
+                                    expiration_ns,
+                                    &mut policy_changes,
                                 )
-                                .await
-                                .map_err(|_| anyhow::anyhow!("consumer delivery write timed out"))??;
+                                .await?;
                                 let accepted_token = delivery_guard
                                     .accept_with_token(delivery.id)
                                     .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
                                 debug_assert_eq!(accepted_token, token);
+                                let mut delivery_deadline = handoff_deadline;
+                                if let Some(remaining) = expiration_ns.map(remaining_until_ns) {
+                                    delivery_deadline =
+                                        cap_deadline_at_ttl(delivery_deadline, remaining);
+                                }
                                 state.record_delivery(
                                     delivery.id,
                                     InFlightDelivery {
-                                        deadline: handoff_deadline,
+                                        deadline: delivery_deadline,
                                         token,
                                     },
                                 );
@@ -437,7 +501,10 @@ pub(super) async fn run_session(
                                         debug_assert_eq!(delivery.token, token);
                                         state.record_delivery(
                                             id,
-                                            InFlightDelivery { deadline, ..delivery },
+                                            InFlightDelivery {
+                                                deadline: deadline.min(delivery.deadline),
+                                                ..delivery
+                                            },
                                         );
                                     }
                                 }
@@ -448,6 +515,11 @@ pub(super) async fn run_session(
                             if broker_storage_error(&error) {
                                 metrics.storage_errors.fetch_add(1, Ordering::Relaxed);
                             }
+                            flush_timed(
+                                &mut writer,
+                                state.heartbeat,
+                                subscription_policy_changes.as_mut(),
+                            ).await?;
                             write_error_timed(
                                 &mut writer,
                                 state.heartbeat,
@@ -459,11 +531,22 @@ pub(super) async fn run_session(
                         }
                     }
                 }
+                changed = wait_for_policy_change(&mut subscription_policy_changes), if subscription_policy_changes.is_some() => {
+                    changed.map_err(|_| anyhow::anyhow!("subscribed Topic closed"))?;
+                    if writer.has_pending() {
+                        anyhow::bail!("Topic delivery policy changed with buffered consumer output");
+                    }
+                }
                 _ = heartbeat_tick.tick(), if state.heartbeat.is_some() => {
                     let heartbeat = state.heartbeat.unwrap();
                     if last_command.elapsed() >= heartbeat.saturating_mul(2) {
                         break;
                     }
+                    flush_timed(
+                        &mut writer,
+                        state.heartbeat,
+                        subscription_policy_changes.as_mut(),
+                    ).await?;
                     tokio::time::timeout(
                         connection_progress_timeout(state.heartbeat),
                         write_frame(&mut writer, FrameType::Response, HEARTBEAT),
@@ -472,7 +555,11 @@ pub(super) async fn run_session(
                     .map_err(|_| anyhow::anyhow!("heartbeat write timed out"))??;
                 }
                 _ = output_buffer_tick.tick(), if state.output_buffer_timeout.is_some() && writer.has_pending() => {
-                    flush_timed(&mut writer, state.heartbeat).await?;
+                    flush_timed(
+                        &mut writer,
+                        state.heartbeat,
+                        subscription_policy_changes.as_mut(),
+                    ).await?;
                 }
                 _ = wait_for_in_flight_deadline(in_flight_deadline) => {}
             }
@@ -513,6 +600,42 @@ pub(super) async fn run_session(
     session_result
 }
 
+async fn wait_for_policy_change(
+    policy_changes: &mut Option<tokio::sync::watch::Receiver<rustqueue_queue::TopicPolicy>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    policy_changes
+        .as_mut()
+        .expect("disabled policy change future is never polled")
+        .changed()
+        .await
+}
+
+fn ensure_buffered_policy_is_current(
+    writer: &ClientWriter,
+    policy_changes: Option<&mut tokio::sync::watch::Receiver<rustqueue_queue::TopicPolicy>>,
+) -> anyhow::Result<()> {
+    let Some(policy_changes) = policy_changes else {
+        return Ok(());
+    };
+    match policy_changes.has_changed() {
+        Ok(false) => Ok(()),
+        Ok(true) if writer.has_pending() => {
+            anyhow::bail!("Topic delivery policy changed with buffered consumer output")
+        }
+        Ok(true) => {
+            policy_changes.borrow_and_update();
+            Ok(())
+        }
+        Err(_) => anyhow::bail!("subscribed Topic closed"),
+    }
+}
+
+fn cap_deadline_at_ttl(deadline: Instant, remaining: Duration) -> Instant {
+    Instant::now()
+        .checked_add(remaining)
+        .map_or(deadline, |ttl_deadline| deadline.min(ttl_deadline))
+}
+
 async fn fetch_deliveries(
     broker: &Broker,
     request: FetchRequest,
@@ -528,6 +651,8 @@ async fn fetch_deliveries(
         )
         .await?;
     let (deliveries, delivery_guard) = batch.into_parts();
+    let ttl_discard = broker.topic_policy(&request.topic)?.delivery_mode
+        == rustqueue_queue::DeliveryMode::TtlDiscard;
     let deliveries = deliveries
         .into_iter()
         .map(|delivery| RemoteDelivery {
@@ -535,6 +660,7 @@ async fn fetch_deliveries(
             timestamp_ns: delivery.timestamp_ns,
             attempts: delivery.attempts,
             body: bytes::Bytes::from_owner(delivery.body),
+            ttl_discard,
         })
         .collect();
     Ok(FetchResponse {

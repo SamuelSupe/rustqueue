@@ -27,7 +27,8 @@ pub use management::{
 };
 pub use model::{
     BrokerLatencyStats, BrokerStats, ChannelGroupCommitStats, ChannelStats, Delivery,
-    DeliveryBatch, DeliveryBudgetStats, PublishGroupCommitStats, QueueAggregateStats, TopicStats,
+    DeliveryBatch, DeliveryBudgetStats, DeliveryMode, PublishGroupCommitStats, QueueAggregateStats,
+    TopicPolicy, TopicStats, TtlDiscardReport,
 };
 
 #[doc(hidden)]

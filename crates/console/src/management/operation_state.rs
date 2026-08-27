@@ -23,6 +23,19 @@ pub(super) fn new_operation(
     digest.update(request.kind.as_bytes());
     digest.update(request.topic.as_bytes());
     digest.update(request.channel.as_deref().unwrap_or_default().as_bytes());
+    digest.update(
+        request
+            .delivery_mode
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    digest.update(
+        request
+            .message_ttl_seconds
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
     Ok(ManagedResourceOperation {
         id: format!("op-{}", &hex::encode(digest.finalize())[..32]),
         action,
@@ -72,6 +85,7 @@ pub(super) fn started_channel(resource: &RustQueueChannel) -> StartedOperation {
 fn parse_action(action: &str) -> Result<ManagedResourceAction, ManagementError> {
     match action {
         "create" => Ok(ManagedResourceAction::Create),
+        "configure" => Ok(ManagedResourceAction::Configure),
         "pause" => Ok(ManagedResourceAction::Pause),
         "unpause" => Ok(ManagedResourceAction::Unpause),
         "empty" => Ok(ManagedResourceAction::Empty),
@@ -86,6 +100,7 @@ fn parse_action(action: &str) -> Result<ManagedResourceAction, ManagementError> 
 pub fn action_name(action: ManagedResourceAction) -> &'static str {
     match action {
         ManagedResourceAction::Create => "create",
+        ManagedResourceAction::Configure => "configure",
         ManagedResourceAction::Pause => "pause",
         ManagedResourceAction::Unpause => "unpause",
         ManagedResourceAction::Empty => "empty",

@@ -2,8 +2,8 @@ use super::io::SEQUENCE_RESERVATION;
 use super::*;
 use crate::outbox::OutboxEntry;
 use crate::{
-    ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot,
-    TopicManagementAction,
+    ChannelManagementAction, ChannelManagementCommand, DeliveryMode, ManagementFenceSnapshot,
+    TopicManagementAction, TopicPolicy,
 };
 use futures::future::join_all;
 use std::collections::{BTreeMap, HashSet};
@@ -2085,6 +2085,7 @@ async fn failed_management_preconditions_do_not_leave_durable_blockers() {
                 TopicManagementAction::Pause,
                 broker.registry_revision(),
                 None,
+                None,
             )
             .await,
         Err(BrokerError::TopicNotFound)
@@ -2115,6 +2116,7 @@ async fn failed_management_preconditions_do_not_leave_durable_blockers() {
                 "missing",
                 TopicManagementAction::Delete,
                 broker.registry_revision(),
+                None,
                 None,
             )
             .await,
@@ -2154,8 +2156,13 @@ async fn a_different_management_action_cannot_cross_a_pending_operation() {
     })
     .unwrap();
     broker.create_topic("events").await.unwrap();
-    let fingerprint =
-        serde_json::to_string(&("topic", "events", TopicManagementAction::Pause)).unwrap();
+    let fingerprint = serde_json::to_string(&(
+        "topic",
+        "events",
+        TopicManagementAction::Pause,
+        None::<TopicPolicy>,
+    ))
+    .unwrap();
     broker
         .inner
         .management_ops
@@ -2176,6 +2183,7 @@ async fn a_different_management_action_cannot_cross_a_pending_operation() {
                 TopicManagementAction::Delete,
                 broker.registry_revision(),
                 Some(now_ms() + 60_000),
+                None,
             )
             .await,
         Err(BrokerError::OperationConflict)
@@ -2215,6 +2223,7 @@ async fn management_fences_fail_closed_and_survive_restart() {
             TopicManagementAction::Delete,
             broker.registry_revision(),
             Some(deadline),
+            None,
         )
         .await
         .unwrap();
@@ -2254,6 +2263,7 @@ async fn management_fences_fail_closed_and_survive_restart() {
             TopicManagementAction::Create,
             broker.registry_revision(),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2279,6 +2289,7 @@ async fn management_rejects_stale_registry_revisions() {
             TopicManagementAction::Create,
             stale,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2289,6 +2300,7 @@ async fn management_rejects_stale_registry_revisions() {
             "events",
             TopicManagementAction::Pause,
             stale,
+            None,
             None,
         )
         .await
@@ -2434,6 +2446,7 @@ async fn management_operation_results_are_idempotent_across_restart() {
             TopicManagementAction::Create,
             expected,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2443,6 +2456,7 @@ async fn management_operation_results_are_idempotent_across_restart() {
             "orders",
             TopicManagementAction::Create,
             expected,
+            None,
             None,
         )
         .await
@@ -2458,6 +2472,7 @@ async fn management_operation_results_are_idempotent_across_restart() {
             TopicManagementAction::Create,
             0,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2470,11 +2485,68 @@ async fn management_operation_results_are_idempotent_across_restart() {
                 TopicManagementAction::Pause,
                 broker.registry_revision(),
                 None,
+                None,
             )
             .await,
         Err(BrokerError::OperationConflict)
     ));
     assert!(broker.storage_healthy());
+}
+
+#[tokio::test]
+async fn management_topic_policy_is_validated_and_bound_to_operation_identity() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    let ttl_policy = TopicPolicy {
+        delivery_mode: DeliveryMode::TtlDiscard,
+        message_ttl_seconds: Some(30),
+    };
+    broker
+        .manage_topic(
+            "create-ttl-orders-0001",
+            "ttl-orders",
+            TopicManagementAction::Create,
+            broker.registry_revision(),
+            None,
+            Some(ttl_policy),
+        )
+        .await
+        .unwrap();
+    assert_eq!(broker.topic_policy("ttl-orders").unwrap(), ttl_policy);
+
+    assert!(matches!(
+        broker
+            .manage_topic(
+                "create-ttl-orders-0001",
+                "ttl-orders",
+                TopicManagementAction::Create,
+                broker.registry_revision(),
+                None,
+                Some(TopicPolicy::default()),
+            )
+            .await,
+        Err(BrokerError::OperationConflict)
+    ));
+    assert!(matches!(
+        broker
+            .manage_topic(
+                "configure-ttl-orders-0001",
+                "ttl-orders",
+                TopicManagementAction::Configure,
+                broker.registry_revision(),
+                None,
+                Some(TopicPolicy {
+                    delivery_mode: DeliveryMode::Reliable,
+                    message_ttl_seconds: Some(30),
+                }),
+            )
+            .await,
+        Err(BrokerError::InvalidTopicPolicy(_))
+    ));
 }
 
 #[tokio::test]
@@ -2487,8 +2559,13 @@ async fn expired_pending_tombstone_can_finish_and_unblock_the_topic() {
     .unwrap();
     broker.create_topic("orders").await.unwrap();
     let operation_id = "tombstone-orders-0001";
-    let fingerprint =
-        serde_json::to_string(&("topic", "orders", TopicManagementAction::Tombstone)).unwrap();
+    let fingerprint = serde_json::to_string(&(
+        "topic",
+        "orders",
+        TopicManagementAction::Tombstone,
+        None::<TopicPolicy>,
+    ))
+    .unwrap();
     broker
         .inner
         .management_ops
@@ -2508,6 +2585,7 @@ async fn expired_pending_tombstone_can_finish_and_unblock_the_topic() {
             TopicManagementAction::Tombstone,
             0,
             Some(now_ms().saturating_sub(1)),
+            None,
         )
         .await
         .unwrap();
@@ -2724,5 +2802,246 @@ fn runtime_integrity_errors_isolate_the_broker() {
     assert!(matches!(
         broker.ensure_storage_healthy(),
         Err(BrokerError::StorageUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn ttl_discard_removes_unrouted_backlog_across_restart() {
+    let root = tempdir().unwrap();
+    let config = BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    };
+    let broker = Broker::open(config.clone()).unwrap();
+    broker.create_topic("ttl-events").await.unwrap();
+    broker
+        .configure_topic_policy(
+            "ttl-events",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    broker
+        .publish(
+            "ttl-events",
+            vec![b"expires-without-a-channel".to_vec()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    drop(broker);
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let broker = Broker::open(config).unwrap();
+    while !broker.expire_due_topics(128).await.unwrap().is_empty() {}
+    broker
+        .create_channel("ttl-events", "late-workers")
+        .await
+        .unwrap();
+
+    assert!(broker
+        .fetch_batch(
+            "ttl-events",
+            "late-workers",
+            1,
+            usize::MAX,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    let topic = &broker.stats().topics[0];
+    assert_eq!(topic.message_count, 0);
+    assert_eq!(topic.ttl_discarded_messages, 1);
+}
+
+#[tokio::test]
+async fn ttl_policy_changes_apply_to_backlog_without_reviving_expired_messages() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("policy", "workers").await.unwrap();
+    broker
+        .publish("policy", vec![b"old".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    broker
+        .configure_topic_policy(
+            "policy",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(broker.stats().topics[0].message_count, 1);
+
+    broker
+        .configure_topic_policy(
+            "policy",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(broker
+        .fetch_batch("policy", "workers", 1, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    broker
+        .publish("policy", vec![b"survivor".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    broker
+        .configure_topic_policy(
+            "policy",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    broker
+        .configure_topic_policy("policy", TopicPolicy::default())
+        .await
+        .unwrap();
+
+    let message = broker
+        .next_message("policy", "workers", None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.body.as_ref(), b"survivor");
+    broker
+        .finish("policy", "workers", message.id)
+        .await
+        .unwrap();
+    assert!(broker
+        .next_message("policy", "workers", None)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(broker.stats().topics[0].ttl_discarded_messages, 1);
+}
+
+#[tokio::test]
+async fn ttl_discard_evicts_durable_ephemeral_deferred_requeued_and_in_flight_state() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("ttl-state").await.unwrap();
+    broker
+        .configure_topic_policy(
+            "ttl-state",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    for channel in ["alpha", "beta", "tail#ephemeral"] {
+        broker.create_channel("ttl-state", channel).await.unwrap();
+    }
+    broker
+        .publish(
+            "ttl-state",
+            vec![b"in-flight".to_vec(), b"retry".to_vec()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    broker
+        .publish(
+            "ttl-state",
+            vec![b"deferred".to_vec()],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    let alpha = broker
+        .fetch_batch("ttl-state", "alpha", 1, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap()
+        .remove(0);
+    let beta = broker
+        .fetch_batch("ttl-state", "beta", 1, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap()
+        .remove(0);
+    broker
+        .requeue("ttl-state", "beta", beta.id, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let ephemeral = broker
+        .fetch_batch(
+            "ttl-state",
+            "tail#ephemeral",
+            1,
+            usize::MAX,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(broker.stats().topics[0]
+        .channels
+        .iter()
+        .any(|channel| channel.deferred_count > 0));
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    while !broker.expire_due_topics(128).await.unwrap().is_empty() {}
+
+    let topic = &broker.stats().topics[0];
+    assert_eq!(topic.message_count, 0);
+    assert_eq!(topic.ttl_discarded_messages, 3);
+    assert!(topic.channels.iter().all(|channel| {
+        channel.depth == 0 && channel.in_flight_count == 0 && channel.deferred_count == 0
+    }));
+    broker.create_channel("ttl-state", "gamma").await.unwrap();
+    assert!(broker
+        .fetch_batch("ttl-state", "gamma", 1, usize::MAX, Duration::ZERO, None,)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        broker.finish("ttl-state", "alpha", alpha.id).await,
+        Err(BrokerError::MessageNotInFlight)
+    ));
+    assert!(matches!(
+        broker
+            .requeue("ttl-state", "beta", beta.id, Duration::ZERO)
+            .await,
+        Err(BrokerError::MessageNotInFlight)
+    ));
+    assert!(matches!(
+        broker.touch(
+            "ttl-state",
+            "tail#ephemeral",
+            ephemeral.id,
+            Some(Duration::from_secs(30)),
+        ),
+        Err(BrokerError::MessageNotInFlight)
     ));
 }

@@ -281,6 +281,9 @@ struct TopicAggregate {
     name: String,
     owners: BTreeSet<String>,
     paused: bool,
+    delivery_mode: String,
+    message_ttl_seconds: Option<u64>,
+    ttl_discarded_messages: u64,
     stored_messages: u64,
     segment_count: u64,
     segment_bytes: u64,
@@ -292,6 +295,15 @@ impl TopicAggregate {
         self.name = topic.name.clone();
         self.owners.insert(owner.into());
         self.paused |= topic.paused;
+        self.delivery_mode = match topic.delivery_mode {
+            rustqueue_queue::DeliveryMode::Reliable => "RELIABLE",
+            rustqueue_queue::DeliveryMode::TtlDiscard => "TTL_DISCARD",
+        }
+        .into();
+        self.message_ttl_seconds = topic.message_ttl_seconds;
+        self.ttl_discarded_messages = self
+            .ttl_discarded_messages
+            .saturating_add(topic.ttl_discarded_messages);
         self.stored_messages = self.stored_messages.saturating_add(topic.message_count);
         self.segment_count = self.segment_count.saturating_add(topic.segment_count);
         self.segment_bytes = self.segment_bytes.saturating_add(topic.segment_bytes);
@@ -308,6 +320,9 @@ impl TopicAggregate {
             name: self.name,
             owners: self.owners.into_iter().collect(),
             paused: self.paused,
+            delivery_mode: self.delivery_mode,
+            message_ttl_seconds: self.message_ttl_seconds,
+            ttl_discarded_messages: self.ttl_discarded_messages,
             stored_messages: self.stored_messages,
             segment_count: self.segment_count,
             segment_bytes: self.segment_bytes,

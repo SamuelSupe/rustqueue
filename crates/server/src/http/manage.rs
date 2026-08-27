@@ -2,8 +2,8 @@ use super::*;
 use crate::subscriptions::DeletePermit;
 use axum::extract::Path;
 use rustqueue_queue::{
-    ChannelManagementAction, ChannelManagementCommand, ManagementFenceSnapshot, ManagementResult,
-    TopicManagementAction,
+    ChannelManagementAction, ChannelManagementCommand, DeliveryMode, ManagementFenceSnapshot,
+    ManagementResult, TopicManagementAction, TopicPolicy,
 };
 
 #[derive(Debug, Deserialize)]
@@ -12,6 +12,10 @@ pub(super) struct TopicManageRequest {
     topic: String,
     expected_revision: u64,
     tombstone_until_ms: Option<i64>,
+    #[serde(default, alias = "deliveryMode")]
+    delivery_mode: Option<DeliveryMode>,
+    #[serde(default, alias = "messageTtlSeconds")]
+    message_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +35,7 @@ pub(super) async fn manage_topic(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&headers, &state.tokens.console, "console")?;
     let action = parse_topic_action(&action)?;
+    let policy = topic_policy(&request, action)?;
     let result = state
         .broker
         .manage_topic(
@@ -39,6 +44,7 @@ pub(super) async fn manage_topic(
             action,
             request.expected_revision,
             request.tombstone_until_ms,
+            policy,
         )
         .await?;
     tracing::info!(
@@ -253,6 +259,7 @@ pub(super) async fn sync_fences(
 fn parse_topic_action(value: &str) -> Result<TopicManagementAction, ApiError> {
     match value {
         "create" => Ok(TopicManagementAction::Create),
+        "configure" => Ok(TopicManagementAction::Configure),
         "pause" => Ok(TopicManagementAction::Pause),
         "unpause" => Ok(TopicManagementAction::Unpause),
         "empty" => Ok(TopicManagementAction::Empty),
@@ -262,6 +269,40 @@ fn parse_topic_action(value: &str) -> Result<TopicManagementAction, ApiError> {
             "E_BAD_ACTION",
             "unknown topic action",
         )),
+    }
+}
+
+fn topic_policy(
+    request: &TopicManageRequest,
+    action: TopicManagementAction,
+) -> Result<Option<TopicPolicy>, ApiError> {
+    let policy = request.delivery_mode.map(|delivery_mode| TopicPolicy {
+        delivery_mode,
+        message_ttl_seconds: request.message_ttl_seconds,
+    });
+    match action {
+        TopicManagementAction::Create
+            if policy.is_none() && request.message_ttl_seconds.is_none() =>
+        {
+            Ok(None)
+        }
+        TopicManagementAction::Create | TopicManagementAction::Configure => policy
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    "E_BAD_TOPIC_POLICY",
+                    "delivery_mode is required when configuring a topic policy",
+                )
+            })?
+            .validate()
+            .map(Some)
+            .map_err(|detail| ApiError::bad_request("E_BAD_TOPIC_POLICY", detail)),
+        _ if policy.is_some() || request.message_ttl_seconds.is_some() => {
+            Err(ApiError::bad_request(
+                "E_BAD_TOPIC_POLICY",
+                "topic policy is only accepted for create or configure",
+            ))
+        }
+        _ => Ok(None),
     }
 }
 

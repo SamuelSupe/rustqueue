@@ -20,6 +20,10 @@ pub struct ApplyRequest {
     pub(super) action: String,
     pub(super) topic: String,
     pub(super) channel: Option<String>,
+    #[serde(default, alias = "deliveryMode")]
+    pub(super) delivery_mode: Option<String>,
+    #[serde(default, alias = "messageTtlSeconds")]
+    pub(super) message_ttl_seconds: Option<u64>,
     pub(super) action_token: String,
     #[serde(default)]
     pub(super) confirmation: String,
@@ -38,6 +42,8 @@ pub async fn apply(
         action: request.action.clone(),
         topic: request.topic.clone(),
         channel: request.channel.clone(),
+        delivery_mode: request.delivery_mode.clone(),
+        message_ttl_seconds: request.message_ttl_seconds,
     };
     validate_request(&preview_request)?;
     let challenge = state
@@ -142,6 +148,8 @@ fn verify_request(
         || request.action != challenge.action
         || request.topic != challenge.topic
         || request.channel != challenge.channel
+        || request.delivery_mode != challenge.delivery_mode
+        || request.message_ttl_seconds != challenge.message_ttl_seconds
     {
         return Err(ManagementError::conflict(
             "E_ACTION_TOKEN_MISMATCH",
@@ -170,8 +178,20 @@ fn verify_current_owners(
         .topics
         .iter()
         .find(|topic| topic.name == request.topic);
+    if request.kind == "topic"
+        && request.action == "create"
+        && challenge.subject_kind == "catalog"
+        && topic.is_some()
+    {
+        return Err(ManagementError::conflict(
+            "E_RESOURCE_CHANGED",
+            "topic appeared after preview",
+        ));
+    }
     let mut current = if request.kind == "topic" && request.action == "create" {
-        challenge.owners.clone()
+        topic
+            .map(|topic| topic.owners.clone())
+            .unwrap_or_else(|| challenge.owners.clone())
     } else if request.kind == "channel" && request.action == "create" {
         topic.map(|topic| topic.owners.clone()).unwrap_or_default()
     } else if request.kind == "topic" {
@@ -196,11 +216,63 @@ fn verify_current_owners(
             "resource ownership changed after preview",
         ));
     }
-    if is_destructive(&request.action) && current.len() > 1 {
+    let topic_policy_operation =
+        request.kind == "topic" && matches!(request.action.as_str(), "create" | "configure");
+    if (is_destructive(&request.action) || topic_policy_operation) && current.len() > 1 {
         return Err(ManagementError::conflict(
             "E_MIGRATION_IN_PROGRESS",
-            "destructive operations are blocked while multiple owners are visible",
+            "destructive and topic policy operations are blocked while multiple owners are visible",
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_owner_guard_only_blocks_topic_policy_operations() {
+        let mut snapshot = crate::model::Snapshot::default();
+        snapshot.topics.push(crate::model::TopicView {
+            name: "events".into(),
+            owners: vec!["one".into(), "two".into()],
+            ..Default::default()
+        });
+        let mut request = ApplyRequest {
+            kind: "channel".into(),
+            action: "create".into(),
+            topic: "events".into(),
+            channel: Some("workers".into()),
+            delivery_mode: None,
+            message_ttl_seconds: None,
+            action_token: "token".into(),
+            confirmation: String::new(),
+        };
+        let mut challenge = ActionChallenge {
+            token: "token".into(),
+            kind: "channel".into(),
+            action: "create".into(),
+            topic: "events".into(),
+            channel: Some("workers".into()),
+            delivery_mode: None,
+            message_ttl_seconds: None,
+            subject_uid: "uid".into(),
+            resource_version: "1".into(),
+            subject_kind: "topic".into(),
+            owners: vec!["one".into(), "two".into()],
+            confirmation: None,
+            expires_at_ms: u64::MAX,
+        };
+
+        assert!(verify_current_owners(&snapshot, &request, &challenge).is_ok());
+
+        request.kind = "topic".into();
+        request.action = "configure".into();
+        request.channel = None;
+        challenge.kind = "topic".into();
+        challenge.action = "configure".into();
+        challenge.channel = None;
+        assert!(verify_current_owners(&snapshot, &request, &challenge).is_err());
+    }
 }

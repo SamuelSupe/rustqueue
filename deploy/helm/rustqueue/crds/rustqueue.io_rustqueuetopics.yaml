@@ -29,6 +29,9 @@ spec:
             spec:
               type: object
               required: [queue, topic, phase]
+              x-kubernetes-validations:
+                - rule: "self.deliveryMode == 'RELIABLE' ? !has(self.messageTtlSeconds) : has(self.messageTtlSeconds) && self.messageTtlSeconds > 0"
+                  message: "RELIABLE requires no TTL; TTL_DISCARD requires messageTtlSeconds greater than zero"
               properties:
                 queue: {type: string, minLength: 1}
                 topic: {type: string, minLength: 1}
@@ -41,6 +44,11 @@ spec:
                   enum: [PREPARING, ACTIVE, APPLYING, FAILED, TOMBSTONED]
                 revision: {type: integer, format: int64, minimum: 0, default: 0}
                 paused: {type: boolean, default: false}
+                deliveryMode:
+                  type: string
+                  enum: [RELIABLE, TTL_DISCARD]
+                  default: RELIABLE
+                messageTtlSeconds: {type: integer, format: int64, minimum: 1, nullable: true}
                 tombstoneUntilMs: {type: integer, format: int64, nullable: true}
                 lastError: {type: string, nullable: true, maxLength: 1024}
                 operation:
@@ -51,7 +59,7 @@ spec:
                     id: {type: string, minLength: 16, maxLength: 128}
                     action:
                       type: string
-                      enum: [CREATE, PAUSE, UNPAUSE, EMPTY, DELETE]
+                      enum: [CREATE, CONFIGURE, PAUSE, UNPAUSE, EMPTY, DELETE]
                     completedOwners:
                       type: array
                       default: []

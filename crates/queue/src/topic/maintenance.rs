@@ -3,6 +3,13 @@ use crate::eviction::{self, ProtectiveEviction};
 use crate::model::{QueueAggregateStats, TopicStats};
 use rustqueue_storage::ScrubTarget;
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+pub(crate) struct PreparedTtlDiscard {
+    pub through_position: u64,
+    pub messages: u64,
+    pub channels: Vec<Arc<str>>,
+}
 
 impl Topic {
     pub fn empty_channel(&mut self, channel: &str) -> Result<(), BrokerError> {
@@ -51,8 +58,13 @@ impl Topic {
         TopicStats {
             name: self.name.clone(),
             paused: self.manifest.paused,
+            delivery_mode: self.manifest.delivery_mode,
+            message_ttl_seconds: self.manifest.message_ttl_seconds,
+            ttl_discarded_messages: self.manifest.ttl_discarded_messages,
             published_count: self.published_count,
-            message_count: self.messages.total_count(),
+            message_count: self
+                .messages
+                .count_after_position(self.manifest.expired_through_position),
             segment_count,
             segment_bytes,
             last_durable_position: self.durable_position,
@@ -71,9 +83,10 @@ impl Topic {
         let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();
         aggregate.topic_count = aggregate.topic_count.saturating_add(1);
-        aggregate.message_count = aggregate
-            .message_count
-            .saturating_add(self.messages.total_count());
+        aggregate.message_count = aggregate.message_count.saturating_add(
+            self.messages
+                .count_after_position(self.manifest.expired_through_position),
+        );
         aggregate.segment_count = aggregate.segment_count.saturating_add(segment_count);
         aggregate.segment_bytes = aggregate.segment_bytes.saturating_add(segment_bytes);
         if let Some(pending) = self.pending_sync() {
@@ -163,7 +176,8 @@ impl Topic {
             now_ns().saturating_sub(bootstrap_retention.as_nanos().min(i64::MAX as u128) as i64);
         let bootstrap_from = self
             .messages
-            .retain_from_timestamp(cutoff, self.manifest.next_position);
+            .retain_from_timestamp(cutoff, self.manifest.next_position)
+            .max(self.manifest.expired_through_position.saturating_add(1));
         let channel_from = self
             .channels
             .values()
@@ -215,6 +229,63 @@ impl Topic {
             self.remove_purged_messages()?;
         }
         Ok(removed)
+    }
+
+    pub fn prepare_ttl_discard(
+        &mut self,
+        now_ns: i64,
+        max_messages: u64,
+    ) -> Result<Option<PreparedTtlDiscard>, BrokerError> {
+        let Some(ttl_seconds) = self.policy().ttl_seconds() else {
+            return Ok(None);
+        };
+        let ttl_ns = ttl_seconds
+            .saturating_mul(1_000_000_000)
+            .min(i64::MAX as u64) as i64;
+        let cutoff_ns = now_ns.saturating_sub(ttl_ns);
+        let Some((through_position, messages)) = self.messages.through_timestamp_after(
+            self.manifest.expired_through_position,
+            cutoff_ns,
+            max_messages.max(1),
+        )?
+        else {
+            return Ok(None);
+        };
+        let channels: Vec<Arc<str>> = self.channels.keys().cloned().map(Arc::from).collect();
+        for channel in &channels {
+            self.persist_channel_buffered(channel, ChannelCommand::Evict { through_position })?;
+        }
+        Ok(Some(PreparedTtlDiscard {
+            through_position,
+            messages,
+            channels,
+        }))
+    }
+
+    pub fn commit_ttl_discard(
+        &mut self,
+        through_position: u64,
+        messages: u64,
+    ) -> Result<(), BrokerError> {
+        if through_position <= self.manifest.expired_through_position {
+            return Ok(());
+        }
+        let mut manifest = self.manifest.clone();
+        manifest.expired_through_position = through_position;
+        manifest.ttl_discarded_messages = manifest.ttl_discarded_messages.saturating_add(messages);
+        if !self.has_durable_channels() {
+            manifest.unrouted_from_position = Some(
+                manifest
+                    .unrouted_from_position
+                    .unwrap_or(1)
+                    .max(through_position.saturating_add(1))
+                    .min(manifest.next_position),
+            );
+        }
+        store_atomic(&self.manifest_path, &manifest)?;
+        self.manifest = manifest;
+        self.messages.discard_scheduled_through(through_position);
+        Ok(())
     }
 
     pub fn scrub_targets(&self) -> Result<Vec<ScrubTarget>, BrokerError> {

@@ -12,7 +12,7 @@ use kube::api::{Api, ObjectMeta, PostParams};
 use kube::{Resource, ResourceExt};
 use rustqueue_operator::{
     ManagedResourcePhase, RustQueue, RustQueueChannel, RustQueueChannelSpec, RustQueueTopic,
-    RustQueueTopicSpec,
+    RustQueueTopicSpec, TopicDeliveryMode,
 };
 use std::collections::BTreeMap;
 
@@ -121,6 +121,8 @@ pub async fn begin_topic(
                     phase: phase_for(operation.action),
                     revision: 1,
                     paused: false,
+                    delivery_mode: request_topic_mode(request)?,
+                    message_ttl_seconds: request.message_ttl_seconds,
                     tombstone_until_ms: None,
                     last_error: None,
                     operation: Some(operation),
@@ -137,6 +139,10 @@ pub async fn begin_topic(
     };
     ensure_topic_children_idle(state, &request.topic).await?;
     resource.spec.owners = challenge.owners.clone();
+    if request.action == "configure" {
+        resource.spec.delivery_mode = request_topic_mode(request)?;
+        resource.spec.message_ttl_seconds = request.message_ttl_seconds;
+    }
     if request.action == "retry" {
         retry_operation(&mut resource.spec.operation, &resource.spec.phase, now)?;
     } else {
@@ -161,6 +167,17 @@ pub async fn begin_topic(
         .await
         .map_err(kube_conflict)?;
     Ok(started_topic(&replaced))
+}
+
+fn request_topic_mode(request: &ApplyRequest) -> Result<TopicDeliveryMode, ManagementError> {
+    match request.delivery_mode.as_deref().unwrap_or("RELIABLE") {
+        "RELIABLE" => Ok(TopicDeliveryMode::Reliable),
+        "TTL_DISCARD" => Ok(TopicDeliveryMode::TtlDiscard),
+        _ => Err(ManagementError::bad_request(
+            "E_BAD_TOPIC_POLICY",
+            "delivery_mode must be RELIABLE or TTL_DISCARD",
+        )),
+    }
 }
 
 pub async fn begin_channel(

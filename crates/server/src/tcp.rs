@@ -120,6 +120,7 @@ struct RemoteDelivery {
     timestamp_ns: i64,
     attempts: u16,
     body: Bytes,
+    ttl_discard: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
