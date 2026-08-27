@@ -11,6 +11,7 @@ mod tls;
 
 use admission::PublishAdmission;
 use anyhow::Context;
+use auth::Authenticator;
 use clap::Parser;
 use config::Config;
 use metrics::Metrics;
@@ -106,6 +107,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&metrics),
     ));
     let subscriptions = SubscriptionRegistry::default();
+    let authenticator = Authenticator::new(&config)
+        .map_err(anyhow::Error::msg)?
+        .map(Arc::new);
+    let ephemeral_consumers = tcp::EphemeralConsumers::default();
     let initially_pressured = disk_guard::initialize(&config, &publish_admission, &metrics)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -125,6 +130,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&delivering),
         Arc::clone(&publish_admission),
         subscriptions.clone(),
+        authenticator.clone(),
+        ephemeral_consumers.clone(),
         shutdown_rx.clone(),
         std::time::Duration::from_secs(config.shutdown.grace_seconds)
             .saturating_sub(std::time::Duration::from_millis(250)),
@@ -137,6 +144,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&delivering),
         Arc::clone(&publish_admission),
         subscriptions.clone(),
+        authenticator,
+        ephemeral_consumers,
         shutdown_rx.clone(),
     ));
     let mut kodo_http_task = tokio::spawn(http::serve_kodo_compat(

@@ -19,6 +19,7 @@ pub struct RuntimeCapabilities {
     storage: rustqueue_storage::BinaryCapabilities,
     pub maximum_message_bytes: usize,
     pub maximum_batch_bytes: usize,
+    pub websocket_ttl_live_v1: bool,
 }
 
 pub fn runtime_capabilities() -> RuntimeCapabilities {
@@ -26,6 +27,7 @@ pub fn runtime_capabilities() -> RuntimeCapabilities {
         storage: rustqueue_storage::binary_capabilities(),
         maximum_message_bytes: MAX_SUPPORTED_MESSAGE_BYTES,
         maximum_batch_bytes: MAX_SUPPORTED_BATCH_BYTES,
+        websocket_ttl_live_v1: true,
     }
 }
 
@@ -34,6 +36,7 @@ pub fn runtime_capabilities() -> RuntimeCapabilities {
 pub struct Config {
     pub node: NodeConfig,
     pub network: NetworkConfig,
+    pub websocket: WebSocketConfig,
     pub storage: StorageConfig,
     pub queue: QueueConfig,
     pub security: SecurityConfig,
@@ -41,6 +44,16 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub shutdown: ShutdownConfig,
     pub log_format: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSocketConfig {
+    pub enabled: bool,
+    pub max_connections: usize,
+    pub max_connections_per_topic: usize,
+    pub frame_inflight_bytes: usize,
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -174,6 +187,7 @@ impl Default for Config {
         Self {
             node: NodeConfig::default(),
             network: NetworkConfig::default(),
+            websocket: WebSocketConfig::default(),
             storage: StorageConfig::default(),
             queue: QueueConfig::default(),
             security: SecurityConfig::default(),
@@ -181,6 +195,18 @@ impl Default for Config {
             metrics: MetricsConfig::default(),
             shutdown: ShutdownConfig::default(),
             log_format: "text".into(),
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: 1_024,
+            max_connections_per_topic: 256,
+            frame_inflight_bytes: 128 * 1024 * 1024,
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -402,6 +428,31 @@ impl Config {
         }
         if !(1..=9).contains(&self.network.max_deflate_level) {
             bail!("network.max_deflate_level must be in 1..=9");
+        }
+        if self.websocket.max_connections == 0
+            || self.websocket.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+            || self.websocket.max_connections_per_topic == 0
+            || self.websocket.max_connections_per_topic > self.websocket.max_connections
+            || self.websocket.frame_inflight_bytes < self.queue.max_message_bytes.saturating_add(24)
+            || self.websocket.frame_inflight_bytes > u32::MAX as usize
+        {
+            bail!("websocket connection limits must be non-zero and frame_inflight_bytes must fit at least one maximum message and u32");
+        }
+        if self.websocket.allowed_origins.iter().any(|origin| {
+            let authority = origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"));
+            origin == "*"
+                || authority.is_none_or(|authority| {
+                    authority.is_empty()
+                        || authority.contains('/')
+                        || authority.contains('?')
+                        || authority.contains('#')
+                        || authority.contains(',')
+                        || authority.trim() != authority
+                })
+        }) {
+            bail!("websocket.allowed_origins must contain exact HTTP origins without paths or wildcards");
         }
         if self.security.kodo_cleanup_enabled {
             bail!(

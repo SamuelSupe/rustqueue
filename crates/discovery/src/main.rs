@@ -42,6 +42,12 @@ struct Cli {
     kodo_gateway_address: Option<String>,
     #[arg(long, env = "RUSTQUEUE_KODO_CLEANUP_ENABLED", default_value_t = false)]
     kodo_cleanup_enabled: bool,
+    #[arg(
+        long,
+        env = "RUSTQUEUE_WEBSOCKET_ALLOWED_ORIGINS",
+        value_delimiter = ','
+    )]
+    websocket_allowed_origins: Vec<String>,
 }
 
 #[tokio::main]
@@ -55,6 +61,24 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if cli.endpoint_slice_timeout_ms == 0 {
         anyhow::bail!("EndpointSlice timeout must be greater than zero");
+    }
+    if cli.websocket_allowed_origins.iter().any(|origin| {
+        let authority = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"));
+        origin == "*"
+            || authority.is_none_or(|authority| {
+                authority.is_empty()
+                    || authority.contains('/')
+                    || authority.contains('?')
+                    || authority.contains('#')
+                    || authority.contains(',')
+                    || authority.trim() != authority
+            })
+    }) {
+        anyhow::bail!(
+            "WebSocket allowed origins must be exact HTTP origins without paths or wildcards"
+        );
     }
     if cli.kodo_cleanup_enabled {
         anyhow::bail!(
@@ -103,6 +127,6 @@ async fn main() -> anyhow::Result<()> {
     );
     tokio::select! {
         result = refresh => result,
-        result = serve(cli.address, directory) => result,
+        result = serve(cli.address, directory, cli.websocket_allowed_origins) => result,
     }
 }

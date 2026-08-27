@@ -28,6 +28,8 @@ struct BinaryCapabilities {
     maximum_message_bytes: usize,
     #[serde(default = "legacy_maximum_batch_bytes")]
     maximum_batch_bytes: usize,
+    #[serde(default)]
+    websocket_ttl_live_v1: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -142,6 +144,7 @@ pub(super) async fn target_image(
                 cluster.spec.storage_feature_level,
                 cluster.spec.max_message_bytes,
                 required_batch_bytes(cluster),
+                cluster.spec.websocket.enabled,
             )
             .map_or_else(
                 |message| Ok(Outcome::Blocked(message)),
@@ -279,6 +282,7 @@ fn validate_binary(
     desired: u32,
     message_bytes: usize,
     batch_bytes: usize,
+    websocket_required: bool,
 ) -> Result<(), String> {
     if capabilities.binary_version.trim().is_empty() || capabilities.data_format != DATA_FORMAT {
         return Err("target image does not advertise RustQueue format v7".into());
@@ -299,6 +303,9 @@ fn validate_binary(
             capabilities.maximum_message_bytes, capabilities.maximum_batch_bytes
         ));
     }
+    if websocket_required && !capabilities.websocket_ttl_live_v1 {
+        return Err("target image does not support WebSocket TTL live subscriptions".into());
+    }
     Ok(())
 }
 
@@ -313,6 +320,7 @@ fn validate_report(
         desired.max(report.storage.active_writer_feature_level),
         message_bytes,
         batch_bytes,
+        false,
     )?;
     if report.storage.data_format != DATA_FORMAT {
         return Err("PVC compatibility state is not format v7".into());
@@ -341,13 +349,14 @@ fn legacy_maximum_batch_bytes() -> usize {
 
 fn probe_contract(cluster: &RustQueue, image: &str) -> String {
     format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
         cluster.metadata.uid.as_deref().unwrap_or_default(),
         image,
         cluster.spec.image_pull_policy,
         cluster.spec.storage_feature_level,
         cluster.spec.max_message_bytes,
         required_batch_bytes(cluster),
+        cluster.spec.websocket.enabled,
         cluster.spec.rollout.retry_nonce,
     )
 }
@@ -462,13 +471,16 @@ mod tests {
             maximum_writer_feature_level: maximum,
             maximum_message_bytes: 100 * 1024 * 1024,
             maximum_batch_bytes: 128 * 1024 * 1024,
+            websocket_ttl_live_v1: true,
         }
     }
 
     #[test]
     fn target_image_must_support_the_requested_feature() {
-        assert!(validate_binary(&binary(2), 2, 100 * 1024 * 1024, 128 * 1024 * 1024).is_ok());
-        assert!(validate_binary(&binary(1), 2, 20 * 1024 * 1024, 64 * 1024 * 1024).is_err());
+        assert!(
+            validate_binary(&binary(2), 2, 100 * 1024 * 1024, 128 * 1024 * 1024, false).is_ok()
+        );
+        assert!(validate_binary(&binary(1), 2, 20 * 1024 * 1024, 64 * 1024 * 1024, false).is_err());
     }
 
     #[test]
@@ -483,7 +495,19 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.maximum_message_bytes, legacy_maximum_message_bytes());
         assert_eq!(legacy.maximum_batch_bytes, legacy_maximum_batch_bytes());
-        assert!(validate_binary(&legacy, 2, 100 * 1024 * 1024, 128 * 1024 * 1024).is_err());
+        assert!(validate_binary(&legacy, 2, 100 * 1024 * 1024, 128 * 1024 * 1024, false).is_err());
+    }
+
+    #[test]
+    fn websocket_capability_is_required_only_when_enabled() {
+        let mut capabilities = binary(2);
+        capabilities.websocket_ttl_live_v1 = false;
+        assert!(
+            validate_binary(&capabilities, 2, 20 * 1024 * 1024, 64 * 1024 * 1024, true,).is_err()
+        );
+        assert!(
+            validate_binary(&capabilities, 2, 20 * 1024 * 1024, 64 * 1024 * 1024, false,).is_ok()
+        );
     }
 
     #[test]

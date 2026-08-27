@@ -9,6 +9,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::time::Duration;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Deserialize)]
 struct TopicQuery {
@@ -22,10 +24,29 @@ struct ChannelQuery {
 }
 
 pub fn router(directory: Directory) -> Router {
+    router_with_origins(directory, &[])
+}
+
+pub fn router_with_origins(directory: Directory, allowed_origins: &[String]) -> Router {
+    let lookup_route = if allowed_origins.is_empty() {
+        get(lookup)
+    } else {
+        let origins = allowed_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect::<Vec<_>>();
+        get(lookup).layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods([axum::http::Method::GET])
+                .allow_headers([header::ACCEPT])
+                .max_age(Duration::from_secs(600)),
+        )
+    };
     Router::new()
         .route("/ping", get(|| async { "OK" }))
         .route("/info", get(info))
-        .route("/lookup", get(lookup))
+        .route("/lookup", lookup_route)
         .route("/topics", get(topics))
         .route("/channels", get(channels))
         .route("/nodes", get(nodes))
@@ -82,10 +103,14 @@ async fn nsq_content_negotiation(request: Request<Body>, next: Next) -> Response
     response
 }
 
-pub async fn serve(address: SocketAddr, directory: Directory) -> anyhow::Result<()> {
+pub async fn serve(
+    address: SocketAddr,
+    directory: Directory,
+    allowed_origins: Vec<String>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "RustQueue discovery API listening");
-    axum::serve(listener, router(directory)).await?;
+    axum::serve(listener, router_with_origins(directory, &allowed_origins)).await?;
     Ok(())
 }
 

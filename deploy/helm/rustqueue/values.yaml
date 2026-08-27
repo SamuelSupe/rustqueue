@@ -5,7 +5,7 @@ operator:
   replicas: 2
   image:
     repository: rustqueue-operator
-    tag: "0.9.0"
+    tag: "0.10.0"
     pullPolicy: IfNotPresent
   log: rustqueue_operator=info
   resources:
@@ -20,7 +20,7 @@ operator:
 queue:
   create: true
   name: rustqueue
-  image: rustqueue:0.9.0
+  image: rustqueue:0.10.0
   imagePullPolicy: IfNotPresent
   minBrokers: 1
   maxBrokers: 500
@@ -57,6 +57,12 @@ queue:
   registrySecretName: ""
   clientTlsSecretName: ""
   discoveryReplicas: 2
+  websocket:
+    enabled: false
+    maxConnections: 1024
+    maxConnectionsPerTopic: 256
+    frameInflightBytes: 134217728
+    allowedOrigins: []
   proxyNodeSelector: {}
   # Rotate opaque TCP tunnels so a small producer pool is redistributed as the
   # Broker fleet changes. Set to 0 to keep connections pinned indefinitely.

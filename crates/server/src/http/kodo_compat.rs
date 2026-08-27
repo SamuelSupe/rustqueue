@@ -23,6 +23,9 @@ pub(crate) async fn serve_kodo_compat(
         delivering,
         publish_admission,
         subscriptions,
+        None,
+        EphemeralConsumers::default(),
+        shutdown.clone(),
     )?;
     let tokens = state.tokens.clone();
     let token_shutdown = shutdown.clone();
@@ -69,6 +72,10 @@ mod tests {
             delivering: Arc::new(AtomicBool::new(true)),
             publish_admission: Arc::new(PublishAdmission::new(1024, metrics)),
             subscriptions: SubscriptionRegistry::default(),
+            authenticator: None,
+            ephemeral_consumers: EphemeralConsumers::default(),
+            websocket: WebSocketRuntime::new(&Config::default().websocket),
+            shutdown: tokio::sync::watch::channel(false).1,
             started_at: 1,
         };
 

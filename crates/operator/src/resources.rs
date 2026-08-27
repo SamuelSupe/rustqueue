@@ -255,6 +255,12 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
         json!({"name": "RUSTQUEUE_BROKER_SERVICE", "value": broker_service_name}),
         json!({"name": "RUSTQUEUE_REGISTRY_TOKEN_FILE", "value": "/run/secrets/rustqueue/registry-token"}),
     ];
+    if !cluster.spec.websocket.allowed_origins.is_empty() {
+        discovery_env.push(json!({
+            "name": "RUSTQUEUE_WEBSOCKET_ALLOWED_ORIGINS",
+            "value": cluster.spec.websocket.allowed_origins.join(",")
+        }));
+    }
     if input.advertise_kodo_gateways {
         let cleanup_enabled = input.activate_kodo_cleanup
             && cluster.spec.kodo_compatibility.effective_cleanup_enabled();
@@ -533,8 +539,26 @@ fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
     } else {
         ""
     };
+    let websocket_origins = cluster
+        .spec
+        .websocket
+        .allowed_origins
+        .iter()
+        .map(|origin| serde_json::to_string(origin).expect("origin is serializable"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let websocket = if cluster.spec.websocket.enabled {
+        format!(
+            "[websocket]\nenabled = true\nmax_connections = {}\nmax_connections_per_topic = {}\nframe_inflight_bytes = {}\nallowed_origins = [{websocket_origins}]\n\n",
+            cluster.spec.websocket.max_connections,
+            cluster.spec.websocket.max_connections_per_topic,
+            cluster.spec.websocket.frame_inflight_bytes,
+        )
+    } else {
+        String::new()
+    };
     let mut output = format!(
-        "{kodo_network}[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmax_segment_bytes = {max_segment_bytes}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\nmaintenance_startup_delay_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\npublish_ack_mode = \"{}\"\nrelaxed_sync_messages = {}\nrelaxed_sync_bytes = {}\nrelaxed_sync_interval_ms = {}\n\n[limits]\nmax_body_bytes = {max_body_bytes}\nnode_publish_inflight_bytes = {node_publish_inflight_bytes}\nconnection_publish_inflight_bytes = {connection_publish_inflight_bytes}\nnode_delivery_inflight_bytes = {}\nconnection_delivery_inflight_bytes = {}\ndisconnect_on_retriable_publish_error = false\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\n{publish_token}registry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\n{kodo_cleanup_token}console_management_enabled = {}\nkodo_cleanup_enabled = {}\n# secret: {secret_name}\n",
+        "{kodo_network}{websocket}[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmax_segment_bytes = {max_segment_bytes}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\nmaintenance_startup_delay_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\npublish_ack_mode = \"{}\"\nrelaxed_sync_messages = {}\nrelaxed_sync_bytes = {}\nrelaxed_sync_interval_ms = {}\n\n[limits]\nmax_body_bytes = {max_body_bytes}\nnode_publish_inflight_bytes = {node_publish_inflight_bytes}\nconnection_publish_inflight_bytes = {connection_publish_inflight_bytes}\nnode_delivery_inflight_bytes = {}\nconnection_delivery_inflight_bytes = {}\ndisconnect_on_retriable_publish_error = false\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\n{publish_token}registry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\n{kodo_cleanup_token}console_management_enabled = {}\nkodo_cleanup_enabled = {}\n# secret: {secret_name}\n",
         cluster.spec.storage_feature_level,
         cluster.spec.min_free_bytes,
         cluster.spec.disk_high_watermark_percent,
@@ -666,6 +690,7 @@ mod tests {
                 proxy_node_selector: BTreeMap::new(),
                 proxy_tcp_max_connection_age_seconds: 300,
                 discovery_replicas: 2,
+                websocket: crate::crd::WebSocketSpec::default(),
                 kodo_compatibility: crate::crd::KodoCompatibility::default(),
                 maintenance: None,
                 rollout: crate::crd::RolloutPolicy::default(),
@@ -845,6 +870,28 @@ mod tests {
                 .termination_grace_period_seconds,
             Some(45)
         );
+    }
+
+    #[test]
+    fn websocket_broker_config_is_opt_in_and_renders_limits_and_origins() {
+        let default_config = broker_config(&cluster(), "queue-auth");
+        assert!(!default_config.contains("[websocket]"));
+
+        let mut websocket_cluster = cluster();
+        websocket_cluster.spec.websocket.enabled = true;
+        websocket_cluster.spec.websocket.allowed_origins = vec![
+            "https://console.example.test".into(),
+            "http://127.0.0.1:14151".into(),
+        ];
+        let websocket_config = broker_config(&websocket_cluster, "queue-auth");
+
+        assert!(websocket_config.contains("[websocket]\nenabled = true"));
+        assert!(websocket_config.contains("max_connections = 1024"));
+        assert!(websocket_config.contains("max_connections_per_topic = 256"));
+        assert!(websocket_config.contains("frame_inflight_bytes = 134217728"));
+        assert!(websocket_config.contains(
+            "allowed_origins = [\"https://console.example.test\", \"http://127.0.0.1:14151\"]"
+        ));
     }
 
     #[test]

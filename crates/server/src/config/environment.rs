@@ -27,6 +27,27 @@ impl Config {
         )?;
         set_from_env("RUSTQUEUE_TCP_ADDRESS", &mut self.network.tcp_address)?;
         set_from_env("RUSTQUEUE_HTTP_ADDRESS", &mut self.network.http_address)?;
+        set_from_env("RUSTQUEUE_WEBSOCKET_ENABLED", &mut self.websocket.enabled)?;
+        set_from_env(
+            "RUSTQUEUE_WEBSOCKET_MAX_CONNECTIONS",
+            &mut self.websocket.max_connections,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_WEBSOCKET_MAX_CONNECTIONS_PER_TOPIC",
+            &mut self.websocket.max_connections_per_topic,
+        )?;
+        set_from_env(
+            "RUSTQUEUE_WEBSOCKET_FRAME_INFLIGHT_BYTES",
+            &mut self.websocket.frame_inflight_bytes,
+        )?;
+        if let Ok(value) = env::var("RUSTQUEUE_WEBSOCKET_ALLOWED_ORIGINS") {
+            self.websocket.allowed_origins = value
+                .split(',')
+                .map(str::trim)
+                .filter(|origin| !origin.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
         if let Ok(value) = env::var("RUSTQUEUE_KODO_HTTP_ADDRESS") {
             self.network.kodo_http_address = Some(
                 value

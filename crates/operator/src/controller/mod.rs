@@ -1380,6 +1380,32 @@ fn validate(cluster: &RustQueue, active_feature_floor: u32) -> anyhow::Result<()
     ) {
         bail!("publishAckMode must be durable, write_ack, or nsq_relaxed");
     }
+    if cluster.spec.websocket.max_connections == 0
+        || cluster.spec.websocket.max_connections > tokio::sync::Semaphore::MAX_PERMITS
+        || cluster.spec.websocket.max_connections_per_topic == 0
+        || cluster.spec.websocket.max_connections_per_topic > cluster.spec.websocket.max_connections
+        || cluster.spec.websocket.frame_inflight_bytes
+            < cluster.spec.max_message_bytes.saturating_add(24)
+        || cluster.spec.websocket.frame_inflight_bytes > u32::MAX as usize
+    {
+        bail!("WebSocket limits must fit one maximum message and satisfy per-Topic <= global connections");
+    }
+    if cluster.spec.websocket.allowed_origins.iter().any(|origin| {
+        let authority = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"));
+        origin == "*"
+            || authority.is_none_or(|authority| {
+                authority.is_empty()
+                    || authority.contains('/')
+                    || authority.contains('?')
+                    || authority.contains('#')
+                    || authority.contains(',')
+                    || authority.trim() != authority
+            })
+    }) {
+        bail!("WebSocket allowedOrigins must be exact HTTP origins without paths or wildcards");
+    }
     validate_message_storage_contract(
         cluster.spec.max_message_bytes,
         effective_storage_feature_level(cluster.spec.storage_feature_level, active_feature_floor),

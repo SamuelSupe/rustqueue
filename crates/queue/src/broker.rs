@@ -466,6 +466,23 @@ impl Broker {
     }
 
     pub async fn create_channel(&self, topic: &str, channel: &str) -> Result<(), BrokerError> {
+        self.create_channel_inner(topic, channel, true).await
+    }
+
+    pub async fn create_channel_existing(
+        &self,
+        topic: &str,
+        channel: &str,
+    ) -> Result<(), BrokerError> {
+        self.create_channel_inner(topic, channel, false).await
+    }
+
+    async fn create_channel_inner(
+        &self,
+        topic: &str,
+        channel: &str,
+        create_topic: bool,
+    ) -> Result<(), BrokerError> {
         validate_name(topic).map_err(|_| BrokerError::InvalidTopic)?;
         validate_channel(channel)?;
         self.ensure_management_access(topic, Some(channel))?;
@@ -475,7 +492,11 @@ impl Broker {
         self.storage_task(move || {
             let _lifecycle = broker.inner.topic_lifecycle.lock();
             broker.ensure_management_access(&topic, Some(&channel))?;
-            let handle = broker.get_or_create_topic_locked(&topic)?;
+            let handle = if create_topic {
+                broker.get_or_create_topic_locked(&topic)?
+            } else {
+                broker.topic(&topic)?
+            };
             let _commit_gate = handle.commit_gate.lock();
             let _channel_commit_gate = handle.channel_commit_gate.lock();
             if handle

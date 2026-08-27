@@ -46,6 +46,13 @@ spec:
   maxDetailedMetricSeries: {{ .Values.queue.maxDetailedMetricSeries | int64 }}
   consoleManagementEnabled: {{ and .Values.console.enabled .Values.console.management.enabled }}
   discoveryReplicas: {{ .Values.queue.discoveryReplicas }}
+  websocket:
+    enabled: {{ .Values.queue.websocket.enabled }}
+    maxConnections: {{ .Values.queue.websocket.maxConnections | int64 }}
+    maxConnectionsPerTopic: {{ .Values.queue.websocket.maxConnectionsPerTopic | int64 }}
+    frameInflightBytes: {{ .Values.queue.websocket.frameInflightBytes | int64 }}
+    allowedOrigins:
+      {{- toYaml .Values.queue.websocket.allowedOrigins | nindent 6 }}
   proxyNodeSelector:
     {{- toYaml .Values.queue.proxyNodeSelector | nindent 4 }}
   proxyTcpMaxConnectionAgeSeconds: {{ .Values.queue.proxyTcpMaxConnectionAgeSeconds | int64 }}

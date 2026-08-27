@@ -1429,6 +1429,24 @@ async fn broker_rejects_unbounded_durable_topic_creation() {
 }
 
 #[tokio::test]
+async fn create_channel_existing_rejects_missing_topic_without_creating_it() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+
+    let error = broker
+        .create_channel_existing("events", "workers")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, BrokerError::TopicNotFound));
+    assert!(broker.topic_names().is_empty());
+}
+
+#[tokio::test]
 async fn sealed_backlog_uses_bounded_metadata_residency() {
     let root = tempdir().unwrap();
     let config = BrokerConfig {
@@ -2938,6 +2956,81 @@ async fn ttl_policy_changes_apply_to_backlog_without_reviving_expired_messages()
         .unwrap()
         .is_none());
     assert_eq!(broker.stats().topics[0].ttl_discarded_messages, 1);
+}
+
+#[tokio::test]
+async fn ttl_policy_watch_keeps_reliable_epoch_across_coalesced_changes() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_topic("policy-watch").await.unwrap();
+    broker
+        .configure_topic_policy(
+            "policy-watch",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(30),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut policy_changes = broker.subscribe_topic_policy("policy-watch").unwrap();
+    let initial_epoch = broker.topic_reliable_policy_epoch("policy-watch").unwrap();
+
+    broker
+        .configure_topic_policy(
+            "policy-watch",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(60),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.topic_reliable_policy_epoch("policy-watch").unwrap(),
+        initial_epoch
+    );
+    policy_changes.changed().await.unwrap();
+    assert_eq!(
+        *policy_changes.borrow_and_update(),
+        TopicPolicy {
+            delivery_mode: DeliveryMode::TtlDiscard,
+            message_ttl_seconds: Some(60),
+        }
+    );
+
+    broker
+        .configure_topic_policy("policy-watch", TopicPolicy::default())
+        .await
+        .unwrap();
+    broker
+        .configure_topic_policy(
+            "policy-watch",
+            TopicPolicy {
+                delivery_mode: DeliveryMode::TtlDiscard,
+                message_ttl_seconds: Some(90),
+            },
+        )
+        .await
+        .unwrap();
+
+    policy_changes.changed().await.unwrap();
+    assert_eq!(
+        *policy_changes.borrow_and_update(),
+        TopicPolicy {
+            delivery_mode: DeliveryMode::TtlDiscard,
+            message_ttl_seconds: Some(90),
+        }
+    );
+    assert_eq!(
+        broker.topic_reliable_policy_epoch("policy-watch").unwrap(),
+        initial_epoch + 1
+    );
 }
 
 #[tokio::test]

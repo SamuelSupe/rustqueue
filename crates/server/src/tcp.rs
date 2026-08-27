@@ -13,7 +13,7 @@ use channel_ops::*;
 use codec::*;
 use commands::*;
 use dead_letter::*;
-use ephemeral::*;
+pub(crate) use ephemeral::EphemeralConsumers;
 use session::*;
 use time::*;
 use writer::*;
@@ -224,16 +224,14 @@ pub async fn serve(
     delivering: Arc<AtomicBool>,
     publish_admission: Arc<PublishAdmission>,
     subscriptions: SubscriptionRegistry,
+    authenticator: Option<Arc<Authenticator>>,
+    ephemeral_consumers: EphemeralConsumers,
     mut shutdown: watch::Receiver<bool>,
     shutdown_grace: Duration,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.network.tcp_address).await?;
     let tls_acceptor = tls::acceptor(config.security.tls.as_ref())?;
-    let authenticator = Authenticator::new(&config)
-        .map_err(anyhow::Error::msg)?
-        .map(Arc::new);
     let permits = Arc::new(Semaphore::new(config.limits.max_connections));
-    let ephemeral_consumers = EphemeralConsumers::default();
     info!(address = %config.network.tcp_address, "NSQ TCP listener ready");
 
     let mut sessions = JoinSet::new();

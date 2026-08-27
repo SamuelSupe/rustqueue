@@ -7,6 +7,13 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 #[derive(Default)]
 pub struct Metrics {
     pub tcp_connections: AtomicI64,
+    pub websocket_connections: AtomicI64,
+    pub websocket_messages: AtomicU64,
+    pub websocket_bytes: AtomicU64,
+    pub websocket_auth_failures: AtomicU64,
+    pub websocket_capacity_rejections: AtomicU64,
+    pub websocket_slow_disconnects: AtomicU64,
+    pub websocket_non_ttl_rejections: AtomicU64,
     pub publish_messages: AtomicU64,
     pub publish_bytes: AtomicU64,
     pub publish_inflight_bytes: AtomicI64,
@@ -36,6 +43,13 @@ pub struct Metrics {
 #[derive(Clone, Debug, Serialize)]
 pub struct RuntimeMetricsSnapshot {
     pub tcp_connections: i64,
+    pub websocket_connections: i64,
+    pub websocket_messages: u64,
+    pub websocket_bytes: u64,
+    pub websocket_auth_failures: u64,
+    pub websocket_capacity_rejections: u64,
+    pub websocket_slow_disconnects: u64,
+    pub websocket_non_ttl_rejections: u64,
     pub publish_messages: u64,
     pub publish_bytes: u64,
     pub publish_inflight_bytes: i64,
@@ -300,6 +314,15 @@ impl Metrics {
     pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
         RuntimeMetricsSnapshot {
             tcp_connections: self.tcp_connections.load(Ordering::Relaxed),
+            websocket_connections: self.websocket_connections.load(Ordering::Relaxed),
+            websocket_messages: self.websocket_messages.load(Ordering::Relaxed),
+            websocket_bytes: self.websocket_bytes.load(Ordering::Relaxed),
+            websocket_auth_failures: self.websocket_auth_failures.load(Ordering::Relaxed),
+            websocket_capacity_rejections: self
+                .websocket_capacity_rejections
+                .load(Ordering::Relaxed),
+            websocket_slow_disconnects: self.websocket_slow_disconnects.load(Ordering::Relaxed),
+            websocket_non_ttl_rejections: self.websocket_non_ttl_rejections.load(Ordering::Relaxed),
             publish_messages: self.publish_messages.load(Ordering::Relaxed),
             publish_bytes: self.publish_bytes.load(Ordering::Relaxed),
             publish_inflight_bytes: self.publish_inflight_bytes.load(Ordering::Relaxed),
@@ -332,6 +355,20 @@ impl Metrics {
             concat!(
                 "# TYPE rustqueue_tcp_connections gauge\n",
                 "rustqueue_tcp_connections {}\n",
+                "# TYPE rustqueue_websocket_connections gauge\n",
+                "rustqueue_websocket_connections {}\n",
+                "# TYPE rustqueue_websocket_messages_total counter\n",
+                "rustqueue_websocket_messages_total {}\n",
+                "# TYPE rustqueue_websocket_bytes_total counter\n",
+                "rustqueue_websocket_bytes_total {}\n",
+                "# TYPE rustqueue_websocket_auth_failures_total counter\n",
+                "rustqueue_websocket_auth_failures_total {}\n",
+                "# TYPE rustqueue_websocket_capacity_rejections_total counter\n",
+                "rustqueue_websocket_capacity_rejections_total {}\n",
+                "# TYPE rustqueue_websocket_slow_disconnects_total counter\n",
+                "rustqueue_websocket_slow_disconnects_total {}\n",
+                "# TYPE rustqueue_websocket_non_ttl_rejections_total counter\n",
+                "rustqueue_websocket_non_ttl_rejections_total {}\n",
                 "# TYPE rustqueue_publish_messages_total counter\n",
                 "rustqueue_publish_messages_total {}\n",
                 "# TYPE rustqueue_publish_bytes_total counter\n",
@@ -382,6 +419,13 @@ impl Metrics {
                 "rustqueue_protective_evicted_messages_total {}\n"
             ),
             self.tcp_connections.load(Ordering::Relaxed),
+            self.websocket_connections.load(Ordering::Relaxed),
+            self.websocket_messages.load(Ordering::Relaxed),
+            self.websocket_bytes.load(Ordering::Relaxed),
+            self.websocket_auth_failures.load(Ordering::Relaxed),
+            self.websocket_capacity_rejections.load(Ordering::Relaxed),
+            self.websocket_slow_disconnects.load(Ordering::Relaxed),
+            self.websocket_non_ttl_rejections.load(Ordering::Relaxed),
             self.publish_messages.load(Ordering::Relaxed),
             self.publish_bytes.load(Ordering::Relaxed),
             self.publish_inflight_bytes.load(Ordering::Relaxed),

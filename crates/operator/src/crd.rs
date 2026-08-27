@@ -82,6 +82,8 @@ pub struct RustQueueSpec {
     #[serde(default = "default_discovery_replicas")]
     pub discovery_replicas: i32,
     #[serde(default)]
+    pub websocket: WebSocketSpec,
+    #[serde(default)]
     pub kodo_compatibility: KodoCompatibility,
     #[serde(default)]
     pub maintenance: Option<BrokerMaintenance>,
@@ -91,6 +93,33 @@ pub struct RustQueueSpec {
     pub broker_scheduling: BrokerScheduling,
     #[serde(default)]
     pub broker_resources: WorkloadResources,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSocketSpec {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_websocket_max_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_websocket_max_connections_per_topic")]
+    pub max_connections_per_topic: usize,
+    #[serde(default = "default_websocket_frame_inflight_bytes")]
+    pub frame_inflight_bytes: usize,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+impl Default for WebSocketSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: default_websocket_max_connections(),
+            max_connections_per_topic: default_websocket_max_connections_per_topic(),
+            frame_inflight_bytes: default_websocket_frame_inflight_bytes(),
+            allowed_origins: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -374,6 +403,15 @@ fn default_max_detailed_metric_series() -> usize {
 }
 fn default_discovery_replicas() -> i32 {
     2
+}
+fn default_websocket_max_connections() -> usize {
+    1_024
+}
+fn default_websocket_max_connections_per_topic() -> usize {
+    256
+}
+fn default_websocket_frame_inflight_bytes() -> usize {
+    128 * 1024 * 1024
 }
 fn default_rollout_timeout() -> u64 {
     600

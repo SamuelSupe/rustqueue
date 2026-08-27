@@ -1,7 +1,7 @@
 # RustQueue format v7 share-nothing architecture
 
 Status: accepted implementation contract
-Target release: 0.9.0
+Target release: 0.10.0
 Data format: v7, clean directories only
 
 ## 1. Goal
@@ -125,7 +125,109 @@ TTL cannot restore an already expired prefix.
   the fleet over time, but it cannot turn 16 streams into 500-way concurrent
   disk I/O.
 
-### 2.5 Ordering and identity
+### 2.5 WebSocket TTL live subscriptions
+
+The Broker HTTP listener optionally exposes a best-effort live subscription for
+short-lived Topics:
+
+```text
+GET /v1/ws/topics/{topic}
+Sec-WebSocket-Protocol: rustqueue.live.v1
+```
+
+The feature is default-off. A handshake succeeds only when the addressed
+Topic already exists locally and its persisted policy is `TTL_DISCARD`; the
+endpoint never creates a Topic, and `RELIABLE` or unknown Topics are rejected
+with a stable error code. One connection represents one Topic and begins at
+the current tail. There is no historical replay, reconnect resume, consumer
+ACK or WebSocket retry.
+
+Clients first query Discovery `/lookup` and then connect directly to every
+healthy Broker owner returned for the Topic. The producer proxy is not a
+WebSocket fan-out layer. During a visible owner migration, clients may union
+the streams and deduplicate using the broker-scoped message ID in the frame.
+Discovery's read-only lookup response uses the same allowed-origin policy as
+the Broker WebSocket endpoint.
+
+Each message is written as one complete binary frame. Its first 24 bytes are
+big-endian metadata, followed by the original body:
+
+| Offset | Size | Field |
+| --- | ---: | --- |
+| `0..4` | 4 | ASCII `RQW1` |
+| `4..6` | 2 | Header length, fixed at `24` |
+| `6..8` | 2 | Delivery attempts |
+| `8..16` | 8 | Broker timestamp, signed `i64` nanoseconds |
+| `16..24` | 8 | Broker-scoped message ID, unsigned `u64` |
+| `24..` | — | Original message body |
+
+Text frames are control messages. `auth_required`, client `auth`, `ready` and
+stable error codes are part of the v1 control contract. Subscription
+authorization reuses the existing AUTH rules with the virtual Channel
+`websocket#ephemeral`. Service clients can send an HTTP
+`Authorization: Bearer` header during upgrade; browser clients must use the
+control exchange and must not put credentials in a query string. A browser
+Origin must exactly match the configured allowlist. A missing Origin is
+allowed for non-browser clients but does not bypass authentication.
+
+The HTTP `101 Switching Protocols` response establishes only the transport.
+The live subscription boundary is the server's `{"type":"ready",...}` control
+frame. No message capture is promised before `ready`, including during the
+AUTH exchange after `auth_required`; an HTTP upgrade is not a capture
+boundary.
+
+Handshake failures reuse the HTTP `ApiError` shape: the stable code is in the
+JSON `message` field and the human-readable explanation is in `detail`. Once
+upgraded, terminal errors use a text control of the form
+`{"type":"error","code":"...","detail":"..."}` before close:
+
+| Code | Meaning |
+| --- | --- |
+| `E_WS_QUERY_FORBIDDEN` | Query parameters are forbidden; use the path and headers. |
+| `E_WS_ORIGIN` | Browser Origin is not an exact configured allowlist entry. |
+| `E_WS_SUBPROTOCOL` | `rustqueue.live.v1` was not negotiated. |
+| `E_BAD_TOPIC` | Topic does not exist on this Broker. |
+| `E_WS_TTL_REQUIRED` | Existing Topic is not `TTL_DISCARD` or changed away from it. |
+| `E_WS_CAPACITY` | Connection, Channel or frame-memory capacity is exhausted. |
+| `E_WS_CONTROL` | Unsupported client text/binary data frame was received. |
+| `E_WS_HEARTBEAT` | Peer missed the heartbeat liveness window. |
+| `E_AUTH_TIMEOUT` | `auth` was not received before the AUTH deadline. |
+| `E_BAD_AUTH` | AUTH control was non-text, malformed, or missing a valid `auth`/`secret`. |
+| `E_AUTH_OVERLOADED` | AUTH service or capacity gate is exhausted; retry later. |
+| `E_AUTH_FAILED` | Authentication service or credential validation failed. |
+| `E_UNAUTHORIZED` | AUTH does not permit the Topic subscription. |
+| `E_TOPIC_CLOSED` | Topic was deleted, tombstoned, or closed. |
+| `E_OWNER_CHANGED` | Topic owner/fence changed; perform a fresh lookup. |
+| `E_DRAINING` | Broker is draining and closes the live subscription. |
+| `E_SHUTDOWN` | Broker is shutting down; reconnect after discovery. |
+
+The delivery path creates one ephemeral Channel per connection and reserves at
+most one message at a time. A reservation is released when the complete frame
+cannot be written, when the connection closes, or when the Broker is shutting
+down; there is no reliable backlog. The write deadline is the smaller of the
+socket timeout and the message's remaining TTL. If a frame cannot finish by
+that deadline, the connection closes rather than leaving a partial frame.
+Paused Topics stop taking messages. Topic deletion, migration, owner shutdown,
+or a change to `RELIABLE` closes affected connections and leaves reconnection
+to the client's next lookup.
+
+Runtime defaults are bounded and opt-in:
+
+```toml
+[websocket]
+enabled = false
+max_connections = 1024
+max_connections_per_topic = 256
+frame_inflight_bytes = 134217728
+allowed_origins = []
+```
+
+The node-wide frame budget and connection caps protect publishers from slow
+consumers. Metrics are aggregate by default and include connection count,
+completed frame messages/bytes, authentication failures, capacity rejections,
+non-TTL Topic rejections and slow-consumer closes.
+
+### 2.6 Ordering and identity
 
 - Storage append order exists only inside one broker/topic log.
 - There is no cross-broker order and no global delivery completion order.
@@ -144,6 +246,8 @@ TTL cannot restore an already expired prefix.
 - Client TLS/mTLS, AUTH, Snappy, and Deflate.
 - Local topic segments and channel WAL/checkpoints.
 - Local health, metrics, stats, drain, scrub, and disk-pressure endpoints.
+- Optional best-effort WebSocket delivery for existing `TTL_DISCARD` Topics;
+  it shares the Broker HTTP listener and does not add a listener or port.
 - No OpenRaft node, internal replication server, leader routing, peer
   discovery, or membership controller.
 
@@ -168,6 +272,9 @@ Each replica:
 5. serves `/lookup`, `/topics`, `/channels`, `/nodes`, `/ping`, and `/info`;
    `/lookup` returns the healthy owners during a partial Broker outage while
    the complete-inventory metric remains false.
+
+WebSocket clients use `/lookup` only for owner discovery. Discovery does not
+proxy or multiplex the WebSocket data path.
 
 Discovery state is derived and is never authoritative message metadata. A
 restart reconstructs the complete index from ready brokers. Replicas do not
@@ -366,6 +473,12 @@ move to discovery. Native v6 cluster APIs are removed, including partition,
 replica, migration, rebalance, transfer-leader, federation, and cluster
 operation resources.
 
+The optional native Broker endpoint `GET /v1/ws/topics/{topic}` is available
+only when WebSocket support is enabled and the Topic is `TTL_DISCARD`. Clients
+must negotiate `rustqueue.live.v1`; a successful frame write is best effort and
+does not acknowledge application processing. `/v1/capabilities` advertises the
+`websocket_ttl_live_v1` capability when the binary supports this protocol.
+
 `/ping` remains process liveness. Broker readiness requires local storage,
 clock, and admission health only; it has no cluster-wide dependency.
 
@@ -373,6 +486,8 @@ clock, and admission health only; it has no cluster-wide dependency.
 
 - The deployment targets a trusted internal Kubernetes network.
 - Client-facing broker TLS/mTLS and external AUTH remain optional and compatible.
+- WebSocket Origin checks are exact matches against `websocket.allowed_origins`;
+  the same allowlist is used by Discovery's read-only `/lookup` response.
 - Certificates are mounted from user-provided Kubernetes Secrets.
 - There is no operator-managed CA.
 - Discovery-to-broker polling uses a bounded bearer token, dedicated Service
@@ -478,6 +593,11 @@ The implementation is complete only when all of the following pass:
 14. Console management acceptance creates a real three-owner topic, forces the
     Console Pod down after one owner is durably recorded, and verifies the new
     Pod completes the remaining owners without reapplying the finished owner.
+15. WebSocket acceptance verifies the `rustqueue.live.v1` handshake and 24-byte
+    `RQW1` frame layout, rejects missing and `RELIABLE` Topics without creating
+    them, confirms no replay across connect/disconnect, and exercises AUTH,
+    exact Origin checks, TTL deadline closure, Topic pause/delete/migration,
+    connection and frame-budget rejection, and reservation cleanup.
 
 ## 10. Explicit non-goals
 
@@ -487,5 +607,7 @@ The implementation is complete only when all of the following pass:
 - global deduplication, order, channel catalog, or atomic management;
 - online broker data migration;
 - consumer connection fan-out reduction;
+- reliable WebSocket delivery, replay, resume, client ACK or a shared
+  WebSocket consumer group;
 - cross-region replication;
 - Broker/PVC lifecycle controls in Console.

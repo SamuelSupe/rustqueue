@@ -11,14 +11,14 @@
 [NSQ performance boundaries](docs/architecture/nsq-performance.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.9.0 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.9.0)
+[v0.10.0 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.0)
 
-RustQueue 0.9.0 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.10.0 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.9.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.9.0).
+> Current release: [v0.10.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.0).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -32,6 +32,7 @@ The complete architecture and reliability contract is documented in
 | --- | --- |
 | Durability | Default `PUB`/`MPUB`/`DPUB` return after local segment `fsync`; opt-in `write_ack` and `nsq_relaxed` return after append with explicit crash-loss windows; `FIN`/`REQ` use a durable channel WAL |
 | Delivery | At least once; a restart may redeliver a message without a durable `FIN` |
+| Live subscriptions | Optional WebSocket `rustqueue.live.v1` stream for existing `TTL_DISCARD` Topics; best effort, no replay or ACK |
 | Compatibility | NSQ V2 core commands, lookup, standard Stats fields, TLS/mTLS, AUTH, Snappy, Deflate, fan-out and ephemeral channels |
 | Kodo | Default-off compatibility profile: stable publish Gateways from `/nodes`, real Broker owners from `/lookup`, and no upstream Kodo change |
 | Message size | Conservative 20 MiB default; stable 100 MiB protocol/storage ceiling; Kodo profile validates exactly 104,857,500 bytes |
@@ -44,54 +45,43 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.9.0
+## What's new in 0.10.0
 
-- **Topic-level TTL discard.** Managed Topics can choose `TTL_DISCARD` with a
-  positive whole-second `messageTtlSeconds`; `RELIABLE` remains the default and
-  requires no TTL. The TTL starts at the Broker write timestamp and is an
-  absolute lifetime.
-- **One final expiration boundary.** Expiry applies to unrouted, deferred,
-  requeued and in-flight messages. It evicts the message from every Channel,
-  never writes a DLQ entry, and lets `TTL_DISCARD` retry normally until the TTL
-  rather than ending through retention or maximum-attempt DLQ rules.
-- **Safe online policy changes.** Topic creation can set the policy, and
-  `/v1/manage/topics/configure` supports the `CONFIGURE` operation for existing
-  Topics. Enabling or shortening TTL previews possible backlog loss and
-  requires the exact Topic name; visible multi-owner migrations block policy
-  changes. Extending or disabling TTL cannot revive an already expired message.
-- **Deadline-bound delivery.** Reservation and socket handoff recheck the
-  absolute deadline. If a frame cannot finish before expiry, the consumer
-  connection closes instead of leaving a partially parseable NSQ frame; a
-  complete frame that is not `FIN`ed still expires at the same boundary.
-- **Wire and storage compatibility.** `PUB`, `MPUB` and `DPUB` keep their
-  existing `publish_ack_mode` acknowledgement behavior, and NSQ TCP/HTTP
-  publishing remains unchanged. Existing and auto-created Topics stay
-  `RELIABLE`; old manifests default to that mode, and disk format v7 needs no
-  migration.
+- **TTL live WebSocket subscriptions.** The default-off WebSocket endpoint
+  streams only existing `TTL_DISCARD` Topics. It is a best-effort feed with no
+  replay, reconnect resume or client ACK; consumers use Discovery `/lookup`
+  and connect to every returned Topic owner.
+- **Bounded live delivery.** Each connection uses one ephemeral Channel and at
+  most one reservation. Frame memory, total connections and per-Topic
+  connections are bounded; a slow or expired write closes the connection and
+  releases the reservation.
+- **Existing protocol compatibility.** Topic TTL discard remains the v0.9.0
+  capability, while NSQ TCP/HTTP publishing, ACK modes, storage format v7 and
+  existing `RELIABLE` behavior remain unchanged.
 
-See the [v0.9.0 release notes](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.9.0)
-and [NSQ performance boundaries](docs/architecture/nsq-performance.md) for
-the contract and benchmark interpretation.
+See the [v0.10.0 release notes](docs/releases/v0.10.0.md) and [NSQ performance
+boundaries](docs/architecture/nsq-performance.md) for the contract and
+benchmark interpretation.
 
-## Download 0.9.0
+## Download 0.10.0
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.9.0-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.9.0-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.9.0-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.9.0.tgz` | Helm Chart |
-| `SHA256SUMS-0.9.0` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.10.0-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.10.0-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.10.0-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.10.0.tgz` | Helm Chart |
+| `SHA256SUMS-0.10.0` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.9.0/rustqueue-0.9.0-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.9.0/SHA256SUMS-0.9.0"
-sha256sum --check --ignore-missing SHA256SUMS-0.9.0
-tar -xzf "rustqueue-0.9.0-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.0/rustqueue-0.10.0-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.0/SHA256SUMS-0.10.0"
+sha256sum --check --ignore-missing SHA256SUMS-0.10.0
+tar -xzf "rustqueue-0.10.0-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -182,7 +172,7 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   sent is returned as ambiguous and is never retried automatically.
 - `rustqueue-operator`: creates the StatefulSet, retained PVCs, discovery,
   proxy, RBAC, disruption budgets, PVC expansion and drain-aware one-at-a-time
-  rolling updates. The 0.9 Kodo profile adds atomic Discovery cutover,
+  rolling updates. The Kodo compatibility profile adds atomic Discovery cutover,
   producer-restart fencing and fail-closed decommissioning.
 - `rustqueue-console`: Kubernetes and broker observability backend serving the
   bilingual Carbon UI, with default-off native Topic/Channel management.
@@ -192,6 +182,130 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
 The broker implements `IDENTIFY`, `AUTH`, `SUB`, `PUB`, `MPUB`, `DPUB`, `RDY`,
 `FIN`, `REQ`, `TOUCH`, `NOP`, and `CLS`, including TLS/mTLS, Snappy, Deflate,
 output buffering, sampling, fan-out and ephemeral channels.
+
+## WebSocket TTL live subscriptions
+
+RustQueue can expose a best-effort live feed for short-lived data without
+changing the NSQ TCP contract. WebSocket support is disabled by default. When
+enabled, each Broker's HTTP listener accepts:
+
+```text
+GET /v1/ws/topics/{topic}
+```
+
+The request must negotiate the `rustqueue.live.v1` subprotocol. The Topic must
+already exist on that Broker and have `deliveryMode=TTL_DISCARD`; the endpoint
+never creates a Topic. A missing Topic and a `RELIABLE` Topic are rejected during
+the handshake with the stable WebSocket error response. One connection covers
+one Topic and starts at the current tail, so messages published before the
+connection—or while it is disconnected—are not replayed.
+
+Because RustQueue is share-nothing, clients first call Discovery `/lookup`,
+then open one WebSocket to the Broker HTTP address for each healthy owner. A
+client can union those streams and use the broker-scoped message ID in the
+binary frame for migration-time deduplication. The producer proxy is not a
+WebSocket fan-out layer.
+
+### Authentication and browser policy
+
+WebSocket authentication reuses the existing subscription permission and
+checks the virtual Channel `websocket#ephemeral`. Service clients may send
+`Authorization: Bearer <token>` in the HTTP upgrade request. Browser clients
+may complete the `auth_required` / `auth` text-control exchange; credentials
+must never be placed in a query parameter. Browser requests with an `Origin`
+header must exactly match `websocket.allowed_origins`; a request without an
+Origin is treated as a non-browser client and still goes through normal
+authentication. Discovery's read-only `/lookup` endpoint applies the same
+allowed-origin list.
+
+### Binary data frame
+
+Every delivered message is one complete binary WebSocket frame. The first 24
+bytes are big-endian metadata, followed by the raw message body:
+
+| Offset | Size | Field |
+| --- | ---: | --- |
+| `0..4` | 4 | ASCII magic `RQW1` |
+| `4..6` | 2 | Header length, fixed at `24` |
+| `6..8` | 2 | Delivery attempts |
+| `8..16` | 8 | Broker timestamp, signed `i64` nanoseconds |
+| `16..24` | 8 | Broker-scoped message ID, unsigned `u64` |
+| `24..` | — | Original message body |
+
+Text frames are control messages. Clients should handle `auth_required`,
+`ready`, and stable error codes and ignore unknown fields for forward
+compatibility. There is no WebSocket ACK: a message is considered delivered by
+RustQueue only after the complete frame is written, which does not mean the
+client has processed it.
+
+The HTTP `101 Switching Protocols` response establishes only the transport. A
+live subscription begins at the server's `{"type":"ready",...}` control
+frame. No message capture is promised before `ready`, including while the
+server is waiting for the `auth` control frame; clients must not interpret the
+upgrade or `auth_required` frame as the start boundary.
+
+### Stable v1 error codes
+
+Handshake failures reuse the HTTP `ApiError` shape: the stable code is in the
+JSON `message` field and the human-readable explanation is in `detail`. After
+upgrade, terminal errors are sent as a text control such as
+`{"type":"error","code":"E_TOPIC_CLOSED","detail":"..."}` and then the
+connection is closed. Clients should reconnect or repeat `/lookup` according
+to the code:
+
+| Code | Meaning |
+| --- | --- |
+| `E_WS_QUERY_FORBIDDEN` | Query parameters are not accepted; use the path and headers only. |
+| `E_WS_ORIGIN` | The browser `Origin` is not an exact configured allowlist entry. |
+| `E_WS_SUBPROTOCOL` | The upgrade must include `rustqueue.live.v1`. |
+| `E_BAD_TOPIC` | The Topic does not exist on this Broker. |
+| `E_WS_TTL_REQUIRED` | The existing Topic is not `TTL_DISCARD` or changed away from it. |
+| `E_WS_CAPACITY` | Connection, per-Topic, Channel or frame-memory capacity is exhausted; back off. |
+| `E_WS_CONTROL` | An unsupported client text/binary data frame was received. |
+| `E_WS_HEARTBEAT` | The peer missed the heartbeat liveness window; reconnect. |
+| `E_AUTH_TIMEOUT` | The required `auth` control was not received before the AUTH deadline. |
+| `E_BAD_AUTH` | The AUTH control was non-text, malformed, or missing a valid `auth`/`secret` payload. |
+| `E_AUTH_OVERLOADED` | The AUTH service or its capacity gate is exhausted; retry later. |
+| `E_AUTH_FAILED` | The authentication service or credential validation failed. |
+| `E_UNAUTHORIZED` | AUTH succeeded but does not permit this Topic subscription. |
+| `E_TOPIC_CLOSED` | The Topic was deleted, tombstoned, or otherwise closed. |
+| `E_OWNER_CHANGED` | The Topic owner/fence changed; repeat Discovery `/lookup`. |
+| `E_DRAINING` | The Broker is draining and will not keep the live subscription. |
+| `E_SHUTDOWN` | The Broker is shutting down; reconnect after a healthy owner is discovered. |
+
+The stream deliberately has no reliable backlog. At most one message is
+reserved per connection. A failed or timed-out write cancels that reservation
+and closes the connection; RustQueue does not retry the frame over WebSocket.
+The write deadline is the smaller of the socket timeout and the message's
+remaining TTL. Paused Topics stop taking messages. Topic deletion, migration,
+owner shutdown, or a change to `RELIABLE` closes affected connections so the
+client can perform `/lookup` again.
+
+The node-wide frame budget and connection limits are bounded by this default
+runtime configuration:
+
+```toml
+[websocket]
+enabled = false
+max_connections = 1024
+max_connections_per_topic = 256
+frame_inflight_bytes = 134217728
+allowed_origins = []
+```
+
+The same fields can be overridden for a Broker with
+`RUSTQUEUE_WEBSOCKET_ENABLED`, `RUSTQUEUE_WEBSOCKET_MAX_CONNECTIONS`,
+`RUSTQUEUE_WEBSOCKET_MAX_CONNECTIONS_PER_TOPIC`,
+`RUSTQUEUE_WEBSOCKET_FRAME_INFLIGHT_BYTES`, and
+`RUSTQUEUE_WEBSOCKET_ALLOWED_ORIGINS` (a comma-separated list of exact HTTP
+origins). Wildcards and origins containing a path are rejected.
+
+Helm values, the RustQueue Operator spec, and the CRD expose the same settings
+through their Kubernetes naming conventions. Enabling the feature reuses the
+existing Broker HTTP Service and NetworkPolicy; it does not add a port or an
+Ingress. Monitor connection count, completed frame messages/bytes,
+authentication failures, capacity rejections, non-TTL rejections and slow
+consumer closes before increasing the limits.
 
 ## Local development
 
@@ -240,7 +354,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.9.0 \
+  --set queue.image=registry.example/rustqueue:0.10.0 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -254,7 +368,7 @@ scrub, upgrade or the NSQ-compatible admin API. Client TLS is optional and
 always supplied through an existing Kubernetes Secret; the operator does not
 run a CA.
 
-### Kodo compatibility in 0.9
+### Kodo compatibility
 
 Kodo compatibility is implemented entirely by RustQueue as a separate,
 default-off deployment profile. Kodo continues to use RustQueue Discovery:
@@ -477,7 +591,7 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.9.0 CI/CD workflow publishes a Release only after the non-Kubernetes
+The v0.10.0 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one
@@ -534,6 +648,8 @@ Native broker endpoints:
 - `GET /v1/registry`
 - `GET /v1/registry/head`
 - `GET /v1/capabilities`
+- `GET /v1/ws/topics/{topic}` (WebSocket, only when enabled and only for
+  `TTL_DISCARD` Topics; negotiate `rustqueue.live.v1`)
 - `GET|POST /v1/drain`
 - `GET /v1/stats`
 - `GET /v1/observe` (console token, no message bodies)
@@ -580,7 +696,7 @@ writes. Keep both relaxed profiles separate from durable-PUB results.
 
 ## Storage and upgrades
 
-RustQueue 0.9 keeps disk format v7. Format v7 is a clean break: a v6 or older
+RustQueue 0.10 keeps disk format v7. Format v7 is a clean break: a v6 or older
 directory is refused and there is no in-place migration. Within v7, record tags
 and existing fields are append-only.
 Every binary declares its reader/writer feature range and protocol message/body
@@ -653,6 +769,7 @@ non-Kubernetes gate runs in GitHub Actions.
 
 ## Non-goals
 
-RustQueue 0.9 does not provide message replication, backups, exactly-once
+RustQueue 0.10 does not provide message replication, backups, exactly-once
 delivery, a global channel catalog, online data migration, cross-region
-replication, or Broker/PVC lifecycle controls in Console.
+replication, reliable WebSocket replay/resume/ACK semantics, or Broker/PVC
+lifecycle controls in Console.
