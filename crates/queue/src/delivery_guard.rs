@@ -1,4 +1,4 @@
-use crate::delivery_budget::DeliveryHold;
+use crate::delivery_budget::{DeliveryHold, DeliveryLease};
 use crate::model::ReservedDelivery;
 use crate::topic::TopicHandle;
 use std::sync::Arc;
@@ -39,12 +39,19 @@ impl DeliveryGuard {
     }
 
     pub fn accept_with_token(&mut self, id: u64) -> Option<u64> {
+        self.accept_with_lease(id).map(|(token, _lease)| token)
+    }
+
+    /// Transfers the consumer's metadata hold together with the delivery token.
+    /// Keep the lease until FIN/REQ completion, timeout, or disconnect cleanup.
+    pub fn accept_with_lease(&mut self, id: u64) -> Option<(u64, DeliveryLease)> {
         if let Some(index) = self
             .reservations
             .iter()
             .position(|reservation| reservation.id == id)
         {
-            return Some(self.reservations.swap_remove(index).token);
+            let reservation = self.reservations.swap_remove(index);
+            return Some((reservation.token, reservation.lease));
         }
         None
     }

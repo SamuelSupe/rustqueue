@@ -8,7 +8,7 @@ export function useSnapshot() {
   const request = useRef<AbortController | undefined>(undefined);
 
   const refresh = useCallback(async () => {
-    request.current?.abort();
+    if (request.current && !request.current.signal.aborted) return;
     const controller = new AbortController();
     request.current = controller;
     try {
@@ -20,11 +20,16 @@ export function useSnapshot() {
         const body = await response.json().catch(() => ({}));
         throw new Error(body.message || `HTTP ${response.status}`);
       }
-      setSnapshot((await response.json()) as Snapshot);
+      const next = (await response.json()) as Snapshot;
+      if (controller.signal.aborted) return;
+      setSnapshot(next);
       setError(undefined);
     } catch (reason) {
-      if ((reason as Error).name !== 'AbortError') setError((reason as Error).message);
+      if (!controller.signal.aborted && (reason as Error).name !== 'AbortError') {
+        setError((reason as Error).message);
+      }
     } finally {
+      if (request.current === controller) request.current = undefined;
       if (!controller.signal.aborted) setLoading(false);
     }
   }, []);

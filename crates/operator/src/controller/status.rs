@@ -148,11 +148,14 @@ impl<'a> StatusBuilder<'a> {
 }
 
 fn resume_resets_operation_clock(previous: &str, next: &str) -> bool {
-    matches!(previous, "Paused" | "AwaitingCanaryApproval" | "Blocked")
-        && !matches!(
-            next,
-            "Paused" | "AwaitingCanaryApproval" | "Blocked" | "Completed" | "Failed"
-        )
+    // Pod recovery can reopen a completed revision long after its rollout ended.
+    matches!(
+        previous,
+        "Paused" | "AwaitingCanaryApproval" | "Blocked" | "Completed"
+    ) && !matches!(
+        next,
+        "Paused" | "AwaitingCanaryApproval" | "Blocked" | "Completed" | "Failed"
+    )
 }
 
 pub(super) fn operation_id(kind: &str, target: &str, revision: &str) -> String {
@@ -310,46 +313,42 @@ mod tests {
     }
 
     #[test]
-    fn resuming_a_human_gate_restarts_the_operation_timeout_clock() {
-        let mut resource = cluster();
-        resource.status = Some(
-            StatusBuilder::new(&resource, 3, 3, 1)
-                .operation(OperationUpdate {
-                    id: "rollout-1",
-                    kind: "Rollout",
-                    phase: "Paused",
-                    target: "queue:v2",
-                    revision: "r2",
-                    message: "paused",
-                    previous_image: Some("queue:v1".into()),
-                    current_broker: None,
-                })
-                .build(),
-        );
-        resource
-            .status
-            .as_mut()
-            .unwrap()
-            .current_operation
-            .as_mut()
-            .unwrap()
-            .started_at = "2000-01-01T00:00:00Z".into();
+    fn resuming_an_inactive_operation_restarts_the_timeout_clock() {
+        let update = |phase| OperationUpdate {
+            id: "rollout-1",
+            kind: "Rollout",
+            phase,
+            target: "queue:v2",
+            revision: "r2",
+            message: "broker readiness changed",
+            previous_image: Some("queue:v1".into()),
+            current_broker: Some("queue-2".into()),
+        };
+        for phase in ["Paused", "AwaitingCanaryApproval", "Blocked", "Completed"] {
+            let mut resource = cluster();
+            let mut inactive = StatusBuilder::new(&resource, 3, 3, 1)
+                .operation(update(phase))
+                .build();
+            inactive.current_operation.as_mut().unwrap().started_at = "2000-01-01T00:00:00Z".into();
+            resource.status = Some(inactive);
 
-        let resumed = StatusBuilder::new(&resource, 3, 3, 1)
-            .operation(OperationUpdate {
-                id: "rollout-1",
-                kind: "Rollout",
-                phase: "Draining",
-                target: "queue:v2",
-                revision: "r2",
-                message: "running",
-                previous_image: Some("queue:v1".into()),
-                current_broker: Some("queue-2".into()),
-            })
-            .build()
-            .current_operation
-            .unwrap();
-        assert_ne!(resumed.started_at, "2000-01-01T00:00:00Z");
+            let mut resumed = StatusBuilder::new(&resource, 3, 2, 1)
+                .operation(update("WaitingForReady"))
+                .build();
+            let operation = resumed.current_operation.as_mut().unwrap();
+            assert_ne!(operation.started_at, "2000-01-01T00:00:00Z", "{phase}");
+            assert!(operation.completed_at.is_none(), "{phase}");
+            operation.started_at = "2001-01-01T00:00:00Z".into();
+            resource.status = Some(resumed);
+
+            let waiting = StatusBuilder::new(&resource, 3, 2, 1)
+                .operation(update("WaitingForReady"))
+                .build();
+            assert_eq!(
+                waiting.current_operation.unwrap().started_at,
+                "2001-01-01T00:00:00Z"
+            );
+        }
         assert!(!resume_resets_operation_clock("Draining", "Replacing"));
     }
 }

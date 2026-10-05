@@ -1,6 +1,6 @@
 use super::*;
 use crate::eviction::{self, ProtectiveEviction};
-use crate::model::{QueueAggregateStats, TopicStats};
+use crate::model::TopicStats;
 use rustqueue_storage::ScrubTarget;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -43,19 +43,31 @@ impl Topic {
         self.persist_channel(channel, ChannelCommand::Pause { paused })
     }
 
-    pub fn stats(&mut self) -> TopicStats {
+    pub fn stats(&self) -> Result<TopicStats, BrokerError> {
         let last = self.deliverable_position;
         let now_ms = now_ms();
-        let scheduled = self.messages.deferred_positions(now_ms);
         let (segment_count, segment_bytes) = self.log.storage_usage();
         let pending_sync = self.pending_sync();
-        let mut channels: Vec<_> = self
+        let channels: Vec<_> = self
             .channels
-            .values_mut()
-            .map(|channel| channel.state.stats(last, &scheduled, now_ms))
+            .values()
+            .map(|channel| &channel.state)
+            .collect();
+        let mut scheduled = vec![0u64; channels.len()];
+        self.messages
+            .for_each_deferred_range(now_ms, last, |first, last| {
+                for (channel, count) in channels.iter().zip(&mut scheduled) {
+                    *count =
+                        count.saturating_add(channel.scheduled_count_in_range(first, last, now_ms));
+                }
+            })?;
+        let mut channels: Vec<_> = channels
+            .into_iter()
+            .zip(scheduled)
+            .map(|(channel, count)| channel.stats(last, count, now_ms))
             .collect();
         channels.sort_by(|left, right| left.name.cmp(&right.name));
-        TopicStats {
+        Ok(TopicStats {
             name: self.name.clone(),
             paused: self.manifest.paused,
             delivery_mode: self.manifest.delivery_mode,
@@ -74,38 +86,7 @@ impl Topic {
                 pending.since.elapsed().as_millis().min(u64::MAX as u128) as u64
             }),
             channels,
-        }
-    }
-
-    pub fn add_aggregate_stats(&mut self, aggregate: &mut QueueAggregateStats) {
-        let last = self.deliverable_position;
-        let now_ms = now_ms();
-        let scheduled = self.messages.deferred_positions(now_ms);
-        let (segment_count, segment_bytes) = self.log.storage_usage();
-        aggregate.topic_count = aggregate.topic_count.saturating_add(1);
-        aggregate.message_count = aggregate.message_count.saturating_add(
-            self.messages
-                .count_after_position(self.manifest.expired_through_position),
-        );
-        aggregate.segment_count = aggregate.segment_count.saturating_add(segment_count);
-        aggregate.segment_bytes = aggregate.segment_bytes.saturating_add(segment_bytes);
-        if let Some(pending) = self.pending_sync() {
-            aggregate.unsynced_messages =
-                aggregate.unsynced_messages.saturating_add(pending.messages);
-            aggregate.unsynced_bytes = aggregate.unsynced_bytes.saturating_add(pending.bytes);
-            aggregate.sync_lag_ms = aggregate
-                .sync_lag_ms
-                .max(pending.since.elapsed().as_millis().min(u64::MAX as u128) as u64);
-        }
-        for channel in self.channels.values_mut() {
-            let (depth, in_flight, deferred, ack_gap) =
-                channel.state.metric_counts(last, &scheduled, now_ms);
-            aggregate.channel_count = aggregate.channel_count.saturating_add(1);
-            aggregate.channel_depth = aggregate.channel_depth.saturating_add(depth);
-            aggregate.channel_in_flight = aggregate.channel_in_flight.saturating_add(in_flight);
-            aggregate.channel_deferred = aggregate.channel_deferred.saturating_add(deferred);
-            aggregate.channel_ack_gap = aggregate.channel_ack_gap.saturating_add(ack_gap);
-        }
+        })
     }
 
     pub fn oldest_message_timestamp(&self) -> Option<i64> {
@@ -284,7 +265,6 @@ impl Topic {
         }
         store_atomic(&self.manifest_path, &manifest)?;
         self.manifest = manifest;
-        self.messages.discard_scheduled_through(through_position);
         Ok(())
     }
 

@@ -197,6 +197,16 @@ pub struct BrokerView {
     pub error: Option<String>,
 }
 
+impl BrokerView {
+    pub fn http_origin(&self, port: u16) -> String {
+        if self.pod_ip.contains(':') && !self.pod_ip.starts_with('[') {
+            format!("http://[{}]:{port}", self.pod_ip)
+        } else {
+            format!("http://{}:{port}", self.pod_ip)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct PvcView {
     pub name: String,

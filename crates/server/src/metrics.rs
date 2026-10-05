@@ -134,6 +134,8 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
          rustqueue_channel_ack_gap_total {channel_ack_gap}\n\
          # TYPE rustqueue_delivery_inflight_bytes gauge\n\
          rustqueue_delivery_inflight_bytes {}\n\
+         # TYPE rustqueue_delivery_inflight_messages gauge\n\
+         rustqueue_delivery_inflight_messages {}\n\
          # TYPE rustqueue_delivery_budget_waiters gauge\n\
          rustqueue_delivery_budget_waiters {}\n\
          # TYPE rustqueue_delivery_budget_waits_total counter\n\
@@ -154,6 +156,7 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
         stats.aggregate.unsynced_messages,
         stats.aggregate.unsynced_bytes,
         stats.delivery_budget.in_flight_bytes,
+        stats.delivery_budget.in_flight_messages,
         stats.delivery_budget.waiters,
         stats.delivery_budget.waits_total,
     );

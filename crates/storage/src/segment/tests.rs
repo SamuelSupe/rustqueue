@@ -53,22 +53,33 @@ fn multipart_append_preserves_the_record_wire_format() {
 #[test]
 fn sealed_segments_recover_from_the_sidecar_index() {
     let directory = tempdir().unwrap();
-    let mut log = SegmentLog::open(directory.path(), 100).unwrap();
-    log.append(record(0, &[1; 20]), true).unwrap();
+    let mut log = SegmentLog::open(directory.path(), 128 * 1024).unwrap();
+    for _ in 0..1024 {
+        log.append(record(0, &[1; 20]), false).unwrap();
+    }
+    log.seal().unwrap();
     log.append(record(0, &[2; 20]), true).unwrap();
     let sealed = log.segment_paths().unwrap()[0].clone();
     log.persist_recovery_index(&sealed, b"queue-metadata".to_vec())
         .unwrap();
+    assert!(
+        log.resident_records.capacity() <= 4,
+        "sealed records retain capacity for {} locations with only {} active location(s)",
+        log.resident_records.capacity(),
+        log.resident_records.len(),
+    );
     drop(log);
 
-    let log = SegmentLog::open(directory.path(), 100).unwrap();
-    assert_eq!(log.recovery_report().indexed_records, 1);
+    let log = SegmentLog::open(directory.path(), 128 * 1024).unwrap();
+    assert_eq!(log.recovery_report().indexed_records, 1024);
     assert_eq!(log.recovery_report().scanned_records, 1);
     assert_eq!(
         log.load_recovery_metadata(&sealed).unwrap(),
         Some(b"queue-metadata".to_vec())
     );
     assert_eq!(log.read(1).unwrap().unwrap().payload, vec![1; 20]);
+    assert_eq!(log.read(1024).unwrap().unwrap().payload, vec![1; 20]);
+    assert_eq!(log.read(1025).unwrap().unwrap().payload, vec![2; 20]);
 }
 
 #[test]

@@ -139,7 +139,7 @@ pub async fn begin_topic(
     };
     ensure_topic_children_idle(state, &request.topic).await?;
     resource.spec.owners = challenge.owners.clone();
-    if request.action == "configure" {
+    if matches!(request.action.as_str(), "create" | "configure") {
         resource.spec.delivery_mode = request_topic_mode(request)?;
         resource.spec.message_ttl_seconds = request.message_ttl_seconds;
     }

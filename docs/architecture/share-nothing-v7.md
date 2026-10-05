@@ -357,7 +357,6 @@ discard is a separate, audited administrative action.
       channels/
         <encoded-channel>.checkpoint
         <encoded-channel>.wal
-      delayed.index
   dlq-outbox/
   audit/
 ```
@@ -372,15 +371,26 @@ discard is a separate, audited administrative action.
 - The payload is stored once per broker regardless of channel count.
 - Tail short writes are truncated during recovery.
 - Each sealed segment has an atomic CRC-protected recovery index containing
-  record locations and fixed-size, per-entry-CRC queue metadata. Startup reads
-  only the fixed header and first/last entries; pages are loaded on demand into
-  a Broker-wide byte-bounded cache, while background scrub validates the full
+  record locations and fixed-size, per-entry-CRC queue metadata. Storage locations
+  recover from the fixed header; queue metadata is validated in bounded pages at
+  startup to recover ranges and per-segment delivery-deadline bounds. Delivery
+  pages are loaded on demand into a Broker-wide byte-bounded cache, while
+  background scrub validates the full
   sidecar checksum. A missing or bad index safely falls back to a full scan and
   is rebuilt.
 - There is no backlog message-count limit. Sealed segments retain one summary
   in memory, so cold metadata residency scales with segment count rather than
   message count; disk high-watermark and minimum-free-space policy controls
-  publish rejection.
+  publish rejection. Sealing also releases unused message-metadata and record-
+  location buffer capacity before returning its Broker-wide cache budget;
+  spilled Topics cannot retain buffers from their former active tails.
+- DPUB deadlines stay in queue metadata. Sealed segments retain only minimum and
+  maximum deadlines, rather than one in-memory position per delayed message.
+  Statistics count fully deferred segments by range and stream bounded pages for
+  mixed deadlines, excluding ACKs, in-flight deliveries, and duplicate requeue
+  bookkeeping. Metadata read failures propagate from the Rust statistics APIs
+  as `Result` errors, fail HTTP statistics/metrics, and isolate storage; they
+  never produce a successful partial snapshot.
 - The active tail is always fully scanned. Cold indexed payload corruption is
   detected and isolated on payload read or by background scrub. Automatic scrub
   and normal GC wait for the configured startup quiet period (30 seconds by
@@ -398,6 +408,15 @@ discard is a separate, audited administrative action.
 - Each local channel stores barrier/cursor, ACK floor, bounded sparse ACK,
   requeue targets, attempts that reached a durable `REQ`, paused state, and
   retention cursor.
+- Scanning future DPUB messages retains one rewind position and the earliest
+  wakeup time per Channel. When that deadline passes, delivery revisits shared
+  Topic metadata from the rewind position; no per-message DPUB scan entries
+  are added to the Channel checkpoint. This scan cursor is transient and
+  recovery rescans from the ACK floor. Explicit REQ targets and attempts keep
+  their existing WAL and checkpoint semantics.
+  Recovery removes legacy scan deadlines that match shared metadata and have
+  no delivery attempt, reading at most one metadata page at a time per Channel.
+  Recorded position fences are captured before absent state is discarded.
 - State mutations append to a per-channel WAL.
 - Concurrent FIN/REQ mutations for one topic are combined into groups of at
   most 64 requests or 1 ms. Each touched durable channel is fsynced once before

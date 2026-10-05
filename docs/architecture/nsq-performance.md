@@ -24,6 +24,26 @@ serialized, and reservation stops at a durable position that advances only
 after the sync succeeds. Existing durable messages can therefore continue to
 flow while the next group waits for its acknowledged-durability boundary.
 
+Delivery admission has a second, node-wide bound for in-flight message count.
+`limits.node_delivery_inflight_messages` defaults to 262,144 and is passed to
+`BrokerConfig.delivery_inflight_messages`; set
+`RUSTQUEUE_NODE_DELIVERY_INFLIGHT_MESSAGES` to override it. This slot budget is
+separate from the 512 MiB node-wide payload working-set budget: it covers the
+queue reservation and consumer-session metadata for unacknowledged messages,
+and a slot returns only after both holders release it. Empty messages consume a
+slot as well. When the count reaches its limit, later reservations pause, so
+throughput under saturation depends on the configured capacity and how long
+consumers retain their deliveries. FIN/REQ
+completion, timeout, cancellation or disconnect cleanup, and TTL cleanup
+release slots according to that lifecycle. The slot count is visible in
+`delivery_budget.in_flight_messages` and as the Prometheus gauge
+`rustqueue_delivery_inflight_messages`.
+
+TCP command processing and response writes have a bounded progress timeout.
+After a command completes, the peer receives a fresh heartbeat idle window;
+time spent waiting on Broker work or response I/O does not consume that window.
+Idle peers and blocked writes still time out.
+
 ## Material differences from NSQ
 
 | Area | NSQ v1.3.0 | RustQueue | Performance consequence |
@@ -62,6 +82,42 @@ Both use the first reached `RELAXED_SYNC_MESSAGES` (default 2500),
 Track `rustqueue_publish_unsynced_messages`,
 `rustqueue_publish_unsynced_bytes`, and
 `rustqueue_publish_sync_lag_seconds` alongside throughput and ACK latency.
+
+## Release qualification
+
+Release comparisons use `scripts/benchmark-qualify.sh`. OrbStack remains the
+default environment. When shared host paging prevents calibration, the
+`performance-qualification` GitHub workflow uses a fresh Linux ARM64 runner and
+records that environment separately. It first runs two interleaved pairs of
+the exact same Broker image in all three profiles, with 30 seconds of warmup
+and 120 seconds of measurement. Each profile must stay within 5 percent
+throughput spread and 10 percent PUB-ACK p99 spread before the ten-pair
+baseline/candidate comparison runs. Broker and load generator each receive
+two CPUs and 2 GiB with swap disabled. Delivery integrity and complete-drain
+checks remain required; calibration failure stops comparison.
+The Linux runner fixes the Broker to CPUs 0-1 and the load generator to CPUs 2-3,
+so they do not compete for the same cores. Their CPU quotas and effective CPU
+sets are recorded; OrbStack keeps its default CPU placement. Both A/A and A/B
+use the same placement without changing the profiles or acceptance thresholds.
+The workflow allows six hours for calibration, all ten comparison pairs and
+complete consumer drains.
+
+The workflow runs when its definition or the qualification script changes in
+a PR, and can also be dispatched with an explicit published baseline tag.
+Its artifacts contain raw measurements, source commits, binary hashes,
+environment details, calibration and the existing regression verdict.
+On the Linux runner, RSS is read from the Broker's host PID instead of spawning
+`docker exec` inside its CPU-limited cgroup every second. Before/after cgroup CPU,
+I/O and memory-event counters, host VM counters, CPU utilization counters,
+block-device counters, load averages and PSI are saved with each trial.
+The named data volume's filesystem, device and free capacity are recorded;
+RAM-backed data filesystems are rejected. The load generator's cgroup
+CPU usage and throttling counters are sampled every second from the host.
+Unavailable pressure counters are recorded explicitly.
+These distinguish generator CPU limits from Broker limits and host contention;
+they do not change the measurement windows or acceptance thresholds.
+Comparisons apply only to the recorded host and architecture. A hosted runner
+is not assumed suitable until its same-binary calibration passes.
 
 ## Next candidates to measure before changing semantics
 

@@ -113,6 +113,7 @@ pub struct BrokerConfig {
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
     pub delivery_inflight_bytes: usize,
+    pub delivery_inflight_messages: usize,
     pub scrub_bytes_per_second: u64,
     pub storage_feature_level: u32,
     pub require_management_fence_sync: bool,
@@ -140,6 +141,7 @@ impl Default for BrokerConfig {
             payload_read_workers: 0,
             payload_read_queue: 4096,
             delivery_inflight_bytes: 512 * 1024 * 1024,
+            delivery_inflight_messages: 262_144,
             scrub_bytes_per_second: 64 * 1024 * 1024,
             storage_feature_level: BASE_STORAGE_FEATURE_LEVEL,
             require_management_fence_sync: false,
@@ -273,6 +275,13 @@ impl Broker {
             ));
         }
         let now = Instant::now();
+        if config.delivery_inflight_messages == 0
+            || config.delivery_inflight_messages > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(BrokerError::InvalidRecord(
+                "delivery message budget must be positive and fit the runtime semaphore".into(),
+            ));
+        }
         if now.checked_add(config.message_timeout).is_none()
             || now.checked_add(config.publish_worker_idle).is_none()
             || now.checked_add(config.relaxed_sync_interval).is_none()
@@ -393,7 +402,10 @@ impl Broker {
             config.max_publish_workers,
             config.publish_worker_idle,
         );
-        let delivery_budget = DeliveryBudget::new(config.delivery_inflight_bytes);
+        let delivery_budget = DeliveryBudget::new(
+            config.delivery_inflight_bytes,
+            config.delivery_inflight_messages,
+        );
         let broker = Self {
             inner: Arc::new(BrokerInner {
                 config,

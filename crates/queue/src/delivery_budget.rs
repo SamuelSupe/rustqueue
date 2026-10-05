@@ -5,6 +5,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const PAYLOAD_READ_WORKING_SET_FACTOR: usize = 2;
 
+/// Keeps one node-wide metadata slot occupied until both the queue reservation
+/// and any consumer-side bookkeeping have been released.
+#[derive(Clone, Debug)]
+pub struct DeliveryLease {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
 pub struct DeliveryHold {
     _permit: Option<OwnedSemaphorePermit>,
     bytes: u64,
@@ -14,16 +21,20 @@ pub struct DeliveryHold {
 pub(crate) struct DeliveryBudget {
     capacity: usize,
     permits: Arc<Semaphore>,
+    message_capacity: usize,
+    messages: Arc<Semaphore>,
     in_flight: Arc<AtomicU64>,
     waiters: Arc<AtomicUsize>,
     waits_total: AtomicU64,
 }
 
 impl DeliveryBudget {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize, message_capacity: usize) -> Self {
         Self {
             capacity,
             permits: Arc::new(Semaphore::new(capacity)),
+            message_capacity,
+            messages: Arc::new(Semaphore::new(message_capacity)),
             in_flight: Arc::new(AtomicU64::new(0)),
             waiters: Arc::new(AtomicUsize::new(0)),
             waits_total: AtomicU64::new(0),
@@ -32,6 +43,15 @@ impl DeliveryBudget {
 
     pub(crate) fn max_payload_bytes(&self) -> usize {
         self.capacity / PAYLOAD_READ_WORKING_SET_FACTOR
+    }
+
+    pub(crate) fn try_reserve_message(&self) -> Option<DeliveryLease> {
+        Arc::clone(&self.messages)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| DeliveryLease {
+                _permit: Arc::new(permit),
+            })
     }
 
     pub(crate) async fn acquire(&self, payload_bytes: usize) -> Result<DeliveryHold, BrokerError> {
@@ -82,6 +102,10 @@ impl DeliveryBudget {
     pub(crate) fn snapshot(&self) -> crate::model::DeliveryBudgetStats {
         crate::model::DeliveryBudgetStats {
             in_flight_bytes: self.in_flight.load(Ordering::Acquire),
+            in_flight_messages: self
+                .message_capacity
+                .saturating_sub(self.messages.available_permits())
+                as u64,
             waiters: self.waiters.load(Ordering::Acquire) as u64,
             waits_total: self.waits_total.load(Ordering::Relaxed),
         }
@@ -115,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_request_fails_instead_of_waiting_forever() {
-        let budget = DeliveryBudget::new(8);
+        let budget = DeliveryBudget::new(8, 1);
         let error = match budget.acquire(5).await {
             Ok(_) => panic!("oversized delivery request was accepted"),
             Err(error) => error,

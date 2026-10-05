@@ -2,32 +2,42 @@ use super::*;
 use crate::model::{BrokerStats, QueueAggregateStats, TopicStats};
 
 impl Broker {
-    pub fn stats(&self) -> BrokerStats {
+    /// Returns an exact snapshot, or a storage error if deferred metadata cannot
+    /// be read. Integrity errors also isolate the Broker through storage health.
+    pub fn stats(&self) -> Result<BrokerStats, BrokerError> {
         self.filtered_stats(None, None)
     }
 
-    pub fn filtered_stats(&self, topic: Option<&str>, channel: Option<&str>) -> BrokerStats {
-        let mut topics = self.topic_stats(topic);
+    pub fn filtered_stats(
+        &self,
+        topic: Option<&str>,
+        channel: Option<&str>,
+    ) -> Result<BrokerStats, BrokerError> {
+        let mut topics = self.observe_storage_result(self.topic_stats(topic))?;
         if let Some(channel) = channel {
             for topic in &mut topics {
                 topic.channels.retain(|candidate| candidate.name == channel);
             }
         }
         topics.sort_by(|left, right| left.name.cmp(&right.name));
-        self.snapshot(topics)
+        Ok(self.snapshot(topics))
     }
 
-    pub fn metrics_stats(&self, detailed: bool, max_series: usize) -> BrokerStats {
+    pub fn metrics_stats(
+        &self,
+        detailed: bool,
+        max_series: usize,
+    ) -> Result<BrokerStats, BrokerError> {
         let handles: Vec<_> = self.inner.topics.read().values().cloned().collect();
         let mut aggregate = QueueAggregateStats::default();
         let mut topics = Vec::new();
         let mut remaining = max_series;
         for handle in handles {
             let _commit_gate = handle.commit_gate.lock();
-            let mut topic = handle.state.lock();
-            topic.add_aggregate_stats(&mut aggregate);
+            let topic = handle.state.lock();
+            let mut stats = self.observe_storage_result(topic.stats())?;
+            aggregate.add_topic(&stats);
             if detailed && remaining >= 6 {
-                let mut stats = topic.stats();
                 remaining = remaining.saturating_sub(6);
                 let channel_limit = remaining / 4;
                 stats.channels.truncate(channel_limit);
@@ -36,13 +46,13 @@ impl Broker {
             }
         }
         topics.sort_by(|left, right| left.name.cmp(&right.name));
-        BrokerStats {
+        Ok(BrokerStats {
             aggregate,
             ..self.snapshot(topics)
-        }
+        })
     }
 
-    fn topic_stats(&self, topic: Option<&str>) -> Vec<TopicStats> {
+    fn topic_stats(&self, topic: Option<&str>) -> Result<Vec<TopicStats>, BrokerError> {
         let handles: Vec<_> = match topic {
             Some(name) => self
                 .inner
@@ -101,7 +111,9 @@ mod tests {
         broker.create_channel("events", "audit").await.unwrap();
         broker.create_channel("other", "workers").await.unwrap();
 
-        let stats = broker.filtered_stats(Some("events"), Some("workers"));
+        let stats = broker
+            .filtered_stats(Some("events"), Some("workers"))
+            .unwrap();
         assert_eq!(stats.aggregate.topic_count, 1);
         assert_eq!(stats.aggregate.channel_count, 1);
         assert_eq!(stats.topics.len(), 1);
@@ -111,6 +123,7 @@ mod tests {
 
         assert!(broker
             .filtered_stats(Some("missing"), None)
+            .unwrap()
             .topics
             .is_empty());
     }
@@ -125,7 +138,7 @@ mod tests {
         .unwrap();
         broker.get_or_create_topic("events").unwrap();
 
-        assert!(broker.metrics_stats(true, 5).topics.is_empty());
-        assert_eq!(broker.metrics_stats(true, 6).topics.len(), 1);
+        assert!(broker.metrics_stats(true, 5).unwrap().topics.is_empty());
+        assert_eq!(broker.metrics_stats(true, 6).unwrap().topics.len(), 1);
     }
 }

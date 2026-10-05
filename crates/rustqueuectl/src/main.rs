@@ -62,6 +62,7 @@ enum RolloutAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     let client = Client::try_default().await?;
     let clusters = Api::<RustQueue>::namespaced(client.clone(), &cli.namespace);

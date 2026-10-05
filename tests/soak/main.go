@@ -39,7 +39,7 @@ type report struct {
 
 func main() {
 	lookup := flag.String("lookup", "host.docker.internal:4151", "lookupd-compatible HTTP address")
-	tcp := flag.String("tcp", "host.docker.internal:4150,host.docker.internal:5150,host.docker.internal:6150", "comma-separated NSQ TCP addresses")
+	tcp := flag.String("tcp", "host.docker.internal:4150,host.docker.internal:5150,host.docker.internal:6150", "comma-separated direct Broker TCP addresses")
 	duration := flag.Duration("duration", 24*time.Hour, "publish duration")
 	grace := flag.Duration("grace", 2*time.Minute, "final drain timeout")
 	rate := flag.Int("rate", 1000, "target messages per second; zero means saturated")
@@ -81,6 +81,9 @@ func main() {
 		return nil
 	}))
 	check(consumer.ConnectToNSQLookupd(*lookup))
+	for _, address := range strings.Split(*tcp, ",") {
+		check(consumer.ConnectToNSQD(strings.TrimSpace(address)))
+	}
 	waitConsumer(consumer, *lookup, topic, channel)
 	if *readyFile != "" {
 		check(os.WriteFile(*readyFile, []byte(topic), 0o600))

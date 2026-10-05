@@ -176,7 +176,7 @@ mod tests {
         .await
         .unwrap());
 
-        let stats = broker.stats();
+        let stats = broker.stats().unwrap();
         let source = stats
             .topics
             .iter()

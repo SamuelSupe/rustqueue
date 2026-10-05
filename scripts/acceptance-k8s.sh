@@ -320,6 +320,36 @@ run_console_management_acceptance() {
   run_curl console-publish-after-recreate -fsS -X POST --data-binary recreated \
     "http://$QUEUE-proxy:4151/pub?topic=$topic" >/dev/null
 
+  local mode ttl_seconds owner
+  for mode in TTL_DISCARD RELIABLE; do
+    ttl_seconds=""
+    [[ "$mode" != TTL_DISCARD ]] || ttl_seconds=30
+    preview=$(console_preview "$base" "$origin" "$cookie" "$csrf" topic delete "$topic" "")
+    token=$(jq -er '.action_token' <<<"$preview")
+    curl -fsS -b "$cookie" -H "Origin: $origin" -H 'Content-Type: application/json' \
+      -H "X-RustQueue-CSRF: $csrf" \
+      --data "$(console_apply_body topic delete "$topic" "" "$token" "$topic")" \
+      "$base/api/v1/management/apply" >/dev/null
+    wait_managed_resource rustqueuetopics "$topic" "" TOMBSTONED
+    wait_console_topic "$base" "$topic" TOMBSTONED
+
+    preview=$(console_preview "$base" "$origin" "$cookie" "$csrf" topic create "$topic" "" "$mode" "$ttl_seconds")
+    token=$(jq -er '.action_token' <<<"$preview")
+    owner=$(jq -er '.impact.owners[0]' <<<"$preview")
+    curl -fsS -b "$cookie" -H "Origin: $origin" -H 'Content-Type: application/json' \
+      -H "X-RustQueue-CSRF: $csrf" \
+      --data "$(console_apply_body topic create "$topic" "" "$token" "" "$mode" "$ttl_seconds")" \
+      "$base/api/v1/management/apply" >/dev/null
+    wait_managed_resource rustqueuetopics "$topic" "" ACTIVE
+    wait_console_topic "$base" "$topic" ACTIVE
+    kubectl -n "$NAMESPACE" exec "$owner" -c broker -- \
+      curl -fsS "http://127.0.0.1:4151/v1/stats?topic=$topic" | \
+      jq -e --arg topic "$topic" --arg mode "$mode" --arg ttl "$ttl_seconds" \
+        'any(.topics[]; .name == $topic and .delivery_mode == $mode
+          and .message_ttl_seconds == (if $ttl == "" then null else ($ttl | tonumber) end))' \
+        >/dev/null
+  done
+
   # Simulate a Console crash after persisting the operation but before calling a broker.
   local operation_now resource
   operation_now=$(date +%s000)
@@ -374,18 +404,24 @@ run_console_management_acceptance() {
 
 console_preview() {
   local base=$1 origin=$2 cookie=$3 csrf=$4 kind=$5 action=$6 topic=$7 channel=$8
+  local mode=${9:-} ttl=${10:-}
   curl -fsS -b "$cookie" -H "Origin: $origin" -H 'Content-Type: application/json' \
     -H "X-RustQueue-CSRF: $csrf" \
     --data "$(jq -cn --arg kind "$kind" --arg action "$action" --arg topic "$topic" \
-      --arg channel "$channel" '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end)}')" \
+      --arg channel "$channel" --arg mode "$mode" --arg ttl "$ttl" \
+      '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end)}
+       + (if $mode == "" then {} else {delivery_mode:$mode,message_ttl_seconds:(if $ttl == "" then null else ($ttl | tonumber) end)} end)')" \
     "$base/api/v1/management/preview"
 }
 
 console_apply_body() {
   local kind=$1 action=$2 topic=$3 channel=$4 token=$5 confirmation=$6
+  local mode=${7:-} ttl=${8:-}
   jq -cn --arg kind "$kind" --arg action "$action" --arg topic "$topic" \
     --arg channel "$channel" --arg token "$token" --arg confirmation "$confirmation" \
-    '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end),action_token:$token,confirmation:$confirmation}'
+    --arg mode "$mode" --arg ttl "$ttl" \
+    '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end),action_token:$token,confirmation:$confirmation}
+     + (if $mode == "" then {} else {delivery_mode:$mode,message_ttl_seconds:(if $ttl == "" then null else ($ttl | tonumber) end)} end)'
 }
 
 require kubectl
@@ -422,6 +458,7 @@ kubectl wait --for=condition=Established crd/rustqueues.rustqueue.io --timeout=6
 kubectl wait --for=condition=Established crd/rustqueuetopics.rustqueue.io --timeout=60s
 kubectl wait --for=condition=Established crd/rustqueuechannels.rustqueue.io --timeout=60s
 helm upgrade --install "$RELEASE" "$CHART" \
+  --skip-crds \
   --namespace "$NAMESPACE" \
   --set-string operator.image.repository="${OPERATOR_IMAGE%:*}" \
   --set-string operator.image.tag="${OPERATOR_IMAGE##*:}" \
@@ -446,8 +483,10 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/"$QUEUE-0" --timeout=180s
 PVC_BEFORE=$(kubectl -n "$NAMESPACE" get pvc -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}')
 [[ -n "$PVC_BEFORE" ]] || { echo "operator did not create the broker PVC" >&2; exit 1; }
 
-run_curl discovery-health -fsS "http://$QUEUE-discovery:4161/v1/health"
-run_curl proxy-health -fsS "http://$QUEUE-proxy:4151/v1/health"
+run_curl discovery-health -fsS --max-time 5 --retry 30 --retry-delay 1 \
+  --retry-max-time 60 --retry-connrefused "http://$QUEUE-discovery:4161/v1/health"
+run_curl proxy-health -fsS --max-time 5 --retry 30 --retry-delay 1 \
+  --retry-max-time 60 --retry-connrefused "http://$QUEUE-proxy:4151/v1/health"
 CONSOLE_SNAPSHOT=$(kubectl -n "$NAMESPACE" exec "$QUEUE-0" -c broker -- \
   curl -fsS "http://$QUEUE-console:4180/api/v1/snapshot")
 [[ "$(jq -r '.complete' <<<"$CONSOLE_SNAPSHOT")" == "true" ]] || {
@@ -546,6 +585,7 @@ kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
 wait_queue_ready 300
 kubectl -n "$NAMESPACE" rollout status deployment/"$QUEUE-discovery" --timeout=180s
 kubectl -n "$NAMESPACE" rollout status daemonset/"$QUEUE-proxy" --timeout=180s
-run_curl proxy-health-after-recovery -fsS "http://$QUEUE-proxy:4151/v1/health"
+run_curl proxy-health-after-recovery -fsS --max-time 5 --retry 30 --retry-delay 1 \
+  --retry-max-time 60 --retry-connrefused "http://$QUEUE-proxy:4151/v1/health"
 
 echo "OrbStack Kubernetes share-nothing v7 acceptance passed"

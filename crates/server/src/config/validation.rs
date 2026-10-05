@@ -97,6 +97,11 @@ impl Config {
     }
 
     pub(super) fn validate_runtime_limits(&self) -> anyhow::Result<()> {
+        if self.limits.node_delivery_inflight_messages == 0
+            || self.limits.node_delivery_inflight_messages > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            bail!("limits.node_delivery_inflight_messages must be positive and fit the runtime semaphore");
+        }
         if self.limits.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             bail!("limits.max_connections exceeds the runtime semaphore capacity");
         }

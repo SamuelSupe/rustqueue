@@ -83,6 +83,8 @@ impl DeliveryBatch {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DeliveryBudgetStats {
     pub in_flight_bytes: u64,
+    #[serde(default)]
+    pub in_flight_messages: u64,
     pub waiters: u64,
     pub waits_total: u64,
 }
@@ -244,5 +246,6 @@ pub(crate) struct ReservedDelivery {
     pub timestamp_ns: i64,
     pub attempts: u16,
     pub token: u64,
+    pub lease: crate::delivery_budget::DeliveryLease,
     pub payload: PayloadRef,
 }

@@ -89,7 +89,7 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(broker.stats().topics[0].channels.is_empty());
+        assert!(broker.stats().unwrap().topics[0].channels.is_empty());
 
         let missing = delete_idle_channel_compat(
             State(state),

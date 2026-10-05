@@ -46,9 +46,13 @@ pub(super) async fn stats(
     if let Err(error) = state.broker.expire_in_flight().await {
         return ApiError::from(error).into_response();
     }
-    let filtered = state
+    let filtered = match state
         .broker
-        .filtered_stats(query.topic.as_deref(), query.channel.as_deref());
+        .filtered_stats(query.topic.as_deref(), query.channel.as_deref())
+    {
+        Ok(stats) => stats,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     let include_clients = query.include_clients.unwrap_or(true);
     if query.format.as_deref() == Some("json") {
         let topics = filtered

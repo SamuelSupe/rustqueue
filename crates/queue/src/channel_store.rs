@@ -524,7 +524,7 @@ mod tests {
             .path()
             .join(format!("{}.checkpoint", hex::encode("workers")));
         let (state, _) = ChannelStore::open(&checkpoint, 65_536).unwrap();
-        let stats = state.stats(1, &Default::default(), i64::MAX);
+        let stats = state.stats(1, 0, i64::MAX);
         assert_eq!(stats.requeue_count, 1);
         assert_eq!(stats.timeout_count, 2);
     }
@@ -558,7 +558,7 @@ mod tests {
             .path()
             .join(format!("{}.checkpoint", hex::encode("workers")));
         let (mut recovered, _) = ChannelStore::open(&checkpoint, 65_536).unwrap();
-        let stats = recovered.stats(1, &Default::default(), 0);
+        let stats = recovered.stats(1, 0, 0);
         assert_eq!(stats.requeue_count, 1);
         assert_eq!(stats.timeout_count, 2);
         assert!(matches!(

@@ -1,0 +1,59 @@
+name: performance-qualification
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/performance-qualification.yml
+      - scripts/benchmark-qualify.sh
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Published baseline version tag
+        required: true
+        default: v0.10.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    env:
+      QUALIFICATION_ENVIRONMENT: github_actions
+      WARMUP_SECONDS: 30
+      MEASUREMENT_SECONDS: 120
+      DRAIN_TIMEOUT_SECONDS: 1800
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+      - name: Resolve exact candidate and release version
+        run: |
+          echo "CANDIDATE_REF=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          version=$(awk '/^\[workspace.package\]$/ {p=1;next} /^\[/ {p=0} p && $1=="version" {gsub(/"/,"",$3);print $3;exit}' Cargo.toml)
+          echo "RELEASE=$version" >> "$GITHUB_ENV"
+      - name: Same-binary calibration before comparison
+        env:
+          PAIRS: 2
+          CALIBRATION_ONLY: 1
+          EVIDENCE_OUTPUT: ${{ github.workspace }}/benchmarks/results/aa-calibration.json
+        run: BASELINE_REF="$CANDIDATE_REF" ./scripts/benchmark-qualify.sh
+      - name: Compare published baseline and candidate
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref || 'v0.10.0' }}
+          PAIRS: 10
+          EVIDENCE_OUTPUT: ${{ github.workspace }}/benchmarks/results/ab-qualification.json
+        run: ./scripts/benchmark-qualify.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-qualification-${{ github.run_id }}
+          path: benchmarks/results/**
+          if-no-files-found: error
+          retention-days: 7

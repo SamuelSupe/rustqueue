@@ -70,10 +70,10 @@ impl PublishGroups {
         topic: &str,
     ) -> Result<mpsc::Sender<PublishRequest>, BrokerError> {
         let mut senders = self.senders.lock();
-        senders.retain(|_, entry| !entry.sender.is_closed());
-        if let Some(entry) = senders.get(topic) {
+        if let Some(entry) = senders.get(topic).filter(|entry| !entry.sender.is_closed()) {
             return Ok(entry.sender.clone());
         }
+        senders.retain(|_, entry| !entry.sender.is_closed());
         if senders.len() >= self.max_workers {
             self.rejected_workers.fetch_add(1, Ordering::Relaxed);
             return Err(BrokerError::PublishWorkerLimit);

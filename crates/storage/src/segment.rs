@@ -524,6 +524,7 @@ impl SegmentLog {
         self.sealed_indexes.insert(path.to_path_buf(), summary);
         self.resident_records
             .retain(|location| location.segment.as_ref() != path);
+        self.resident_records.shrink_to_fit();
         Ok(())
     }
 

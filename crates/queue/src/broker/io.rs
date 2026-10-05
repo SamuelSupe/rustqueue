@@ -550,7 +550,7 @@ mod tests {
             publisher.join().unwrap(),
             Err(BrokerError::TopicTombstoned)
         ));
-        assert_eq!(broker.stats().topics[0].message_count, 0);
+        assert_eq!(broker.stats().unwrap().topics[0].message_count, 0);
     }
 
     #[tokio::test]
@@ -575,11 +575,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(broker.stats().topics[0].unsynced_messages, 1);
+        assert_eq!(broker.stats().unwrap().topics[0].unsynced_messages, 1);
         broker
             .publish_durable_body_sync("events", &[Bytes::from_static(b"durable")], Duration::ZERO)
             .unwrap();
-        let stats = broker.stats();
+        let stats = broker.stats().unwrap();
         assert_eq!(stats.topics[0].last_durable_position, 2);
         assert_eq!(stats.topics[0].unsynced_messages, 0);
     }

@@ -14,6 +14,8 @@ DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-1800}"
 CASES="${CASES:-raw_write sustainable low_load_latency}"
 QUALIFICATION_DEV="${QUALIFICATION_DEV:-0}"
 KEEP_IMAGES="${KEEP_IMAGES:-0}"
+CALIBRATION_ONLY="${CALIBRATION_ONLY:-0}"
+QUALIFICATION_ENVIRONMENT="${QUALIFICATION_ENVIRONMENT:-orbstack}"
 RESULT_ROOT="$ROOT/benchmarks/results"
 EVIDENCE_OUTPUT="${EVIDENCE_OUTPUT:-$ROOT/benchmarks/qualifications/v0.8.4-orbstack.json}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -34,8 +36,10 @@ BASELINE_IMAGE="rustqueue:qualify-baseline-$$"
 CANDIDATE_IMAGE="rustqueue:qualify-candidate-$$"
 TOOLS_IMAGE="rustqueue:qualify-tools-$$"
 ACTIVE_BROKER=""
+ACTIVE_LOAD_GENERATOR=""
 ACTIVE_VOLUME=""
 SAMPLER_PID=""
+CPU_SAMPLER_PID=""
 SEQUENCE=0
 FINAL_DRAIN_ATTEMPTS=30
 
@@ -50,10 +54,19 @@ require_positive_integer() {
 }
 
 cleanup_run() {
+  if [[ -n "$CPU_SAMPLER_PID" ]]; then
+    kill "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    CPU_SAMPLER_PID=""
+  fi
   if [[ -n "$SAMPLER_PID" ]]; then
     kill "$SAMPLER_PID" >/dev/null 2>&1 || true
     wait "$SAMPLER_PID" >/dev/null 2>&1 || true
     SAMPLER_PID=""
+  fi
+  if [[ -n "$ACTIVE_LOAD_GENERATOR" ]]; then
+    docker rm -f "$ACTIVE_LOAD_GENERATOR" >/dev/null 2>&1 || true
+    ACTIVE_LOAD_GENERATOR=""
   fi
   if [[ -n "$ACTIVE_BROKER" ]]; then
     docker rm -f "$ACTIVE_BROKER" >/dev/null 2>&1 || true
@@ -100,7 +113,24 @@ done
 
 docker_context="$(docker context show)"
 docker_os="$(docker info --format '{{.OperatingSystem}}')"
-if [[ "$docker_context" != "orbstack" && "$docker_os" != *OrbStack* ]]; then
+docker_cpus="$(docker info --format '{{.NCPU}}')"
+broker_args=(--cpus 2 --memory 2g --memory-swap 2g)
+load_generator_args=(--cpus 2 --memory 2g --memory-swap 2g)
+broker_cpuset=""
+load_generator_cpuset=""
+platform="OrbStack on macOS"
+if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+  [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
+    die "github_actions qualification requires a GitHub-hosted runner"
+  [[ "$docker_cpus" -ge 4 ]] || die "GitHub qualification requires at least four CPUs"
+  broker_cpuset="0-1"
+  load_generator_cpuset="2-3"
+  broker_args+=(--cpuset-cpus "$broker_cpuset")
+  load_generator_args+=(--cpuset-cpus "$load_generator_cpuset")
+  platform="GitHub Actions on Linux"
+elif [[ "$QUALIFICATION_ENVIRONMENT" != orbstack ]]; then
+  die "unknown qualification environment $QUALIFICATION_ENVIRONMENT"
+elif [[ "$docker_context" != "orbstack" && "$docker_os" != *OrbStack* ]]; then
   die "Docker must use OrbStack (context=$docker_context, os=$docker_os)"
 fi
 
@@ -108,7 +138,15 @@ baseline_commit="$(git -C "$ROOT" rev-parse --verify "$BASELINE_REF^{commit}")"
 candidate_commit="$(git -C "$ROOT" rev-parse --verify "$CANDIDATE_REF^{commit}")"
 BASELINE_TARGET="$TARGET_ROOT/$baseline_commit"
 CANDIDATE_TARGET="$TARGET_ROOT/$candidate_commit"
-if [[ "$QUALIFICATION_DEV" == 0 ]]; then
+if [[ "$CALIBRATION_ONLY" == 1 ]]; then
+  [[ "$baseline_commit" == "$candidate_commit" ]] || die "A/A requires the same source commit"
+  [[ "$PAIRS" == 2 && "$WARMUP_SECONDS" == 30 && "$MEASUREMENT_SECONDS" == 120 \
+    && "$DRAIN_TIMEOUT_SECONDS" == 1800 \
+    && "$CASES" == "raw_write sustainable low_load_latency" ]] ||
+    die "A/A requires all three profiles, two pairs, 30s warmup, 120s measurement and full drain"
+elif [[ "$CALIBRATION_ONLY" != 0 ]]; then
+  die "CALIBRATION_ONLY must be 0 or 1"
+elif [[ "$QUALIFICATION_DEV" == 0 ]]; then
   [[ "$BASELINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "baseline reference must be a version tag"
   tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$BASELINE_REF^{commit}")"
@@ -158,6 +196,7 @@ baseline_version="$(read_workspace_version "$BASELINE_SOURCE")"
 candidate_version="$(read_workspace_version "$CANDIDATE_SOURCE")"
 if [[ "$QUALIFICATION_DEV" == 0 ]]; then
   expected_baseline_version="${BASELINE_REF#v}"
+  [[ "$CALIBRATION_ONLY" != 1 ]] || expected_baseline_version="$RELEASE"
   [[ "$baseline_version" == "$expected_baseline_version" ]] ||
     die "baseline workspace version is $baseline_version, expected $expected_baseline_version"
   [[ "$candidate_version" == "$RELEASE" ]] ||
@@ -183,6 +222,7 @@ build_release() {
   done
   docker run --rm \
     -e RUSTUP_TOOLCHAIN=1.88.0 \
+    -e CARGO_BUILD_JOBS=2 \
     -e CARGO_INCREMENTAL=0 \
     -e CARGO_TARGET_DIR=/target \
     -e "RUSTQUEUE_BUILD_VERSION=$version" \
@@ -195,21 +235,23 @@ build_release() {
     cargo build --locked --release "${binary_args[@]}"
 }
 
-printf 'Compiling exact baseline Broker %s (%s)\n' "$BASELINE_REF" "$baseline_commit"
-build_release "$BASELINE_SOURCE" "$BASELINE_TARGET" "$baseline_version" rustqueued
-cp "$BASELINE_TARGET/release/rustqueued" "$BASELINE_RUNTIME/rustqueued"
-if command -v shasum >/dev/null 2>&1; then
-  baseline_binary_sha256="$(
-    shasum -a 256 "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
-  )"
-else
-  baseline_binary_sha256="$(
-    sha256sum "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
-  )"
+if [[ "$CALIBRATION_ONLY" != 1 ]]; then
+  printf 'Compiling exact baseline Broker %s (%s)\n' "$BASELINE_REF" "$baseline_commit"
+  build_release "$BASELINE_SOURCE" "$BASELINE_TARGET" "$baseline_version" rustqueued
+  cp "$BASELINE_TARGET/release/rustqueued" "$BASELINE_RUNTIME/rustqueued"
+  if command -v shasum >/dev/null 2>&1; then
+    baseline_binary_sha256="$(
+      shasum -a 256 "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
+    )"
+  else
+    baseline_binary_sha256="$(
+      sha256sum "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
+    )"
+  fi
+  docker build --target broker \
+    -f "$ROOT/benchmarks/Dockerfile.qualify" \
+    -t "$BASELINE_IMAGE" "$BASELINE_RUNTIME"
 fi
-docker build --target broker \
-  -f "$ROOT/benchmarks/Dockerfile.qualify" \
-  -t "$BASELINE_IMAGE" "$BASELINE_RUNTIME"
 
 printf 'Compiling candidate Broker %s (%s)\n' "$CANDIDATE_REF" "$candidate_commit"
 build_release \
@@ -234,6 +276,10 @@ fi
 docker build --target broker \
   -f "$ROOT/benchmarks/Dockerfile.qualify" \
   -t "$CANDIDATE_IMAGE" "$CANDIDATE_RUNTIME"
+if [[ "$CALIBRATION_ONLY" == 1 ]]; then
+  docker tag "$CANDIDATE_IMAGE" "$BASELINE_IMAGE"
+  baseline_binary_sha256="$candidate_binary_sha256"
+fi
 printf 'Building common load generator and qualification evaluator\n'
 docker build --target tools \
   -f "$ROOT/benchmarks/Dockerfile.qualify" \
@@ -243,16 +289,74 @@ docker network create "$NETWORK" >/dev/null
 
 sample_rss() {
   local output=$1 broker=$2
+  local pid=""
+  if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+    pid=$(docker inspect "$broker" --format '{{.State.Pid}}')
+  fi
   {
     printf 'timestamp_utc\trss_bytes\n'
-    while docker inspect "$broker" >/dev/null 2>&1; do
-      rss="$(
-        docker exec "$broker" awk '/VmRSS:/ { print $2 * 1024 }' /proc/1/status \
-          2>/dev/null || true
-      )"
+    while true; do
+      if [[ -n "$pid" ]]; then
+        [[ -r "/proc/$pid/status" && "$(cat "/proc/$pid/comm")" == rustqueued ]] || break
+        rss=$(awk '/VmRSS:/ { print $2 * 1024 }' "/proc/$pid/status")
+      else
+        docker inspect "$broker" >/dev/null 2>&1 || break
+        rss="$(
+          docker exec "$broker" awk '/VmRSS:/ { print $2 * 1024 }' /proc/1/status \
+            2>/dev/null || true
+        )"
+      fi
       if [[ "$rss" =~ ^[0-9]+$ ]]; then
         printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rss"
       fi
+      sleep 1
+    done
+  } >"$output"
+}
+
+capture_host_counters() {
+  [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]] || return 0
+  local stem=$1 broker=$2 pid group metric
+  pid=$(docker inspect "$broker" --format '{{.State.Pid}}')
+  group=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
+  [[ -n "$group" ]] || die "GitHub qualification requires readable cgroup v2 counters"
+  for metric in cpu.stat cpu.max cpuset.cpus.effective io.stat memory.events; do
+    cat "/sys/fs/cgroup$group/$metric" >"$stem.$metric"
+  done
+  if [[ -r "/sys/fs/cgroup$group/cpu.pressure" ]]; then
+    cat "/sys/fs/cgroup$group/cpu.pressure" >"$stem.cpu.pressure"
+  else
+    printf 'unavailable\n' >"$stem.cpu.pressure"
+  fi
+  cat /proc/vmstat >"$stem.host-vmstat"
+  cat /proc/stat >"$stem.host-stat"
+  cat /proc/loadavg >"$stem.host-loadavg"
+  cat /proc/diskstats >"$stem.host-diskstats"
+  for metric in cpu io memory; do
+    if [[ -r "/proc/pressure/$metric" ]]; then
+      cat "/proc/pressure/$metric" >"$stem.host-$metric-pressure"
+    else
+      printf 'unavailable\n' >"$stem.host-$metric-pressure"
+    fi
+  done
+}
+
+sample_load_generator_cpu() {
+  local output=$1 container=$2 pid group
+  pid=$(docker inspect "$container" --format '{{.State.Pid}}')
+  group=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
+  [[ -n "$group" ]] || return 1
+  cat "/sys/fs/cgroup$group/cpu.max" >"${output%.tsv}.cpu.max"
+  cat "/sys/fs/cgroup$group/cpuset.cpus.effective" >"${output%.tsv}.cpuset.cpus.effective"
+  {
+    printf 'timestamp_utc\tusage_usec\tuser_usec\tsystem_usec\tnr_periods\tnr_throttled\tthrottled_usec\n'
+    while [[ -r "/sys/fs/cgroup$group/cpu.stat" ]]; do
+      awk -v timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        { counters[$1] = $2 }
+        END { printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n", timestamp,
+          counters["usage_usec"], counters["user_usec"], counters["system_usec"],
+          counters["nr_periods"], counters["nr_throttled"], counters["throttled_usec"] }
+      ' "/sys/fs/cgroup$group/cpu.stat" || break
       sleep 1
     done
   } >"$output"
@@ -273,7 +377,7 @@ wait_for_broker() {
 
 run_variant() {
   local scenario=$1 pair=$2 position=$3 variant=$4
-  local image commit producers consumers batch rate attempt
+  local image commit producers consumers batch rate attempt data_path
   case "$variant" in
     baseline)
       image="$BASELINE_IMAGE"
@@ -321,11 +425,21 @@ run_variant() {
 
   docker volume create "$ACTIVE_VOLUME" >/dev/null
   docker run -d --name "$ACTIVE_BROKER" --network "$NETWORK" \
-    --cpus 2 --memory 2g \
+    "${broker_args[@]}" \
     -e RUSTQUEUE_DATA_PATH=/data \
     -v "$ACTIVE_VOLUME:/data" \
     "$image" >/dev/null
   wait_for_broker "$ACTIVE_BROKER"
+  if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+    data_path=$(docker volume inspect "$ACTIVE_VOLUME" --format '{{.Mountpoint}}')
+    sudo -n findmnt --json --target "$data_path" \
+      --output TARGET,SOURCE,FSTYPE,OPTIONS,MAJ:MIN >"$RUN_DIR/$label.data-filesystem.json"
+    sudo -n df -B1 "$data_path" >"$RUN_DIR/$label.data-filesystem-space.txt"
+    jq -e '.filesystems | length == 1 and all(.[]; .fstype != "tmpfs" and .fstype != "ramfs")' \
+      "$RUN_DIR/$label.data-filesystem.json" >/dev/null ||
+      die "qualification data must use a disk-backed filesystem"
+  fi
+  capture_host_counters "$RUN_DIR/$label.before" "$ACTIVE_BROKER"
   sample_rss "$rss_file" "$ACTIVE_BROKER" &
   SAMPLER_PID=$!
 
@@ -347,16 +461,32 @@ run_variant() {
   if [[ -n "$rate" ]]; then
     bench_args+=(--rate "$rate")
   fi
-  set +e
-  docker run --rm --network "$NETWORK" --cpus 2 --memory 2g \
+  ACTIVE_LOAD_GENERATOR="$PREFIX-load$SEQUENCE"
+  docker run -d --name "$ACTIVE_LOAD_GENERATOR" --network "$NETWORK" \
+    "${load_generator_args[@]}" \
     --entrypoint /usr/local/bin/rustqueue-bench "$TOOLS_IMAGE" \
-    "${bench_args[@]}" >"$report" 2>"$error_log"
-  benchmark_status=$?
-  set -e
+    "${bench_args[@]}" >/dev/null
+  if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+    sample_load_generator_cpu "$RUN_DIR/$label.load-generator-cpu.tsv" \
+      "$ACTIVE_LOAD_GENERATOR" &
+    CPU_SAMPLER_PID=$!
+  fi
+  benchmark_status=$(docker wait "$ACTIVE_LOAD_GENERATOR")
+  docker logs "$ACTIVE_LOAD_GENERATOR" >"$report" 2>"$error_log"
+  if [[ -n "$CPU_SAMPLER_PID" ]]; then
+    kill "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    CPU_SAMPLER_PID=""
+    awk 'END { exit (NR < 2) }' "$RUN_DIR/$label.load-generator-cpu.tsv" || {
+      cleanup_run
+      die "$label did not capture load generator CPU counters"
+    }
+  fi
 
   kill "$SAMPLER_PID" >/dev/null 2>&1 || true
   wait "$SAMPLER_PID" >/dev/null 2>&1 || true
   SAMPLER_PID=""
+  capture_host_counters "$RUN_DIR/$label.after" "$ACTIVE_BROKER"
   if [[ "$benchmark_status" -ne 0 ]]; then
     cat "$error_log" >&2
     cleanup_run
@@ -544,19 +674,24 @@ baseline_image_id="$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')"
 candidate_image_id="$(docker image inspect "$CANDIDATE_IMAGE" --format '{{.Id}}')"
 docker_server_version="$(docker version --format '{{.Server.Version}}')"
 docker_architecture="$(docker info --format '{{.Architecture}}')"
-docker_cpus="$(docker info --format '{{.NCPU}}')"
 docker_memory_bytes="$(docker info --format '{{.MemTotal}}')"
 docker_storage_driver="$(docker info --format '{{.Driver}}')"
 orbstack_version="$(orbctl version 2>/dev/null | head -n 1 || printf unknown)"
 macos_version="$(sw_vers -productVersion 2>/dev/null || printf unknown)"
 hardware_model="$(sysctl -n hw.model 2>/dev/null || printf unknown)"
+rss_observer="docker exec inside Broker cgroup"
+[[ "$QUALIFICATION_ENVIRONMENT" != github_actions ]] || rss_observer="Linux host /proc; outside Broker cgroup"
 
 jq -n \
+  --arg platform "$platform" \
+  --arg rss_observer "$rss_observer" \
   --arg docker_context "$docker_context" \
   --arg docker_os "$docker_os" \
   --arg docker_server_version "$docker_server_version" \
   --arg docker_architecture "$docker_architecture" \
   --argjson docker_cpus "$docker_cpus" \
+  --arg broker_cpuset "$broker_cpuset" \
+  --arg load_generator_cpuset "$load_generator_cpuset" \
   --argjson docker_memory_bytes "$docker_memory_bytes" \
   --arg docker_storage_driver "$docker_storage_driver" \
   --arg orbstack_version "$orbstack_version" \
@@ -564,8 +699,9 @@ jq -n \
   --arg hardware_model "$hardware_model" \
   --arg tool_source "$tool_source" \
   '{
-    platform: "OrbStack on macOS",
+    platform: $platform,
     comparison_scope: "same-host relative only",
+    rss_observer: $rss_observer,
     macos_version: $macos_version,
     hardware_model: $hardware_model,
     orbstack_version: $orbstack_version,
@@ -579,8 +715,14 @@ jq -n \
       storage_driver: $docker_storage_driver
     },
     resource_limits: {
-      broker: {cpus: 2, memory_bytes: 2147483648},
-      load_generator: {cpus: 2, memory_bytes: 2147483648}
+      broker: {
+        cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648,
+        cpuset_cpus: (if $broker_cpuset == "" then null else $broker_cpuset end)
+      },
+      load_generator: {
+        cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648,
+        cpuset_cpus: (if $load_generator_cpuset == "" then null else $load_generator_cpuset end)
+      }
     },
     tool_source: $tool_source
   }' >"$RUN_DIR/environment-core.json"
@@ -701,6 +843,34 @@ set -e
 
 mkdir -p "$(dirname "$EVIDENCE_OUTPUT")"
 cp "$EVIDENCE_FILE" "$EVIDENCE_OUTPUT"
+if [[ "$CALIBRATION_ONLY" == 1 ]]; then
+  # A valid evaluator document proves the original integrity and drain checks ran.
+  jq -e '.schema_version == 1 and (.runs | length) == 12
+    and (.verdict.hard_failures | length) == 0
+    and .verdict.status == "pass"' "$EVIDENCE_FILE" >/dev/null ||
+    die "A/A evaluator rejected integrity or regression checks"
+  jq '
+    def spread: ((max / min) - 1) * 100;
+    if .baseline.binary_sha256 != .candidate.binary_sha256
+      or .baseline.image_id != .candidate.image_id then error("A/A artifacts differ") else . end
+    | [.runs | group_by(.case)[] | . as $runs | {
+        profile: .[0].case, runs: length,
+        throughput_spread_percent: ([.[] | if .case == "sustainable"
+          then .metrics.receive_messages_per_second else .metrics.publish_messages_per_second end] | spread),
+        p99_spread_percent: ([.[].metrics.pub_ack_p99_us] | spread)
+      }]
+    | {limits_percent: {throughput: 5, p99: 10}, profiles: .,
+       status: (if length == 3 and all(.[];
+         .runs == 4 and .throughput_spread_percent <= 5 and .p99_spread_percent <= 10)
+         then "pass" else "fail" end)}
+  ' "$INPUT_FILE" >"$RUN_DIR/calibration.json"
+  cp "$RUN_DIR/calibration.json" "$EVIDENCE_OUTPUT"
+  if jq -e '.status == "pass"' "$EVIDENCE_OUTPUT" >/dev/null; then
+    qualification_status=0
+  else
+    qualification_status=1
+  fi
+fi
 printf 'Raw qualification artifacts: %s\n' "$RUN_DIR"
 printf 'Compact qualification evidence: %s\n' "$EVIDENCE_OUTPUT"
 exit "$qualification_status"

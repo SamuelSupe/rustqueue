@@ -23,6 +23,11 @@ The chart starts two Operator replicas. They coordinate through the
 reconciles RustQueue resources. The Broker and discovery PDBs are owned by the
 RustQueue resource; the Operator PDB is owned by Helm.
 
+The Proxy DaemonSet keeps the existing Ready Pod until its replacement is
+Ready, using `maxUnavailable: 0` and `maxSurge: 1`. Reserve capacity for one
+additional Proxy Pod during an update. This also preserves a publish endpoint
+when `proxyNodeSelector` selects only one node.
+
 ## Reading cluster state
 
 ```sh
@@ -163,6 +168,10 @@ maintenance request exists per RustQueue, which prevents conflicting drains.
 
 ## Rolling an image
 
+When a completed rollout re-enters readiness recovery after a Pod restart,
+its timeout clock starts again. Repeated checks during that recovery keep the
+same start time, so a stalled recovery still reaches the configured timeout.
+
 Set the image through Helm or patch the RustQueue. The Operator performs target
 image capability preflight, validates every current Broker, quiesces publishing
 and freezes new delivery, waits for already-issued leases and delivery buffers
@@ -178,7 +187,7 @@ Canary approval is optional:
 ```sh
 helm upgrade rustqueue deploy/helm/rustqueue \
   --namespace rustqueue \
-  --set queue.image=registry.example/rustqueue:0.10.0 \
+  --set queue.image=registry.example/rustqueue:0.10.1 \
   --set queue.rollout.requireCanaryApproval=true
 
 rustqueuectl -n rustqueue rollout approve
@@ -257,6 +266,16 @@ Permanent PVC loss permanently loses that Broker's unconsumed messages.
 ./scripts/release-gate.sh
 K8S_ACCEPTANCE=1 ./scripts/release-gate.sh
 ```
+
+The acceptance scripts apply the checked-in CRDs before installing the chart
+and use Helm's `--skip-crds` option. This keeps CRD field ownership with the
+explicit bootstrap step and avoids a conflicting second apply from Helm 4.
+Read-only health probes allow up to 60 seconds for Service routing to converge
+after Pod readiness; publishing and management requests are not retried by
+this probe policy.
+The multi-Broker rollout check starts a phase watch before canary approval and
+reads readiness and observed generation from the same API response. This
+captures short rolling phases without combining status from different updates.
 
 The second command is destructive only inside the dedicated OrbStack test
 namespaces. It validates real A/B binaries, canary pause, Lease failover,

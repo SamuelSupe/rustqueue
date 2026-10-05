@@ -77,6 +77,8 @@ node_publish_inflight_bytes = 536870912
 connection_publish_inflight_bytes = 83886080
 # Payload bodies held by slow consumers are bounded separately from the read cache.
 node_delivery_inflight_bytes = 536870912
+# Covers queue and consumer metadata until acknowledgement or release.
+node_delivery_inflight_messages = 262144
 connection_delivery_inflight_bytes = 33554432
 max_rdy_count = 2500
 max_connections = 10000

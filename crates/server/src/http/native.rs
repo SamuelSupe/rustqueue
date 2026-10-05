@@ -66,7 +66,7 @@ pub(super) async fn registry(
         "registry or console",
     )?;
     state.broker.expire_in_flight().await?;
-    let stats = state.broker.stats();
+    let stats = state.broker.stats()?;
     let topics = registry_topics(&stats);
     let (stored_messages, depth, in_flight) = backlog(&stats);
     let process_ready = state.accepting.load(Ordering::Acquire);
@@ -172,7 +172,7 @@ pub(super) async fn drain_status(
         "registry or console",
     )?;
     state.broker.expire_in_flight().await?;
-    let stats = state.broker.metrics_stats(false, 0);
+    let stats = state.broker.metrics_stats(false, 0)?;
     let (stored_messages, depth, in_flight) = backlog(&stats);
     let draining = !state.accepting.load(Ordering::Acquire);
     let delivery_frozen = !state.delivering.load(Ordering::Acquire);
@@ -215,7 +215,7 @@ pub(super) async fn set_drain(
         "broker drain state changed"
     );
     state.broker.expire_in_flight().await?;
-    let stats = state.broker.metrics_stats(false, 0);
+    let stats = state.broker.metrics_stats(false, 0)?;
     let (stored_messages, depth, in_flight) = backlog(&stats);
     let publish_inflight_bytes = state.metrics.publish_inflight_bytes.load(Ordering::Acquire);
     let delivery_frozen = !state.delivering.load(Ordering::Acquire);
@@ -247,7 +247,7 @@ pub(super) async fn native_stats(
     state.broker.expire_in_flight().await?;
     let filtered = state
         .broker
-        .filtered_stats(query.topic.as_deref(), query.channel.as_deref());
+        .filtered_stats(query.topic.as_deref(), query.channel.as_deref())?;
     Ok(Json(json!({
         "complete": true,
         "node_id": state.config.node.id,
@@ -262,7 +262,7 @@ pub(super) async fn observe(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&headers, &state.tokens.console, "console")?;
     state.broker.expire_in_flight().await?;
-    let stats = state.broker.stats();
+    let stats = state.broker.stats()?;
     let segment_count = stats.aggregate.segment_count;
     let segment_bytes = stats.aggregate.segment_bytes;
     let mut value = observation_head(&state);

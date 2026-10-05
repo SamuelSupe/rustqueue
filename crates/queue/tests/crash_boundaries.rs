@@ -219,6 +219,7 @@ async fn sigkill_ttl_boundaries_never_redeliver_or_double_count() {
             let broker = Broker::open(config(root.path())).unwrap();
             let topic = broker
                 .stats()
+                .unwrap()
                 .topics
                 .into_iter()
                 .find(|topic| topic.name == "events")

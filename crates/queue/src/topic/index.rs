@@ -4,7 +4,7 @@ use super::recovery;
 use crate::model::MessageMeta;
 use crate::BrokerError;
 use rustqueue_storage::RecoveryMetadataRef;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,12 +27,13 @@ struct SealedMessages {
     first_timestamp_ns: i64,
     last_timestamp_ns: i64,
     last_log_index: u64,
+    min_available_at_ms: i64,
+    max_available_at_ms: i64,
 }
 
 pub(crate) struct MessageIndex {
     sealed: VecDeque<SealedMessages>,
     active: VecDeque<MessageMeta>,
-    scheduled: BTreeMap<i64, BTreeSet<u64>>,
     total_count: u64,
     cache: Arc<MessageIndexCache>,
 }
@@ -42,7 +43,6 @@ impl MessageIndex {
         Self {
             sealed: VecDeque::new(),
             active: VecDeque::new(),
-            scheduled: BTreeMap::new(),
             total_count: 0,
             cache,
         }
@@ -52,11 +52,8 @@ impl MessageIndex {
         &mut self,
         metadata: RecoveryMetadataRef,
     ) -> Result<(), BrokerError> {
-        let summary = recovery::inspect(&metadata, unix_ms())?;
-        let scheduled = summary.scheduled.clone();
-        self.push_sealed(SealedMessages::from_summary(metadata, summary))?;
-        self.extend_scheduled(scheduled);
-        Ok(())
+        let summary = recovery::inspect(&metadata)?;
+        self.push_sealed(SealedMessages::from_summary(metadata, summary))
     }
 
     pub(crate) fn recover_active(&mut self, messages: Vec<MessageMeta>) -> Result<(), BrokerError> {
@@ -102,8 +99,18 @@ impl MessageIndex {
             .find(|message| message.payload.path.as_ref() == path)
             .cloned()
             .expect("non-empty metadata");
+        let (min_available_at_ms, max_available_at_ms) =
+            self.active_for_path(path)
+                .fold((i64::MAX, i64::MIN), |(min, max), message| {
+                    (
+                        min.min(message.available_at_ms),
+                        max.max(message.available_at_ms),
+                    )
+                });
         self.active
             .retain(|message| message.payload.path.as_ref() != path);
+        // Cold topics must not retain uncharged buffers after their metadata spills.
+        self.active.shrink_to_fit();
         self.cache.release_active(count);
         self.total_count = self.total_count.saturating_sub(count as u64);
         self.push_sealed(SealedMessages {
@@ -116,6 +123,8 @@ impl MessageIndex {
             first_timestamp_ns: first.timestamp_ns,
             last_timestamp_ns: last.timestamp_ns,
             last_log_index: last.log_index,
+            min_available_at_ms,
+            max_available_at_ms,
         })
     }
 
@@ -199,23 +208,51 @@ impl MessageIndex {
         self.total_count
     }
 
-    pub(crate) fn deferred_positions(&mut self, now_ms: i64) -> BTreeSet<u64> {
-        self.scheduled = self.scheduled.split_off(&now_ms.saturating_add(1));
-        self.scheduled
-            .values()
-            .flat_map(|positions| positions.iter().copied())
-            .collect()
-    }
-
-    pub(crate) fn discard_scheduled_through(&mut self, through_position: u64) {
-        self.scheduled.retain(|_, positions| {
-            positions.retain(|position| *position > through_position);
-            !positions.is_empty()
-        });
+    pub(crate) fn for_each_deferred_range(
+        &self,
+        now_ms: i64,
+        last_position: u64,
+        mut visit: impl FnMut(u64, u64),
+    ) -> Result<(), BrokerError> {
+        for segment in &self.sealed {
+            if segment.first_position > last_position {
+                break;
+            }
+            if segment.max_available_at_ms <= now_ms {
+                continue;
+            }
+            let last = segment.last_position.min(last_position);
+            if segment.min_available_at_ms > now_ms {
+                visit(segment.first_position, last);
+                continue;
+            }
+            // Mixed deadlines require one bounded page, never a backlog-sized set.
+            let count = last - segment.first_position + 1;
+            let mut ordinal = 0;
+            while ordinal < count {
+                let length = (count - ordinal).min(PAGE_MESSAGES) as usize;
+                let page = recovery::read_page(&segment.metadata, ordinal, length)?;
+                visit_deferred_ranges(page.iter(), now_ms, &mut visit);
+                ordinal += length as u64;
+            }
+        }
+        visit_deferred_ranges(
+            self.active
+                .iter()
+                .take_while(|message| message.position <= last_position),
+            now_ms,
+            &mut visit,
+        );
+        Ok(())
     }
 
     pub(crate) fn active_count(&self) -> usize {
         self.active.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_metadata_allocated_bytes(&self) -> usize {
+        self.active.capacity() * std::mem::size_of::<MessageMeta>()
     }
 
     pub(crate) fn active_last_position(&self) -> Option<u64> {
@@ -491,14 +528,6 @@ impl MessageIndex {
             self.total_count = self.total_count.saturating_sub(*count);
             self.cache.invalidate(path);
         }
-        self.scheduled.retain(|_, positions| {
-            positions.retain(|position| {
-                !removed
-                    .iter()
-                    .any(|(_, _, first, last)| (*first..=*last).contains(position))
-            });
-            !positions.is_empty()
-        });
         self.sealed
             .retain(|segment| existing.contains(segment.metadata.segment_path()));
     }
@@ -537,24 +566,8 @@ impl MessageIndex {
             expected = Some(message.position.saturating_add(1));
         }
         self.total_count = self.total_count.saturating_add(messages.len() as u64);
-        let now_ms = unix_ms();
-        self.extend_scheduled(
-            messages
-                .iter()
-                .filter(|message| message.available_at_ms > now_ms)
-                .map(|message| (message.available_at_ms, message.position)),
-        );
         self.active.extend(messages);
         Ok(())
-    }
-
-    fn extend_scheduled(&mut self, scheduled: impl IntoIterator<Item = (i64, u64)>) {
-        for (available_at_ms, position) in scheduled {
-            self.scheduled
-                .entry(available_at_ms)
-                .or_default()
-                .insert(position);
-        }
     }
 
     fn load_ordinal(
@@ -602,12 +615,26 @@ impl MessageIndex {
     }
 }
 
-fn unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(i64::MAX as u128) as i64
+fn visit_deferred_ranges<'a>(
+    messages: impl Iterator<Item = &'a MessageMeta>,
+    now_ms: i64,
+    visit: &mut impl FnMut(u64, u64),
+) {
+    let mut range: Option<(u64, u64)> = None;
+    for message in messages {
+        if message.available_at_ms > now_ms {
+            if let Some((_, last)) = range.as_mut() {
+                *last = message.position;
+            } else {
+                range = Some((message.position, message.position));
+            }
+        } else if let Some((first, last)) = range.take() {
+            visit(first, last);
+        }
+    }
+    if let Some((first, last)) = range {
+        visit(first, last);
+    }
 }
 
 impl Drop for MessageIndex {
@@ -631,6 +658,8 @@ impl SealedMessages {
             first_timestamp_ns: summary.first.timestamp_ns,
             last_timestamp_ns: summary.last.timestamp_ns,
             last_log_index: summary.last.log_index,
+            min_available_at_ms: summary.min_available_at_ms,
+            max_available_at_ms: summary.max_available_at_ms,
         }
     }
 }

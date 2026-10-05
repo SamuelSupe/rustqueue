@@ -14,7 +14,8 @@ pub(super) struct Summary {
     pub count: u64,
     pub first: MessageMeta,
     pub last: MessageMeta,
-    pub scheduled: Vec<(i64, u64)>,
+    pub min_available_at_ms: i64,
+    pub max_available_at_ms: i64,
 }
 
 pub(super) fn encode<'a>(messages: impl Iterator<Item = &'a MessageMeta> + Clone) -> Vec<u8> {
@@ -38,10 +39,7 @@ pub(super) fn encode<'a>(messages: impl Iterator<Item = &'a MessageMeta> + Clone
     bytes
 }
 
-pub(super) fn inspect(
-    reference: &RecoveryMetadataRef,
-    now_ms: i64,
-) -> Result<Summary, BrokerError> {
+pub(super) fn inspect(reference: &RecoveryMetadataRef) -> Result<Summary, BrokerError> {
     let header = reference.read_range(0, HEADER_LEN)?;
     let count = decode_header(&header)?;
     if count == 0 {
@@ -58,7 +56,8 @@ pub(super) fn inspect(
             "topic recovery index length mismatch".into(),
         ));
     }
-    let mut scheduled = Vec::new();
+    let mut min_available_at_ms = i64::MAX;
+    let mut max_available_at_ms = i64::MIN;
     let mut first = None;
     let mut last: Option<MessageMeta> = None;
     let mut ordinal = 0;
@@ -72,9 +71,8 @@ pub(super) fn inspect(
                     "topic recovery index range is invalid".into(),
                 ));
             }
-            if message.available_at_ms > now_ms {
-                scheduled.push((message.available_at_ms, message.position));
-            }
+            min_available_at_ms = min_available_at_ms.min(message.available_at_ms);
+            max_available_at_ms = max_available_at_ms.max(message.available_at_ms);
             first.get_or_insert_with(|| message.clone());
             last = Some(message);
         }
@@ -84,7 +82,8 @@ pub(super) fn inspect(
         count,
         first: first.expect("non-empty recovery index"),
         last: last.expect("non-empty recovery index"),
-        scheduled,
+        min_available_at_ms,
+        max_available_at_ms,
     })
 }
 
@@ -173,4 +172,178 @@ fn decode_entry(
             crc32c,
         },
     })
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use crate::topic::{MessageIndexCache, Topic};
+    use crate::{Broker, BrokerConfig};
+    use std::sync::{atomic::AtomicBool, Arc};
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn legacy_dpub_checkpoints_recover_without_duplicating_shared_deadlines() {
+        let root = tempdir().unwrap();
+        let config = BrokerConfig {
+            data_path: root.path().into(),
+            ..BrokerConfig::default()
+        };
+        let broker = Broker::open(config.clone()).unwrap();
+        broker.create_channel("events", "workers").await.unwrap();
+        broker
+            .publish("events", vec![b"first".to_vec()], Duration::from_secs(60))
+            .await
+            .unwrap();
+        let ready = broker
+            .publish("events", vec![b"ready".to_vec()], Duration::ZERO)
+            .await
+            .unwrap()[0];
+        broker
+            .publish("events", vec![b"last".to_vec()], Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(
+            broker
+                .next_message("events", "workers", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            ready
+        );
+        broker
+            .requeue("events", "workers", ready, Duration::from_secs(120))
+            .await
+            .unwrap();
+        drop(broker);
+        let directory = root.path().join("topics").join(hex::encode("events"));
+        let cache = MessageIndexCache::new(
+            config.message_index_cache_bytes,
+            1,
+            16,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mut topic = Topic::open(
+            &directory,
+            config.max_segment_bytes,
+            config.max_ack_gap,
+            config.storage_feature_level,
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        topic.recover_channels().unwrap();
+        for position in [1, 3] {
+            let crate::topic::index::Lookup::Found(message) = topic.messages.lookup(position)
+            else {
+                panic!("active metadata must be resident");
+            };
+            topic
+                .channels
+                .get_mut("workers")
+                .unwrap()
+                .state
+                .requeued_until
+                .insert(position, message.available_at_ms);
+        }
+        topic.spill_message_metadata().unwrap();
+        topic.checkpoint_channels().unwrap();
+        drop(topic);
+        let mut topic = Topic::open(
+            &directory,
+            config.max_segment_bytes,
+            config.max_ack_gap,
+            config.storage_feature_level,
+            cache,
+        )
+        .unwrap();
+        topic.recover_channels().unwrap();
+        let checkpoint = topic.channels["workers"].state.checkpoint();
+        assert_eq!(checkpoint.requeued_until.len(), 1);
+        assert!(checkpoint.requeued_until.contains_key(&2));
+        assert_eq!(checkpoint.attempts.get(&2), Some(&1));
+        drop(topic);
+        let reopened = Broker::open(config).unwrap();
+        let stats = reopened.stats().unwrap();
+        let channel = &stats.topics[0].channels[0];
+        assert_eq!(
+            (channel.depth, channel.deferred_count, channel.requeue_count),
+            (3, 3, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_dpub_checkpoint_gaps_still_fence_lost_positions() {
+        let root = tempdir().unwrap();
+        let config = BrokerConfig {
+            data_path: root.path().into(),
+            ..BrokerConfig::default()
+        };
+        let broker = Broker::open(config.clone()).unwrap();
+        broker.create_channel("events", "workers").await.unwrap();
+        broker
+            .publish("events", vec![b"kept".to_vec()], Duration::ZERO)
+            .await
+            .unwrap();
+        drop(broker);
+        let directory = root.path().join("topics").join(hex::encode("events"));
+        let cache = MessageIndexCache::new(
+            config.message_index_cache_bytes,
+            1,
+            16,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mut topic = Topic::open(
+            &directory,
+            config.max_segment_bytes,
+            config.max_ack_gap,
+            config.storage_feature_level,
+            Arc::clone(&cache),
+        )
+        .unwrap();
+        topic.recover_channels().unwrap();
+        topic
+            .channels
+            .get_mut("workers")
+            .unwrap()
+            .state
+            .requeued_until
+            .insert(4, 100);
+        topic.checkpoint_channels().unwrap();
+        drop(topic);
+        let mut topic = Topic::open(
+            &directory,
+            config.max_segment_bytes,
+            config.max_ack_gap,
+            config.storage_feature_level,
+            cache,
+        )
+        .unwrap();
+        topic.recover_channels().unwrap();
+        assert_eq!(topic.next_position(), 5);
+        drop(topic);
+        let reopened = Broker::open(config).unwrap();
+        reopened
+            .publish("events", vec![b"next".to_vec()], Duration::ZERO)
+            .await
+            .unwrap();
+        let deliveries = reopened
+            .fetch_batch(
+                "events",
+                "workers",
+                8,
+                usize::MAX,
+                Duration::from_secs(30),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|delivery| delivery.body.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"kept".as_slice(), b"next".as_slice()]
+        );
+    }
 }

@@ -137,8 +137,8 @@ async fn post(
     let response = state
         .http
         .post(format!(
-            "http://{}:{}{}",
-            broker.pod_ip, state.config.broker_http_port, path
+            "{}{path}",
+            broker.http_origin(state.config.broker_http_port)
         ))
         .bearer_auth(token)
         .timeout(Duration::from_secs(15))
