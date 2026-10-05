@@ -36,8 +36,10 @@ BASELINE_IMAGE="rustqueue:qualify-baseline-$$"
 CANDIDATE_IMAGE="rustqueue:qualify-candidate-$$"
 TOOLS_IMAGE="rustqueue:qualify-tools-$$"
 ACTIVE_BROKER=""
+ACTIVE_LOAD_GENERATOR=""
 ACTIVE_VOLUME=""
 SAMPLER_PID=""
+CPU_SAMPLER_PID=""
 SEQUENCE=0
 FINAL_DRAIN_ATTEMPTS=30
 
@@ -52,10 +54,19 @@ require_positive_integer() {
 }
 
 cleanup_run() {
+  if [[ -n "$CPU_SAMPLER_PID" ]]; then
+    kill "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    CPU_SAMPLER_PID=""
+  fi
   if [[ -n "$SAMPLER_PID" ]]; then
     kill "$SAMPLER_PID" >/dev/null 2>&1 || true
     wait "$SAMPLER_PID" >/dev/null 2>&1 || true
     SAMPLER_PID=""
+  fi
+  if [[ -n "$ACTIVE_LOAD_GENERATOR" ]]; then
+    docker rm -f "$ACTIVE_LOAD_GENERATOR" >/dev/null 2>&1 || true
+    ACTIVE_LOAD_GENERATOR=""
   fi
   if [[ -n "$ACTIVE_BROKER" ]]; then
     docker rm -f "$ACTIVE_BROKER" >/dev/null 2>&1 || true
@@ -302,10 +313,40 @@ capture_host_counters() {
   for metric in cpu.stat io.stat memory.events; do
     cat "/sys/fs/cgroup$group/$metric" >"$stem.$metric"
   done
+  if [[ -r "/sys/fs/cgroup$group/cpu.pressure" ]]; then
+    cat "/sys/fs/cgroup$group/cpu.pressure" >"$stem.cpu.pressure"
+  else
+    printf 'unavailable\n' >"$stem.cpu.pressure"
+  fi
   cat /proc/vmstat >"$stem.host-vmstat"
+  cat /proc/stat >"$stem.host-stat"
+  cat /proc/loadavg >"$stem.host-loadavg"
   for metric in cpu io memory; do
-    cat "/proc/pressure/$metric" >"$stem.host-$metric-pressure"
+    if [[ -r "/proc/pressure/$metric" ]]; then
+      cat "/proc/pressure/$metric" >"$stem.host-$metric-pressure"
+    else
+      printf 'unavailable\n' >"$stem.host-$metric-pressure"
+    fi
   done
+}
+
+sample_load_generator_cpu() {
+  local output=$1 container=$2 pid group
+  pid=$(docker inspect "$container" --format '{{.State.Pid}}')
+  group=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
+  [[ -n "$group" ]] || return 1
+  {
+    printf 'timestamp_utc\tusage_usec\tuser_usec\tsystem_usec\tnr_periods\tnr_throttled\tthrottled_usec\n'
+    while [[ -r "/sys/fs/cgroup$group/cpu.stat" ]]; do
+      awk -v timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        { counters[$1] = $2 }
+        END { printf "%s\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n", timestamp,
+          counters["usage_usec"], counters["user_usec"], counters["system_usec"],
+          counters["nr_periods"], counters["nr_throttled"], counters["throttled_usec"] }
+      ' "/sys/fs/cgroup$group/cpu.stat" || break
+      sleep 1
+    done
+  } >"$output"
 }
 
 wait_for_broker() {
@@ -398,12 +439,27 @@ run_variant() {
   if [[ -n "$rate" ]]; then
     bench_args+=(--rate "$rate")
   fi
-  set +e
-  docker run --rm --network "$NETWORK" --cpus 2 --memory 2g --memory-swap 2g \
+  ACTIVE_LOAD_GENERATOR="$PREFIX-load$SEQUENCE"
+  docker run -d --name "$ACTIVE_LOAD_GENERATOR" --network "$NETWORK" \
+    --cpus 2 --memory 2g --memory-swap 2g \
     --entrypoint /usr/local/bin/rustqueue-bench "$TOOLS_IMAGE" \
-    "${bench_args[@]}" >"$report" 2>"$error_log"
-  benchmark_status=$?
-  set -e
+    "${bench_args[@]}" >/dev/null
+  if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+    sample_load_generator_cpu "$RUN_DIR/$label.load-generator-cpu.tsv" \
+      "$ACTIVE_LOAD_GENERATOR" &
+    CPU_SAMPLER_PID=$!
+  fi
+  benchmark_status=$(docker wait "$ACTIVE_LOAD_GENERATOR")
+  docker logs "$ACTIVE_LOAD_GENERATOR" >"$report" 2>"$error_log"
+  if [[ -n "$CPU_SAMPLER_PID" ]]; then
+    kill "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$CPU_SAMPLER_PID" >/dev/null 2>&1 || true
+    CPU_SAMPLER_PID=""
+    awk 'END { exit (NR < 2) }' "$RUN_DIR/$label.load-generator-cpu.tsv" || {
+      cleanup_run
+      die "$label did not capture load generator CPU counters"
+    }
+  fi
 
   kill "$SAMPLER_PID" >/dev/null 2>&1 || true
   wait "$SAMPLER_PID" >/dev/null 2>&1 || true

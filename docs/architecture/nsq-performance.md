@@ -102,9 +102,12 @@ Its artifacts contain raw measurements, source commits, binary hashes,
 environment details, calibration and the existing regression verdict.
 On the Linux runner, RSS is read from the Broker's host PID instead of spawning
 `docker exec` inside its CPU-limited cgroup every second. Before/after cgroup CPU,
-I/O and memory-event counters, host VM counters and PSI are saved with each
-trial. These diagnose observer interference and host variation; they do not
-change the measurement windows or acceptance thresholds.
+I/O and memory-event counters, host VM counters, CPU utilization counters,
+load averages and PSI are saved with each trial. The load generator's cgroup
+CPU usage and throttling counters are sampled every second from the host.
+Unavailable pressure counters are recorded explicitly.
+These distinguish generator CPU limits from Broker limits and host contention;
+they do not change the measurement windows or acceptance thresholds.
 
 ## Next candidates to measure before changing semantics
 
