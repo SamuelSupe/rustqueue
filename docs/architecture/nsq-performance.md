@@ -100,6 +100,11 @@ The workflow runs when its definition or the qualification script changes in
 a PR, and can also be dispatched with an explicit published baseline tag.
 Its artifacts contain raw measurements, source commits, binary hashes,
 environment details, calibration and the existing regression verdict.
+On the Linux runner, RSS is read from the Broker's host PID instead of spawning
+`docker exec` inside its CPU-limited cgroup every second. Before/after cgroup CPU,
+I/O and memory-event counters, host VM counters and PSI are saved with each
+trial. These diagnose observer interference and host variation; they do not
+change the measurement windows or acceptance thresholds.
 
 ## Next candidates to measure before changing semantics
 

@@ -268,19 +268,44 @@ docker network create "$NETWORK" >/dev/null
 
 sample_rss() {
   local output=$1 broker=$2
+  local pid=""
+  if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+    pid=$(docker inspect "$broker" --format '{{.State.Pid}}')
+  fi
   {
     printf 'timestamp_utc\trss_bytes\n'
-    while docker inspect "$broker" >/dev/null 2>&1; do
-      rss="$(
-        docker exec "$broker" awk '/VmRSS:/ { print $2 * 1024 }' /proc/1/status \
-          2>/dev/null || true
-      )"
+    while true; do
+      if [[ -n "$pid" ]]; then
+        [[ -r "/proc/$pid/status" && "$(cat "/proc/$pid/comm")" == rustqueued ]] || break
+        rss=$(awk '/VmRSS:/ { print $2 * 1024 }' "/proc/$pid/status")
+      else
+        docker inspect "$broker" >/dev/null 2>&1 || break
+        rss="$(
+          docker exec "$broker" awk '/VmRSS:/ { print $2 * 1024 }' /proc/1/status \
+            2>/dev/null || true
+        )"
+      fi
       if [[ "$rss" =~ ^[0-9]+$ ]]; then
         printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$rss"
       fi
       sleep 1
     done
   } >"$output"
+}
+
+capture_host_counters() {
+  [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]] || return 0
+  local stem=$1 broker=$2 pid group metric
+  pid=$(docker inspect "$broker" --format '{{.State.Pid}}')
+  group=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
+  [[ -n "$group" ]] || die "GitHub qualification requires readable cgroup v2 counters"
+  for metric in cpu.stat io.stat memory.events; do
+    cat "/sys/fs/cgroup$group/$metric" >"$stem.$metric"
+  done
+  cat /proc/vmstat >"$stem.host-vmstat"
+  for metric in cpu io memory; do
+    cat "/proc/pressure/$metric" >"$stem.host-$metric-pressure"
+  done
 }
 
 wait_for_broker() {
@@ -351,6 +376,7 @@ run_variant() {
     -v "$ACTIVE_VOLUME:/data" \
     "$image" >/dev/null
   wait_for_broker "$ACTIVE_BROKER"
+  capture_host_counters "$RUN_DIR/$label.before" "$ACTIVE_BROKER"
   sample_rss "$rss_file" "$ACTIVE_BROKER" &
   SAMPLER_PID=$!
 
@@ -382,6 +408,7 @@ run_variant() {
   kill "$SAMPLER_PID" >/dev/null 2>&1 || true
   wait "$SAMPLER_PID" >/dev/null 2>&1 || true
   SAMPLER_PID=""
+  capture_host_counters "$RUN_DIR/$label.after" "$ACTIVE_BROKER"
   if [[ "$benchmark_status" -ne 0 ]]; then
     cat "$error_log" >&2
     cleanup_run
@@ -575,9 +602,12 @@ docker_storage_driver="$(docker info --format '{{.Driver}}')"
 orbstack_version="$(orbctl version 2>/dev/null | head -n 1 || printf unknown)"
 macos_version="$(sw_vers -productVersion 2>/dev/null || printf unknown)"
 hardware_model="$(sysctl -n hw.model 2>/dev/null || printf unknown)"
+rss_observer="docker exec inside Broker cgroup"
+[[ "$QUALIFICATION_ENVIRONMENT" != github_actions ]] || rss_observer="Linux host /proc; outside Broker cgroup"
 
 jq -n \
   --arg platform "$platform" \
+  --arg rss_observer "$rss_observer" \
   --arg docker_context "$docker_context" \
   --arg docker_os "$docker_os" \
   --arg docker_server_version "$docker_server_version" \
@@ -592,6 +622,7 @@ jq -n \
   '{
     platform: $platform,
     comparison_scope: "same-host relative only",
+    rss_observer: $rss_observer,
     macos_version: $macos_version,
     hardware_model: $hardware_model,
     orbstack_version: $orbstack_version,
