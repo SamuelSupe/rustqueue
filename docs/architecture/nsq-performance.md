@@ -87,7 +87,7 @@ Track `rustqueue_publish_unsynced_messages`,
 
 Release comparisons use `scripts/benchmark-qualify.sh`. OrbStack remains the
 default environment. When shared host paging prevents calibration, the
-`performance-qualification` GitHub workflow uses a fresh Linux runner and
+`performance-qualification` GitHub workflow uses a fresh Linux ARM64 runner and
 records that environment separately. It first runs two interleaved pairs of
 the exact same Broker image in all three profiles, with 30 seconds of warmup
 and 120 seconds of measurement. Each profile must stay within 5 percent
@@ -103,11 +103,15 @@ environment details, calibration and the existing regression verdict.
 On the Linux runner, RSS is read from the Broker's host PID instead of spawning
 `docker exec` inside its CPU-limited cgroup every second. Before/after cgroup CPU,
 I/O and memory-event counters, host VM counters, CPU utilization counters,
-load averages and PSI are saved with each trial. The load generator's cgroup
+block-device counters, load averages and PSI are saved with each trial.
+The named data volume's filesystem, device and free capacity are recorded;
+RAM-backed data filesystems are rejected. The load generator's cgroup
 CPU usage and throttling counters are sampled every second from the host.
 Unavailable pressure counters are recorded explicitly.
 These distinguish generator CPU limits from Broker limits and host contention;
 they do not change the measurement windows or acceptance thresholds.
+Comparisons apply only to the recorded host and architecture. A hosted runner
+is not assumed suitable until its same-binary calibration passes.
 
 ## Next candidates to measure before changing semantics
 

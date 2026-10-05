@@ -321,6 +321,7 @@ capture_host_counters() {
   cat /proc/vmstat >"$stem.host-vmstat"
   cat /proc/stat >"$stem.host-stat"
   cat /proc/loadavg >"$stem.host-loadavg"
+  cat /proc/diskstats >"$stem.host-diskstats"
   for metric in cpu io memory; do
     if [[ -r "/proc/pressure/$metric" ]]; then
       cat "/proc/pressure/$metric" >"$stem.host-$metric-pressure"
@@ -364,7 +365,7 @@ wait_for_broker() {
 
 run_variant() {
   local scenario=$1 pair=$2 position=$3 variant=$4
-  local image commit producers consumers batch rate attempt
+  local image commit producers consumers batch rate attempt data_path
   case "$variant" in
     baseline)
       image="$BASELINE_IMAGE"
@@ -417,6 +418,15 @@ run_variant() {
     -v "$ACTIVE_VOLUME:/data" \
     "$image" >/dev/null
   wait_for_broker "$ACTIVE_BROKER"
+  if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+    data_path=$(docker volume inspect "$ACTIVE_VOLUME" --format '{{.Mountpoint}}')
+    sudo -n findmnt --json --target "$data_path" \
+      --output TARGET,SOURCE,FSTYPE,OPTIONS,MAJ:MIN >"$RUN_DIR/$label.data-filesystem.json"
+    sudo -n df -B1 "$data_path" >"$RUN_DIR/$label.data-filesystem-space.txt"
+    jq -e '.filesystems | length == 1 and all(.[]; .fstype != "tmpfs" and .fstype != "ramfs")' \
+      "$RUN_DIR/$label.data-filesystem.json" >/dev/null ||
+      die "qualification data must use a disk-backed filesystem"
+  fi
   capture_host_counters "$RUN_DIR/$label.before" "$ACTIVE_BROKER"
   sample_rss "$rss_file" "$ACTIVE_BROKER" &
   SAMPLER_PID=$!

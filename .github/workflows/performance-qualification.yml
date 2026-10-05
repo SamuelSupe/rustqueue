@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   qualify:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
     env:
       QUALIFICATION_ENVIRONMENT: github_actions
