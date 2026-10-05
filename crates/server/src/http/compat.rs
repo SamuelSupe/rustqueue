@@ -132,10 +132,13 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> Response {
         return ApiError::from(error).into_response();
     }
     let mut output = state.metrics.render();
-    let queue_stats = state.broker.metrics_stats(
+    let queue_stats = match state.broker.metrics_stats(
         state.config.metrics.detailed_queue_metrics,
         state.config.metrics.max_detailed_series,
-    );
+    ) {
+        Ok(stats) => stats,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     output.push_str(&crate::metrics::render_broker(
         &queue_stats,
         &state.config.metrics,

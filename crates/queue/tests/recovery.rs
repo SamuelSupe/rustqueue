@@ -166,7 +166,9 @@ async fn nsq_relaxed_preserves_a_gap_after_an_acknowledged_tail_is_lost() {
         .await
         .unwrap()[0];
     assert_ne!(replacement_id, lost_id);
-    let lagging = broker.filtered_stats(Some("events"), Some("lagging"));
+    let lagging = broker
+        .filtered_stats(Some("events"), Some("lagging"))
+        .unwrap();
     assert_eq!(lagging.topics[0].channels[0].depth, 1);
     let replacement = broker
         .next_message("events", "workers", None)
@@ -264,7 +266,10 @@ async fn messages_without_a_durable_channel_survive_gc_and_a_legacy_restart() {
     broker.flush().await.unwrap();
 
     assert_eq!(broker.compact().await.unwrap(), 0);
-    assert_eq!(broker.stats().topics[0].message_count, ids.len() as u64);
+    assert_eq!(
+        broker.stats().unwrap().topics[0].message_count,
+        ids.len() as u64
+    );
     drop(broker);
 
     let manifest_path = root
@@ -330,7 +335,10 @@ async fn messages_after_the_last_durable_channel_is_deleted_survive_gc_and_resta
 
     let broker = Broker::open(cfg).unwrap();
     assert!(broker.compact().await.unwrap() > 0);
-    assert_eq!(broker.stats().topics[0].message_count, fresh.len() as u64);
+    assert_eq!(
+        broker.stats().unwrap().topics[0].message_count,
+        fresh.len() as u64
+    );
     broker
         .create_channel("events", "replacement")
         .await
@@ -427,7 +435,7 @@ async fn gc_preserves_positions_and_an_empty_log_reopens_at_the_next_index() {
             .unwrap();
     }
     assert!(broker.compact().await.unwrap() > 0);
-    assert_eq!(broker.stats().topics[0].message_count, 0);
+    assert_eq!(broker.stats().unwrap().topics[0].message_count, 0);
     drop(broker);
 
     let broker = Broker::open(cfg).unwrap();
@@ -466,7 +474,7 @@ async fn protective_eviction_persists_channel_gap_and_audit_before_deleting() {
     assert_eq!(report.topic, "events");
     assert_eq!(report.messages, 1);
     assert_eq!(report.through_position, 1);
-    let channel = &broker.stats().topics[0].channels[0];
+    let channel = &broker.stats().unwrap().topics[0].channels[0];
     assert_eq!(channel.ack_cursor, 1);
     assert_eq!(channel.message_count, 3);
     assert_eq!(
@@ -478,7 +486,10 @@ async fn protective_eviction_persists_channel_gap_and_audit_before_deleting() {
     drop(broker);
 
     let broker = Broker::open(config(root.path())).unwrap();
-    assert_eq!(broker.stats().topics[0].channels[0].message_count, 3);
+    assert_eq!(
+        broker.stats().unwrap().topics[0].channels[0].message_count,
+        3
+    );
     let next = broker
         .next_message("events", "workers", None)
         .await

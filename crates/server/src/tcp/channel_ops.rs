@@ -1,5 +1,6 @@
 use super::*;
 use futures::stream::{FuturesUnordered, StreamExt};
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -64,7 +65,14 @@ pub(super) struct ChannelOpCompletion {
 
 #[derive(Clone)]
 pub(super) struct ChannelOpSender {
-    sender: mpsc::UnboundedSender<ChannelOp>,
+    sender: mpsc::Sender<ChannelOp>,
+}
+
+pub(super) struct ChannelOps {
+    pub(super) sender: ChannelOpSender,
+    pub(super) results: mpsc::UnboundedReceiver<ChannelOpCompletion>,
+    pub(super) task: JoinHandle<()>,
+    pub(super) active: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl ChannelOpSender {
@@ -119,36 +127,41 @@ impl ChannelOpSender {
 
     fn send(&self, operation: ChannelOp) -> Result<(), BrokerError> {
         self.sender
-            .send(operation)
-            .map_err(|_| BrokerError::StorageUnavailable)
+            .try_send(operation)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => BrokerError::ChannelWorkerLimit,
+                mpsc::error::TrySendError::Closed(_) => BrokerError::StorageUnavailable,
+            })
     }
 }
 
-pub(super) fn start_channel_ops(
-    broker: Broker,
-) -> (
-    ChannelOpSender,
-    mpsc::UnboundedReceiver<ChannelOpCompletion>,
-    JoinHandle<()>,
-) {
+pub(super) fn start_channel_ops(broker: Broker, capacity: usize) -> ChannelOps {
     // The session admits at most one operation per in-flight message, and
     // in-flight messages are capped by max_rdy_count.
-    let (operation_tx, operation_rx) = mpsc::unbounded_channel();
+    let (operation_tx, operation_rx) = mpsc::channel(capacity.max(1));
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(run_channel_ops(broker, operation_rx, completion_tx));
-    (
-        ChannelOpSender {
+    let active = Arc::new(Mutex::new(HashSet::new()));
+    let task = tokio::spawn(run_channel_ops(
+        broker,
+        operation_rx,
+        completion_tx,
+        Arc::clone(&active),
+    ));
+    ChannelOps {
+        sender: ChannelOpSender {
             sender: operation_tx,
         },
-        completion_rx,
+        results: completion_rx,
         task,
-    )
+        active,
+    }
 }
 
 async fn run_channel_ops(
     broker: Broker,
-    mut operations: mpsc::UnboundedReceiver<ChannelOp>,
+    mut operations: mpsc::Receiver<ChannelOp>,
     completions: mpsc::UnboundedSender<ChannelOpCompletion>,
+    active: Arc<Mutex<HashSet<u64>>>,
 ) {
     let mut pending = FuturesUnordered::new();
     let mut receiving = true;
@@ -157,6 +170,7 @@ async fn run_channel_ops(
             operation = operations.recv(), if receiving && pending.len() < MAX_PENDING_CHANNEL_OPS => {
                 match operation {
                     Some(operation) => {
+                        active.lock().insert(operation.id());
                         let broker = broker.clone();
                         pending.push(execute_channel_op(broker, operation));
                     }
@@ -165,6 +179,7 @@ async fn run_channel_ops(
             }
             completion = pending.next(), if !pending.is_empty() => {
                 if let Some(completion) = completion {
+                    active.lock().remove(&completion.id);
                     let _ = completions.send(completion);
                 }
             }
@@ -231,7 +246,12 @@ mod tests {
             .unwrap();
         let (deliveries, mut guard) = batch.into_parts();
 
-        let (sender, mut completions, task) = start_channel_ops(broker.clone());
+        let ChannelOps {
+            sender,
+            results: mut completions,
+            task,
+            ..
+        } = start_channel_ops(broker.clone(), 32);
         for delivery in deliveries {
             let token = guard.accept_with_token(delivery.id).unwrap();
             sender
@@ -247,7 +267,7 @@ mod tests {
         }
         task.await.unwrap();
 
-        let stats = broker.stats().channel_group_commit;
+        let stats = broker.stats().unwrap().channel_group_commit;
         assert_eq!(completed, 32);
         assert_eq!(stats.requests, 32);
         assert!(stats.commits < stats.requests);

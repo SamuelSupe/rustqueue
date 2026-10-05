@@ -573,7 +573,7 @@ mod tests {
         };
         let (reader, _) = reader(1, 1);
         let lease = reader.retain(vec![payload]);
-        let budget = DeliveryBudget::new(2);
+        let budget = DeliveryBudget::new(2, 1);
         let hold = budget.acquire(1).await.unwrap();
         assert_eq!(budget.snapshot().in_flight_bytes, 2);
 

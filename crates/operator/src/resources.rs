@@ -356,6 +356,10 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
         "metadata": metadata(&proxy_name, "proxy"),
         "spec": {
             "selector": {"matchLabels": labels_for(&labels, "proxy")},
+            "updateStrategy": {
+                "type": "RollingUpdate",
+                "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}
+            },
             "template": {
                 "metadata": {"labels": labels_for(&labels, "proxy"), "annotations": {"rustqueue.io/revision": revision}},
                 "spec": {
@@ -852,6 +856,13 @@ mod tests {
                     && variable.value.as_deref() == Some("300")
             })));
         let proxy_value = serde_json::to_value(&resources.proxy).unwrap();
+        assert_eq!(
+            proxy_value["spec"]["updateStrategy"],
+            json!({
+                "type": "RollingUpdate",
+                "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1}
+            })
+        );
         assert_eq!(
             proxy_value["spec"]["template"]["spec"]["containers"][0]["livenessProbe"]["httpGet"]
                 ["path"],

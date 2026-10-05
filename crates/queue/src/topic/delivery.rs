@@ -19,6 +19,7 @@ impl Topic {
         max_messages: usize,
         max_bytes: usize,
         timeout: Duration,
+        budget: &crate::delivery_budget::DeliveryBudget,
     ) -> Result<ReserveBatch, BrokerError> {
         if self.manifest.deleted {
             return Err(BrokerError::TopicNotFound);
@@ -60,11 +61,16 @@ impl Topic {
                 channel.state.defer_candidate(position);
                 break;
             }
+            let Some(lease) = budget.try_reserve_message() else {
+                channel.state.defer_candidate(position);
+                break;
+            };
             let (token, attempts) = channel.state.reserve_timestamped(
                 position,
                 message.id,
                 message.timestamp_ns,
                 timeout,
+                Some(lease.clone()),
             );
             bytes = bytes.saturating_add(next_bytes);
             reserved.push(ReservedDelivery {
@@ -73,6 +79,7 @@ impl Topic {
                 timestamp_ns: message.timestamp_ns,
                 attempts,
                 token,
+                lease,
                 payload: message.payload.clone(),
             });
         }
@@ -264,7 +271,8 @@ impl Topic {
             .collect::<Result<_, _>>()?;
         let deadline = Instant::now() + timeout;
         for position in positions {
-            debug_assert!(channel.state.touch_until(position, deadline));
+            let touched = channel.state.touch_until(position, deadline);
+            debug_assert!(touched);
         }
         Ok(())
     }

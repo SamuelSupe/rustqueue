@@ -133,6 +133,10 @@ impl Config {
             &mut self.limits.node_delivery_inflight_bytes,
         )?;
         set_from_env(
+            "RUSTQUEUE_NODE_DELIVERY_INFLIGHT_MESSAGES",
+            &mut self.limits.node_delivery_inflight_messages,
+        )?;
+        set_from_env(
             "RUSTQUEUE_CONNECTION_DELIVERY_INFLIGHT_BYTES",
             &mut self.limits.connection_delivery_inflight_bytes,
         )?;

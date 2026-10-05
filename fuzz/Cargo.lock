@@ -2071,7 +2071,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-discovery"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2110,7 +2110,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-protocol"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "bytes",
  "serde",
@@ -2120,7 +2120,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-proxy"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-queue"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2160,7 +2160,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-storage"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "crc32c",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "rustqueue-telemetry"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "serde",
 ]

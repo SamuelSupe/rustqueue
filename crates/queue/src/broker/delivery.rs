@@ -135,6 +135,7 @@ impl Broker {
                     remaining_messages,
                     max_bytes.saturating_sub(batch.payload_bytes()).max(1),
                     timeout,
+                    &self.inner.delivery_budget,
                 )?;
                 let mut paths = match &action {
                     ReserveBatch::Ready(reserved) => reserved

@@ -422,6 +422,7 @@ kubectl wait --for=condition=Established crd/rustqueues.rustqueue.io --timeout=6
 kubectl wait --for=condition=Established crd/rustqueuetopics.rustqueue.io --timeout=60s
 kubectl wait --for=condition=Established crd/rustqueuechannels.rustqueue.io --timeout=60s
 helm upgrade --install "$RELEASE" "$CHART" \
+  --skip-crds \
   --namespace "$NAMESPACE" \
   --set-string operator.image.repository="${OPERATOR_IMAGE%:*}" \
   --set-string operator.image.tag="${OPERATOR_IMAGE##*:}" \
@@ -446,8 +447,10 @@ kubectl -n "$NAMESPACE" wait --for=condition=Ready pod/"$QUEUE-0" --timeout=180s
 PVC_BEFORE=$(kubectl -n "$NAMESPACE" get pvc -l app.kubernetes.io/instance="$QUEUE",app.kubernetes.io/component=broker -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}')
 [[ -n "$PVC_BEFORE" ]] || { echo "operator did not create the broker PVC" >&2; exit 1; }
 
-run_curl discovery-health -fsS "http://$QUEUE-discovery:4161/v1/health"
-run_curl proxy-health -fsS "http://$QUEUE-proxy:4151/v1/health"
+run_curl discovery-health -fsS --max-time 5 --retry 30 --retry-delay 1 \
+  --retry-max-time 60 --retry-connrefused "http://$QUEUE-discovery:4161/v1/health"
+run_curl proxy-health -fsS --max-time 5 --retry 30 --retry-delay 1 \
+  --retry-max-time 60 --retry-connrefused "http://$QUEUE-proxy:4151/v1/health"
 CONSOLE_SNAPSHOT=$(kubectl -n "$NAMESPACE" exec "$QUEUE-0" -c broker -- \
   curl -fsS "http://$QUEUE-console:4180/api/v1/snapshot")
 [[ "$(jq -r '.complete' <<<"$CONSOLE_SNAPSHOT")" == "true" ]] || {
@@ -546,6 +549,7 @@ kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
 wait_queue_ready 300
 kubectl -n "$NAMESPACE" rollout status deployment/"$QUEUE-discovery" --timeout=180s
 kubectl -n "$NAMESPACE" rollout status daemonset/"$QUEUE-proxy" --timeout=180s
-run_curl proxy-health-after-recovery -fsS "http://$QUEUE-proxy:4151/v1/health"
+run_curl proxy-health-after-recovery -fsS --max-time 5 --retry 30 --retry-delay 1 \
+  --retry-max-time 60 --retry-connrefused "http://$QUEUE-proxy:4151/v1/health"
 
 echo "OrbStack Kubernetes share-nothing v7 acceptance passed"

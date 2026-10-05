@@ -300,12 +300,44 @@ impl Topic {
     }
 
     fn recover_channels(&mut self) -> Result<(), BrokerError> {
+        let mut channel_next = 1u64;
         for path in checkpoint_paths(&self.directory.join("channels"))? {
-            let (state, store) = ChannelStore::open(&path, self.max_ack_gap)?;
+            let (mut state, store) = ChannelStore::open(&path, self.max_ack_gap)?;
             if state.ephemeral {
                 store.remove()?;
                 continue;
             }
+            // Fence recorded positions before removing lost relaxed entries.
+            let recorded_last = state.recovered_position_high_watermark();
+            channel_next = channel_next.max(recorded_last.checked_add(1).ok_or_else(|| {
+                BrokerError::InvalidRecord("channel position range is exhausted".into())
+            })?);
+            let last = recorded_last.max(self.manifest.next_position.saturating_sub(1));
+            state.set_absent_ranges(Arc::from(self.messages.position_gaps(last)));
+            let mut page_key = None;
+            let mut metadata_page = Vec::new();
+            state.compact_recovered_dpubs(|position| match self.messages.lookup(position) {
+                index::Lookup::Found(message) => Ok(Some(message.available_at_ms)),
+                index::Lookup::Absent => Ok(None),
+                index::Lookup::Load(request) => {
+                    if page_key.as_ref() != Some(&request.key) {
+                        metadata_page = recovery::read_page(
+                            &request.metadata,
+                            request.first_ordinal,
+                            request.count,
+                        )?;
+                        page_key = Some(request.key);
+                    }
+                    let ordinal = metadata_page
+                        .binary_search_by_key(&position, |message| message.position)
+                        .map_err(|_| {
+                            BrokerError::InvalidRecord(
+                                "recovered channel metadata position is missing".into(),
+                            )
+                        })?;
+                    Ok(Some(metadata_page[ordinal].available_at_ms))
+                }
+            })?;
             let name = state.name.clone();
             if self.channels.contains_key(&name) {
                 return Err(BrokerError::InvalidRecord(format!(
@@ -325,16 +357,6 @@ impl Topic {
             .messages
             .last_position()
             .map_or(1, |position| position.saturating_add(1));
-        let channel_next = self
-            .channels
-            .values()
-            .map(|channel| channel.state.recovered_position_high_watermark())
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| {
-                BrokerError::InvalidRecord("channel position range is exhausted".into())
-            })?;
         if self.manifest.next_position < channel_next {
             self.manifest.next_position = channel_next;
             store_atomic(&self.manifest_path, &self.manifest)?;
@@ -480,6 +502,11 @@ impl Topic {
         self.messages.active_count()
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_metadata_allocated_bytes(&self) -> usize {
+        self.messages.active_metadata_allocated_bytes()
+    }
+
     fn persist_segment_index(&mut self, path: &Path) -> Result<(), BrokerError> {
         let (_first_index, _last_index) = self
             .log
@@ -570,7 +597,6 @@ impl Topic {
                 self.persist_channel(&channel, ChannelCommand::Evict { through_position })?;
             }
         }
-        self.messages.discard_scheduled_through(through_position);
         Ok(())
     }
 
@@ -720,16 +746,21 @@ impl Topic {
 
     pub fn channel_counts(&mut self, channel: &str) -> Result<(u64, u64, u64), BrokerError> {
         let now_ms = now_ms();
-        let scheduled = self.messages.deferred_positions(now_ms);
         let last_position = self.deliverable_position;
         let channel = self
             .channels
             .get(channel)
             .ok_or(BrokerError::ChannelNotFound)?;
+        let mut scheduled = 0u64;
+        self.messages
+            .for_each_deferred_range(now_ms, last_position, |first, last| {
+                scheduled = scheduled
+                    .saturating_add(channel.state.scheduled_count_in_range(first, last, now_ms));
+            })?;
         let (depth, in_flight, deferred, _) =
             channel
                 .state
-                .metric_counts(last_position, &scheduled, now_ms);
+                .metric_counts(last_position, scheduled, now_ms);
         Ok((depth, in_flight, deferred))
     }
 

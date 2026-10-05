@@ -18,6 +18,8 @@ NODE_KEEPER=""
 STORAGE_CLASS=""
 STORAGE_CLASS_CREATED=0
 CONSOLE_FORWARD_PID=""
+ROLLOUT_WATCH_PID=""
+ROLLOUT_WATCH_FILE=""
 
 source "$(dirname "$0")/lib/console-multi-owner.sh"
 source "$(dirname "$0")/lib/token-rotation.sh"
@@ -32,6 +34,7 @@ diagnostics() {
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=operator --tail=300 || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=console --tail=300 || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=discovery --tail=300 || true
+  kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=proxy --tail=300 --prefix || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=broker --tail=300 --prefix || true
   kubectl -n "$NAMESPACE" logs default-lookup-bootstrap --tail=300 || true
   kubectl -n "$NAMESPACE" logs operational-ledger --tail=300 || true
@@ -39,6 +42,13 @@ diagnostics() {
 
 cleanup() {
     code=$?
+    if [[ -n "$ROLLOUT_WATCH_PID" ]]; then
+      kill "$ROLLOUT_WATCH_PID" >/dev/null 2>&1 || true
+      wait "$ROLLOUT_WATCH_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$ROLLOUT_WATCH_FILE" ]]; then
+      rm -f "$ROLLOUT_WATCH_FILE"
+    fi
     if [[ -n "$CONSOLE_FORWARD_PID" ]]; then
       kill "$CONSOLE_FORWARD_PID" >/dev/null 2>&1 || true
       wait "$CONSOLE_FORWARD_PID" 2>/dev/null || true
@@ -373,6 +383,7 @@ kubectl create namespace "$NAMESPACE" >/dev/null
   kubectl wait --for=condition=Established crd/rustqueuetopics.rustqueue.io --timeout=60s
   kubectl wait --for=condition=Established crd/rustqueuechannels.rustqueue.io --timeout=60s
 helm upgrade --install "$RELEASE" "$CHART" \
+  --skip-crds \
   --namespace "$NAMESPACE" \
   --set-string operator.image.repository="${OPERATOR_IMAGE%:*}" \
   --set-string operator.image.tag="${OPERATOR_IMAGE##*:}" \
@@ -505,19 +516,32 @@ kubectl -n "$NAMESPACE" delete pod "$leader" --wait=false >/dev/null
 wait_operator_failover "$leader" 90
 wait_queue_phase RolloutAwaitingApproval 30
 approved_revision=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.currentOperation.revision}')
-kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
-  -p "{\"spec\":{\"rollout\":{\"approvedRevision\":\"$approved_revision\"}}}" >/dev/null
+ROLLOUT_WATCH_FILE=$(mktemp)
+kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" --watch \
+  -o 'jsonpath={.status.phase}{"\n"}' >"$ROLLOUT_WATCH_FILE" &
+ROLLOUT_WATCH_PID=$!
+deadline=$((SECONDS + 30))
+while [[ ! -s "$ROLLOUT_WATCH_FILE" ]] && (( SECONDS < deadline )); do sleep .1; done
+[[ -s "$ROLLOUT_WATCH_FILE" ]] || { echo "rollout phase watch did not start" >&2; exit 1; }
+approval_generation=$(kubectl -n "$NAMESPACE" patch rustqueue "$QUEUE" --type=merge \
+  -p "{\"spec\":{\"rollout\":{\"approvedRevision\":\"$approved_revision\"}}}" \
+  -o json | jq -r '.metadata.generation')
 
 saw_rolling=0
 deadline=$((SECONDS + 420))
 while (( SECONDS < deadline )); do
-  phase=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-  observed=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.status.observedGeneration}' 2>/dev/null || true)
-  generation=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
-  [[ "$phase" == "Rolling" ]] && saw_rolling=1
-  if [[ "$phase" == "Ready" && "$observed" == "$generation" ]]; then break; fi
+  rollout_status=$(kubectl -n "$NAMESPACE" get rustqueue "$QUEUE" -o json 2>/dev/null | \
+    jq -r '[.status.phase, .status.observedGeneration] | @tsv' || true)
+  read -r phase observed <<<"$rollout_status"
+  grep -q '^Rolling$' "$ROLLOUT_WATCH_FILE" && saw_rolling=1
+  if [[ "$phase" == "Ready" && "$observed" == "$approval_generation" && "$saw_rolling" == 1 ]]; then break; fi
   sleep 2
 done
+kill "$ROLLOUT_WATCH_PID" >/dev/null 2>&1 || true
+wait "$ROLLOUT_WATCH_PID" 2>/dev/null || true
+ROLLOUT_WATCH_PID=""
+printf 'Observed rollout phases:\n'
+cat "$ROLLOUT_WATCH_FILE"
 [[ "$saw_rolling" == "1" && "$phase" == "Ready" ]] || {
   echo "operator did not complete a visible multi-broker rolling replacement" >&2
   exit 1

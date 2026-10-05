@@ -24,6 +24,26 @@ serialized, and reservation stops at a durable position that advances only
 after the sync succeeds. Existing durable messages can therefore continue to
 flow while the next group waits for its acknowledged-durability boundary.
 
+Delivery admission has a second, node-wide bound for in-flight message count.
+`limits.node_delivery_inflight_messages` defaults to 262,144 and is passed to
+`BrokerConfig.delivery_inflight_messages`; set
+`RUSTQUEUE_NODE_DELIVERY_INFLIGHT_MESSAGES` to override it. This slot budget is
+separate from the 512 MiB node-wide payload working-set budget: it covers the
+queue reservation and consumer-session metadata for unacknowledged messages,
+and a slot returns only after both holders release it. Empty messages consume a
+slot as well. When the count reaches its limit, later reservations pause, so
+throughput under saturation depends on the configured capacity and how long
+consumers retain their deliveries. FIN/REQ
+completion, timeout, cancellation or disconnect cleanup, and TTL cleanup
+release slots according to that lifecycle. The slot count is visible in
+`delivery_budget.in_flight_messages` and as the Prometheus gauge
+`rustqueue_delivery_inflight_messages`.
+
+TCP command processing and response writes have a bounded progress timeout.
+After a command completes, the peer receives a fresh heartbeat idle window;
+time spent waiting on Broker work or response I/O does not consume that window.
+Idle peers and blocked writes still time out.
+
 ## Material differences from NSQ
 
 | Area | NSQ v1.3.0 | RustQueue | Performance consequence |

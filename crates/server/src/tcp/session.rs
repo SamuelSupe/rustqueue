@@ -77,7 +77,16 @@ pub(super) async fn run_session(
     let mut last_command = Instant::now();
     let mut pending_fetch: Option<PendingFetch<'_>> = None;
     let mut subscription_policy_changes = None;
-    let (channel_ops, mut channel_op_results, channel_ops_task) = start_channel_ops(broker.clone());
+    let capacity = usize::try_from(config.limits.max_rdy_count)
+        .unwrap_or(usize::MAX)
+        .min(config.limits.node_delivery_inflight_messages);
+    let ChannelOps {
+        sender: channel_ops,
+        results: mut channel_op_results,
+        task: channel_ops_task,
+        active: active_channel_ops,
+    } = start_channel_ops(broker.clone(), capacity);
+    let _channel_ops_task = AbortOnDrop(channel_ops_task.abort_handle());
 
     let session_result: anyhow::Result<()> = async {
         loop {
@@ -162,7 +171,6 @@ pub(super) async fn run_session(
                     .await?;
                     continue;
                 }
-                last_command = Instant::now();
                 let progress_timeout = connection_progress_timeout(state.heartbeat);
                 let keep_open = tokio::time::timeout(
                     progress_timeout,
@@ -182,6 +190,9 @@ pub(super) async fn run_session(
                 )
                 .await
                 .map_err(|_| anyhow::anyhow!("client command timed out"))??;
+                // Broker work and response I/O must not consume the peer's
+                // heartbeat window before it can react to the response.
+                last_command = Instant::now();
                 if !keep_open {
                     break;
                 }
@@ -264,7 +275,6 @@ pub(super) async fn run_session(
                         write_error_timed(&mut writer, state.heartbeat, "E_CLOSING", "node is shutting down").await?;
                         continue;
                     }
-                    last_command = Instant::now();
                     let progress_timeout = connection_progress_timeout(state.heartbeat);
                     let keep_open = tokio::time::timeout(
                         progress_timeout,
@@ -284,6 +294,7 @@ pub(super) async fn run_session(
                     )
                     .await
                     .map_err(|_| anyhow::anyhow!("client command timed out"))??;
+                    last_command = Instant::now();
                     if !keep_open {
                         break;
                     }
@@ -440,10 +451,10 @@ pub(super) async fn run_session(
                                         InFlightDelivery {
                                             deadline,
                                             token,
+                                            _lease: delivery_guard.accept_with_lease(delivery.id).map(|(_, lease)| lease),
                                         },
                                     );
                                     state.mark_channel_operation_pending(delivery.id);
-                                    delivery_guard.accept(delivery.id);
                                     continue;
                                 }
                                 let header = encode_message_header(
@@ -464,8 +475,8 @@ pub(super) async fn run_session(
                                     &mut policy_changes,
                                 )
                                 .await?;
-                                let accepted_token = delivery_guard
-                                    .accept_with_token(delivery.id)
+                                let (accepted_token, lease) = delivery_guard
+                                    .accept_with_lease(delivery.id)
                                     .ok_or_else(|| anyhow::anyhow!("delivery token is missing"))?;
                                 debug_assert_eq!(accepted_token, token);
                                 let mut delivery_deadline = handoff_deadline;
@@ -478,6 +489,7 @@ pub(super) async fn run_session(
                                     InFlightDelivery {
                                         deadline: delivery_deadline,
                                         token,
+                                        _lease: Some(lease),
                                     },
                                 );
                                 handed_off.push((delivery.id, token));
@@ -497,7 +509,7 @@ pub(super) async fn run_session(
                                     )
                                     .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                                 for (id, token) in handed_off {
-                                    if let Some(delivery) = state.in_flight.get(&id).copied() {
+                                    if let Some(delivery) = state.in_flight.get(&id).cloned() {
                                         debug_assert_eq!(delivery.token, token);
                                         state.record_delivery(
                                             id,
@@ -586,8 +598,10 @@ pub(super) async fn run_session(
     // the matching delivery tokens.
     drop(pending_fetch.take());
     if let Some(subscription) = &state.subscription {
+        // Only active futures may have reached the durable worker. Operations
+        // still in the session queue cannot commit after the task is aborted.
         let deliveries =
-            releaseable_in_flight_deliveries(state.in_flight, &state.pending_channel_ops);
+            releaseable_in_flight_deliveries(state.in_flight, &active_channel_ops.lock());
         if !deliveries.is_empty() {
             broker.release_deliveries(&subscription.topic, &subscription.channel, &deliveries);
         }
@@ -798,9 +812,15 @@ async fn wait_for_in_flight_deadline(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustqueue_queue::BrokerConfig;
+    use tempfile::tempdir;
 
     fn delivery(deadline: Instant, token: u64) -> InFlightDelivery {
-        InFlightDelivery { deadline, token }
+        InFlightDelivery {
+            deadline,
+            token,
+            _lease: None,
+        }
     }
 
     fn session_state() -> SessionState {
@@ -824,6 +844,75 @@ mod tests {
             pending_channel_ops: HashSet::new(),
             closing: false,
             client_identity: ClientIdentity::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_command_response_does_not_consume_the_client_heartbeat_window() {
+        for initial_command in [true, false] {
+            let root = tempdir().unwrap();
+            let broker = Broker::open(BrokerConfig {
+                data_path: root.path().into(),
+                ..BrokerConfig::default()
+            })
+            .unwrap();
+            let heartbeat = Duration::from_millis(100);
+            let mut state = session_state();
+            state.heartbeat = Some(heartbeat);
+            let command = ParsedCommand {
+                command: Command::Publish {
+                    topic: "events".into(),
+                },
+                body: Some(Bytes::from_static(b"body")),
+                publish_reservation: None,
+            };
+            let (mut peer, server) = tokio::io::duplex(1);
+            let task = tokio::spawn(async move {
+                run_session(
+                    Box::new(server),
+                    initial_command.then_some(command),
+                    "127.0.0.1:10000".parse().unwrap(),
+                    &Config::default(),
+                    &broker,
+                    &Metrics::default(),
+                    None,
+                    EphemeralConsumers::default(),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(PublishAdmission::new(1024, Arc::new(Metrics::default()))),
+                    Arc::new(ConnectionBudget::new(1024)),
+                    SubscriptionRegistry::default(),
+                    state,
+                )
+                .await
+            });
+            if !initial_command {
+                peer.write_all(b"PUB events\n\0\0\0\x04body").await.unwrap();
+            }
+            let mut response = [0u8; 10];
+            peer.read_exact(&mut response[..1]).await.unwrap();
+            tokio::time::sleep(heartbeat * 3).await;
+            peer.read_exact(&mut response[1..]).await.unwrap();
+            assert_eq!(response.as_slice(), encode_frame(FrameType::Response, OK));
+
+            let mut length = [0u8; 4];
+            tokio::time::timeout(heartbeat * 3, peer.read_exact(&mut length))
+                .await
+                .unwrap()
+                .expect("completed response must leave time to answer a heartbeat");
+            let mut frame = vec![0u8; u32::from_be_bytes(length) as usize];
+            peer.read_exact(&mut frame).await.unwrap();
+            assert_eq!(&frame[4..], HEARTBEAT);
+
+            // An unresponsive peer must still be evicted after the response.
+            let drain = async {
+                let mut remaining = Vec::new();
+                peer.read_to_end(&mut remaining).await.unwrap();
+                task.await.unwrap().unwrap();
+            };
+            tokio::time::timeout(Duration::from_secs(2), drain)
+                .await
+                .expect("heartbeat timeout must still bound an idle connection");
         }
     }
 
@@ -910,16 +999,122 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unresolved_channel_operations_are_not_released_on_disconnect() {
-        let now = Instant::now();
-        let in_flight = HashMap::from([(7, delivery(now, 70)), (8, delivery(now, 80))]);
-        let pending = HashSet::from([7]);
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_finish_and_requeue_are_released_and_redelivered_on_disconnect() {
+        let root = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig {
+            data_path: root.path().into(),
+            ..BrokerConfig::default()
+        })
+        .unwrap();
+        broker.create_channel("events", "workers").await.unwrap();
+        broker
+            .publish(
+                "events",
+                vec![b"first".to_vec(), b"second".to_vec()],
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
 
+        let message_timeout = Duration::from_secs(15 * 60);
+        let batch = broker
+            .fetch_batch_retained(
+                "events",
+                "workers",
+                2,
+                usize::MAX,
+                Duration::ZERO,
+                Some(message_timeout),
+            )
+            .await
+            .unwrap();
+        let (deliveries, mut guard) = batch.into_parts();
+        assert_eq!(deliveries.len(), 2);
+        let expected = deliveries
+            .iter()
+            .map(|delivery| (delivery.id, delivery.body.clone()))
+            .collect::<Vec<_>>();
+
+        let mut state = session_state();
+        state.message_timeout = message_timeout;
+        let mut operations = Vec::with_capacity(deliveries.len());
+        for delivery in deliveries {
+            let (token, lease) = guard.accept_with_lease(delivery.id).unwrap();
+            state.record_delivery(
+                delivery.id,
+                InFlightDelivery {
+                    deadline: Instant::now() + message_timeout,
+                    token,
+                    _lease: Some(lease),
+                },
+            );
+            state.mark_channel_operation_pending(delivery.id);
+            operations.push((delivery.id, token));
+        }
+        drop(guard);
+
+        let ChannelOps {
+            sender,
+            task,
+            active,
+            ..
+        } = start_channel_ops(broker.clone(), operations.len());
+        sender
+            .finish(
+                "events".into(),
+                "workers".into(),
+                operations[0].0,
+                operations[0].1,
+            )
+            .unwrap();
+        sender
+            .requeue(
+                "events".into(),
+                "workers".into(),
+                operations[1].0,
+                operations[1].1,
+                Duration::ZERO,
+            )
+            .unwrap();
+        assert!(active.lock().is_empty());
+        drop(sender);
+        task.abort();
+        let _ = task.await;
+
+        let active = active.lock().clone();
+        let releaseable =
+            releaseable_in_flight_deliveries(std::mem::take(&mut state.in_flight), &active);
         assert_eq!(
-            releaseable_in_flight_deliveries(in_flight, &pending),
-            vec![(8, 80)]
+            releaseable,
+            operations
+                .iter()
+                .map(|(id, token)| (*id, *token))
+                .collect::<Vec<_>>()
         );
+        broker.release_deliveries("events", "workers", &releaseable);
+        drop(state);
+
+        let redelivery = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.fetch_batch_retained(
+                "events",
+                "workers",
+                2,
+                usize::MAX,
+                Duration::ZERO,
+                Some(Duration::ZERO),
+            ),
+        )
+        .await
+        .expect("released deliveries should be immediately fetchable")
+        .unwrap();
+        let (redeliveries, _redelivery_guard) = redelivery.into_parts();
+        let actual = redeliveries
+            .iter()
+            .map(|delivery| (delivery.id, delivery.body.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     #[test]

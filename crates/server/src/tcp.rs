@@ -123,10 +123,11 @@ struct RemoteDelivery {
     ttl_discard: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct InFlightDelivery {
     deadline: Instant,
     token: u64,
+    _lease: Option<rustqueue_queue::DeliveryLease>,
 }
 
 struct SessionState {
@@ -173,17 +174,17 @@ impl SessionState {
         if self.pending_channel_ops.contains(&id) {
             return None;
         }
-        self.in_flight.get(&id).copied()
+        self.in_flight.get(&id).cloned()
     }
 
     fn record_delivery(&mut self, id: u64, delivery: InFlightDelivery) {
+        let deadline = (delivery.deadline, id, delivery.token);
         if let Some(previous) = self.in_flight.insert(id, delivery) {
             self.in_flight_deadlines
                 .remove(&(previous.deadline, id, previous.token));
         }
         if !self.pending_channel_ops.contains(&id) {
-            self.in_flight_deadlines
-                .insert((delivery.deadline, id, delivery.token));
+            self.in_flight_deadlines.insert(deadline);
         }
     }
 

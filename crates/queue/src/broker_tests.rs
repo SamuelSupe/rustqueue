@@ -181,7 +181,7 @@ async fn queued_publish_rechecks_storage_health_before_append() {
         Err(BrokerError::StorageUnavailable)
     ));
     assert_eq!(
-        broker.filtered_stats(Some("events"), None).topics[0].message_count,
+        broker.filtered_stats(Some("events"), None).unwrap().topics[0].message_count,
         0
     );
 }
@@ -208,7 +208,7 @@ async fn write_ack_hides_the_unsynced_tail_until_flush() {
         )
         .await
         .unwrap();
-    let stats = broker.filtered_stats(Some("events"), None);
+    let stats = broker.filtered_stats(Some("events"), None).unwrap();
     assert_eq!(stats.topics[0].last_durable_position, 0);
     assert_eq!(stats.topics[0].unsynced_messages, 1);
     assert!(stats.topics[0].unsynced_bytes > 0);
@@ -226,7 +226,7 @@ async fn write_ack_hides_the_unsynced_tail_until_flush() {
         .unwrap();
     assert_eq!(delivery.id, ids[0]);
     assert_eq!(&*delivery.body, b"pending");
-    let stats = broker.filtered_stats(Some("events"), None);
+    let stats = broker.filtered_stats(Some("events"), None).unwrap();
     assert_eq!(stats.topics[0].last_durable_position, 1);
     assert_eq!(stats.topics[0].unsynced_messages, 0);
     assert_eq!(stats.topics[0].unsynced_bytes, 0);
@@ -254,7 +254,7 @@ async fn nsq_relaxed_exposes_the_unsynced_tail_immediately() {
         )
         .await
         .unwrap();
-    let stats = broker.filtered_stats(Some("events"), None);
+    let stats = broker.filtered_stats(Some("events"), None).unwrap();
     assert_eq!(stats.topics[0].last_durable_position, 0);
     assert_eq!(stats.topics[0].unsynced_messages, 1);
     let delivery = broker
@@ -303,7 +303,7 @@ async fn write_ack_timer_makes_the_tail_durable_and_visible() {
         .unwrap();
     assert_eq!(&*delivery.body, b"timer");
     assert_eq!(
-        broker.filtered_stats(Some("events"), None).topics[0].unsynced_messages,
+        broker.filtered_stats(Some("events"), None).unwrap().topics[0].unsynced_messages,
         0
     );
 }
@@ -580,7 +580,7 @@ async fn blocked_dlq_target_does_not_prevent_broker_restart() {
             .count(),
         1
     );
-    let stats = broker.stats();
+    let stats = broker.stats().unwrap();
     let source = stats
         .topics
         .iter()
@@ -630,7 +630,7 @@ async fn startup_does_not_replay_outbox_before_required_fence_sync() {
             .count(),
         1
     );
-    let stats = broker.stats();
+    let stats = broker.stats().unwrap();
     let source = stats
         .topics
         .iter()
@@ -677,7 +677,7 @@ async fn concurrent_dlq_moves_publish_only_one_copy() {
         1
     );
 
-    let stats = broker.stats();
+    let stats = broker.stats().unwrap();
     let source = stats
         .topics
         .iter()
@@ -727,7 +727,7 @@ async fn cancelled_dlq_move_keeps_the_transaction_serialized_until_completion() 
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let stats = broker.stats();
+            let stats = broker.stats().unwrap();
             let source_depth = stats
                 .topics
                 .iter()
@@ -762,6 +762,7 @@ async fn cancelled_dlq_move_keeps_the_transaction_serialized_until_completion() 
     assert_eq!(
         broker
             .stats()
+            .unwrap()
             .topics
             .iter()
             .find(|topic| topic.name == "events.workers.DLQ")
@@ -816,6 +817,7 @@ async fn completed_dlq_outbox_is_not_published_again_after_restart() {
     assert!(!outbox_path.exists());
     let target = broker
         .stats()
+        .unwrap()
         .topics
         .into_iter()
         .find(|topic| topic.name == target)
@@ -860,6 +862,7 @@ async fn dlq_outbox_recovers_when_the_source_was_removed() {
     );
     let target = broker
         .stats()
+        .unwrap()
         .topics
         .into_iter()
         .find(|topic| topic.name == target)
@@ -887,7 +890,7 @@ async fn stats_settle_expired_in_flight_messages_without_another_fetch() {
         .is_some());
 
     broker.expire_in_flight().await.unwrap();
-    let stats = broker.stats();
+    let stats = broker.stats().unwrap();
     let channel = &stats.topics[0].channels[0];
     assert_eq!(channel.in_flight_count, 0);
     assert_eq!(channel.timeout_count, 1);
@@ -953,17 +956,87 @@ async fn stale_delivery_token_cannot_mutate_a_redelivery() {
         Err(BrokerError::MessageNotInFlight)
     ));
     broker.release_deliveries("events", "workers", &[(id, stale_token)]);
-    assert_eq!(broker.stats().topics[0].channels[0].in_flight_count, 1);
+    assert_eq!(
+        broker.stats().unwrap().topics[0].channels[0].in_flight_count,
+        1
+    );
 
     broker
         .finish_delivery("events", "workers", id, current_token)
         .await
         .unwrap();
-    assert_eq!(broker.stats().topics[0].channels[0].depth, 0);
+    assert_eq!(broker.stats().unwrap().topics[0].channels[0].depth, 0);
 }
 
 #[tokio::test]
-async fn current_delivery_tokens_can_renew_an_expiring_batch() {
+async fn channel_recreation_rejects_old_tokens_and_guard_cancellation() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        bootstrap_retention: Duration::from_secs(90),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "anchor").await.unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"body".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+
+    let old_batch = broker
+        .fetch_batch_retained("events", "workers", 1, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (old_messages, old_guard) = old_batch.into_parts();
+    let id = old_messages[0].id;
+    let old_token = old_guard.token(id).unwrap();
+    drop(old_messages);
+
+    broker.delete_channel("events", "workers").await.unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+
+    let new_batch = broker
+        .fetch_batch_retained("events", "workers", 1, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (new_messages, new_guard) = new_batch.into_parts();
+    assert_eq!(new_messages[0].id, id);
+    let new_token = new_guard.token(id).unwrap();
+    assert_ne!(old_token, new_token);
+
+    assert!(matches!(
+        broker
+            .finish_delivery("events", "workers", id, old_token)
+            .await,
+        Err(BrokerError::MessageNotInFlight)
+    ));
+
+    drop(old_guard);
+    let stats = broker
+        .filtered_stats(Some("events"), Some("workers"))
+        .unwrap();
+    let workers = &stats.topics[0].channels[0];
+    assert_eq!(workers.in_flight_count, 1);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 1);
+
+    broker
+        .finish_delivery("events", "workers", id, new_token)
+        .await
+        .unwrap();
+    let stats = broker
+        .filtered_stats(Some("events"), Some("workers"))
+        .unwrap();
+    let workers = &stats.topics[0].channels[0];
+    assert_eq!((workers.depth, workers.in_flight_count), (0, 0));
+
+    drop(new_messages);
+    drop(new_guard);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 0);
+}
+
+#[tokio::test]
+async fn batch_touch_extends_delivery_deadlines_before_redelivery() {
     let root = tempdir().unwrap();
     let broker = Broker::open(BrokerConfig {
         data_path: root.path().into(),
@@ -987,7 +1060,7 @@ async fn current_delivery_tokens_can_renew_an_expiring_batch() {
             2,
             usize::MAX,
             Duration::ZERO,
-            Some(Duration::ZERO),
+            Some(Duration::from_millis(100)),
         )
         .await
         .unwrap();
@@ -997,23 +1070,198 @@ async fn current_delivery_tokens_can_renew_an_expiring_batch() {
         .map(|delivery| (delivery.id, guard.token(delivery.id).unwrap()))
         .collect();
     broker
-        .touch_deliveries("events", "workers", &tokens, Some(Duration::from_secs(30)))
+        .touch_deliveries("events", "workers", &tokens, Some(Duration::from_secs(2)))
         .unwrap();
     for (id, token) in &tokens {
         assert_eq!(guard.accept_with_token(*id), Some(*token));
     }
 
-    broker
-        .expire_channel_in_flight("events", "workers")
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before_new_deadline = broker
+        .fetch_batch("events", "workers", 2, usize::MAX, Duration::ZERO, None)
         .await
         .unwrap();
-    assert_eq!(broker.stats().topics[0].channels[0].in_flight_count, 2);
-    for (id, token) in tokens {
+    assert!(before_new_deadline.is_empty());
+    assert_eq!(
+        broker.stats().unwrap().topics[0].channels[0].in_flight_count,
+        2
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let redeliveries = broker
+        .fetch_batch("events", "workers", 2, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(redeliveries.len(), 2);
+    assert_eq!(
+        redeliveries
+            .iter()
+            .map(|delivery| delivery.id)
+            .collect::<HashSet<_>>(),
+        tokens.iter().map(|(id, _)| *id).collect::<HashSet<_>>()
+    );
+    for delivery in redeliveries {
         broker
-            .finish_delivery("events", "workers", id, token)
+            .finish("events", "workers", delivery.id)
             .await
             .unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_message_budget_is_shared_and_released_after_fetch_lifecycle() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        max_message_bytes: 32,
+        delivery_inflight_bytes: 64,
+        delivery_inflight_messages: 2,
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "alpha").await.unwrap();
+    broker.create_channel("other", "beta").await.unwrap();
+    broker
+        .publish("events", vec![vec![0x5a; 32]], Duration::ZERO)
+        .await
+        .unwrap();
+
+    // The public publish contract rejects an empty body, but a zero-length
+    // persisted payload is still a valid storage shape. Keep this path in the
+    // broker-level lease regression because it has no byte-budget hold.
+    let empty_id = {
+        let id = broker.reserve_ids(1).unwrap();
+        let mut metadata = broker.reserve_message_metadata(1).unwrap();
+        let handle = broker.topic("events").unwrap();
+        let _commit_gate = handle.commit_gate.lock();
+        let mut state = handle.state.lock();
+        let bodies = [bytes::Bytes::new()];
+        let batch = crate::batch::encode(state.next_position(), id, &bodies).unwrap();
+        state
+            .append_batch(id, now_ns(), now_ms(), batch, true, &mut metadata)
+            .unwrap()[0]
+    };
+    broker
+        .publish(
+            "other",
+            vec![vec![0x6b; 16], vec![0x6c; 16]],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+    let first = broker
+        .fetch_batch_retained("events", "alpha", 1, 32, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (first_messages, first_guard) = first.into_parts();
+    assert_eq!(first_messages.len(), 1);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 1);
+    assert_eq!(broker.delivery_budget_stats().in_flight_bytes, 64);
+
+    let pending_fetch = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            broker
+                .fetch_batch_retained("other", "beta", 1, 32, Duration::ZERO, None)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while {
+            let stats = broker.delivery_budget_stats();
+            stats.waiters == 0 || stats.in_flight_messages != 2
+        } {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second topic must reserve a message before waiting on bytes");
+    pending_fetch.abort();
+    let join_error = pending_fetch
+        .await
+        .err()
+        .expect("the pending fetch must be cancelled");
+    assert!(join_error.is_cancelled());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while broker.delivery_budget_stats().in_flight_messages != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelling a fetch must release its message reservation");
+    assert_eq!(broker.delivery_budget_stats().in_flight_bytes, 64);
+
+    drop(first_messages);
+    drop(first_guard);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 0);
+    assert_eq!(broker.delivery_budget_stats().in_flight_bytes, 0);
+
+    let second = broker
+        .fetch_batch_retained("events", "alpha", 2, 32, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (second_messages, mut second_guard) = second.into_parts();
+    assert_eq!(second_messages.len(), 2);
+    assert!(second_messages
+        .iter()
+        .any(|delivery| delivery.id == empty_id && delivery.body.is_empty()));
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 2);
+
+    let (empty_token, empty_lease) = second_guard
+        .accept_with_lease(empty_id)
+        .expect("the zero-length delivery must carry a consumer lease");
+    drop(second_messages);
+    broker
+        .finish_delivery("events", "alpha", empty_id, empty_token)
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.delivery_budget_stats().in_flight_messages,
+        2,
+        "FIN cannot release the consumer-owned lease"
+    );
+    drop(second_guard);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 1);
+    assert_eq!(broker.delivery_budget_stats().in_flight_bytes, 0);
+
+    let other = broker
+        .fetch_batch_retained("other", "beta", 2, 32, Duration::ZERO, None)
+        .await
+        .unwrap();
+    let (other_messages, mut other_guard) = other.into_parts();
+    assert_eq!(
+        other_messages.len(),
+        1,
+        "the node-wide message budget leaves one slot while FIN's lease is held"
+    );
+    let other_id = other_messages[0].id;
+    let (other_token, other_lease) = other_guard.accept_with_lease(other_id).unwrap();
+    drop(other_messages);
+    drop(other_guard);
+    broker
+        .requeue_delivery("other", "beta", other_id, other_token, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        broker.delivery_budget_stats().in_flight_messages,
+        2,
+        "REQ cannot release the consumer-owned lease"
+    );
+    drop(other_lease);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 1);
+
+    drop(empty_lease);
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 0);
+    let recovered = broker
+        .fetch_batch("other", "beta", 2, 32, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 2);
+    for delivery in recovered {
+        broker.finish("other", "beta", delivery.id).await.unwrap();
+    }
+    assert_eq!(broker.delivery_budget_stats().in_flight_messages, 0);
 }
 
 #[tokio::test]
@@ -1058,14 +1306,14 @@ async fn kodo_channel_counters_are_monotonic_across_empty_and_restart() {
         .await
         .unwrap();
 
-    let channel = &broker.stats().topics[0].channels[0];
+    let channel = &broker.stats().unwrap().topics[0].channels[0];
     assert_eq!(channel.message_count, 3);
     assert_eq!(channel.requeue_count, 1);
     assert_eq!(channel.timeout_count, 1);
     drop(broker);
 
     let reopened = Broker::open(config).unwrap();
-    let channel = &reopened.stats().topics[0].channels[0];
+    let channel = &reopened.stats().unwrap().topics[0].channels[0];
     assert_eq!(channel.message_count, 3);
     assert_eq!(channel.requeue_count, 1);
     assert_eq!(channel.timeout_count, 1);
@@ -1086,7 +1334,7 @@ async fn durable_batch_accepts_the_full_protocol_message_count() {
         .unwrap();
     assert_eq!(ids.len(), rustqueue_protocol::MAX_MPUB_MESSAGES);
     assert_eq!(
-        broker.stats().topics[0].published_count,
+        broker.stats().unwrap().topics[0].published_count,
         rustqueue_protocol::MAX_MPUB_MESSAGES as u64
     );
 }
@@ -1299,14 +1547,14 @@ async fn concurrent_publishes_share_a_durable_group_commit() {
         .collect();
     assert_eq!(ids.len(), 32);
 
-    let commit = broker.stats().publish_group_commit;
+    let commit = broker.stats().unwrap().publish_group_commit;
     assert_eq!(commit.requests, 32);
     assert!(commit.commits < commit.requests);
     assert!(commit.max_batch_requests > 1);
     drop(broker);
 
     let broker = Broker::open(config).unwrap();
-    assert_eq!(broker.stats().topics[0].message_count, 32);
+    assert_eq!(broker.stats().unwrap().topics[0].message_count, 32);
 }
 
 #[tokio::test]
@@ -1353,7 +1601,7 @@ async fn concurrent_fin_and_req_share_a_durable_group_commit() {
     for result in join_all(commands).await {
         result.unwrap();
     }
-    let commit = broker.stats().channel_group_commit;
+    let commit = broker.stats().unwrap().channel_group_commit;
     assert_eq!(commit.requests, 16);
     assert!(commit.commits < commit.requests);
     assert!(commit.max_batch_requests > 1);
@@ -1399,7 +1647,7 @@ async fn idle_publish_workers_retire_and_capacity_is_reusable() {
         .publish("second", vec![b"two".to_vec()], Duration::ZERO)
         .await
         .unwrap();
-    let stats = broker.stats().publish_group_commit;
+    let stats = broker.stats().unwrap().publish_group_commit;
     assert!(stats.retired_workers >= 1);
     assert_eq!(stats.rejected_workers, 1);
     assert!(stats.active_workers <= 1);
@@ -1472,7 +1720,7 @@ async fn sealed_backlog_uses_bounded_metadata_residency() {
     broker.compact().await.unwrap();
     let handle = broker.topic("events").unwrap();
     let (active, sealed) = handle.state.lock().index_residency();
-    assert_eq!(broker.stats().topics[0].message_count, 3_264);
+    assert_eq!(broker.stats().unwrap().topics[0].message_count, 3_264);
     assert!(sealed >= 100);
     assert!(
         active <= 64,
@@ -1483,7 +1731,7 @@ async fn sealed_backlog_uses_bounded_metadata_residency() {
     let broker = Broker::open(config).unwrap();
     let handle = broker.topic("events").unwrap();
     let (active, sealed) = handle.state.lock().index_residency();
-    assert_eq!(broker.stats().topics[0].message_count, 3_264);
+    assert_eq!(broker.stats().unwrap().topics[0].message_count, 3_264);
     assert!(sealed >= 100);
     assert!(active <= 64);
     let deliveries = broker
@@ -1520,7 +1768,7 @@ async fn idle_gc_does_not_seal_a_channel_blocked_active_segment() {
     for _ in 0..4 {
         assert_eq!(broker.compact().await.unwrap(), 0);
     }
-    let stats = broker.stats();
+    let stats = broker.stats().unwrap();
     assert_eq!(stats.topics[0].segment_count, 1);
     assert_eq!(stats.topics[0].message_count, 1);
 }
@@ -1531,6 +1779,7 @@ async fn deferred_stats_are_exact_without_a_consumer_and_after_restart() {
     let config = BrokerConfig {
         data_path: root.path().into(),
         max_ack_gap: 2,
+        bootstrap_retention: Duration::from_nanos(1),
         ..BrokerConfig::default()
     };
     let broker = Broker::open(config.clone()).unwrap();
@@ -1551,13 +1800,134 @@ async fn deferred_stats_are_exact_without_a_consumer_and_after_restart() {
         )
         .await
         .unwrap();
-    let channel = &broker.stats().topics[0].channels[0];
+    let channel = &broker.stats().unwrap().topics[0].channels[0];
     assert_eq!((channel.depth, channel.deferred_count), (4, 1));
+    broker
+        .topic("events")
+        .unwrap()
+        .state
+        .lock()
+        .spill_message_metadata()
+        .unwrap();
+    broker.create_channel("events", "tail").await.unwrap();
+    broker
+        .publish(
+            "events",
+            vec![b"tail-deferred".to_vec()],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    let ready = broker
+        .publish("events", vec![b"tail-ready".to_vec()], Duration::ZERO)
+        .await
+        .unwrap()[0];
+    broker
+        .topic("events")
+        .unwrap()
+        .state
+        .lock()
+        .spill_message_metadata()
+        .unwrap();
+    let stats = broker
+        .filtered_stats(Some("events"), Some("workers"))
+        .unwrap();
+    assert_eq!(
+        (
+            stats.topics[0].channels[0].depth,
+            stats.topics[0].channels[0].deferred_count
+        ),
+        (6, 2)
+    );
+    let deliveries = broker
+        .fetch_batch("events", "workers", 8, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 2);
+    broker
+        .finish("events", "workers", deliveries[1].id)
+        .await
+        .unwrap();
+    let tail = broker
+        .fetch_batch("events", "tail", 8, usize::MAX, Duration::ZERO, None)
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].id, ready);
+    let stats = broker.filtered_stats(Some("events"), Some("tail")).unwrap();
+    assert_eq!(
+        (
+            stats.topics[0].channels[0].in_flight_count,
+            stats.topics[0].channels[0].deferred_count
+        ),
+        (1, 1)
+    );
+    broker
+        .requeue("events", "tail", ready, Duration::from_secs(60))
+        .await
+        .unwrap();
     drop(broker);
 
     let reopened = Broker::open(config).unwrap();
-    let channel = &reopened.stats().topics[0].channels[0];
-    assert_eq!((channel.depth, channel.deferred_count), (4, 1));
+    let workers = reopened
+        .filtered_stats(Some("events"), Some("workers"))
+        .unwrap();
+    assert_eq!(
+        (
+            workers.topics[0].channels[0].depth,
+            workers.topics[0].channels[0].deferred_count
+        ),
+        (5, 2)
+    );
+    let tail = reopened
+        .filtered_stats(Some("events"), Some("tail"))
+        .unwrap();
+    assert_eq!(
+        (
+            tail.topics[0].channels[0].depth,
+            tail.topics[0].channels[0].deferred_count
+        ),
+        (2, 2)
+    );
+}
+
+#[tokio::test]
+async fn deferred_stats_integrity_failure_is_reported_and_isolates_storage() {
+    let root = tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig {
+        data_path: root.path().into(),
+        ..BrokerConfig::default()
+    })
+    .unwrap();
+    broker.create_channel("events", "workers").await.unwrap();
+    broker
+        .publish("events", vec![b"ready".to_vec()], Duration::ZERO)
+        .await
+        .unwrap();
+    broker
+        .publish("events", vec![b"delayed".to_vec()], Duration::from_secs(60))
+        .await
+        .unwrap();
+    let handle = broker.topic("events").unwrap();
+    handle.state.lock().spill_message_metadata().unwrap();
+    let index = std::fs::read_dir(
+        root.path()
+            .join("topics")
+            .join(hex::encode("events"))
+            .join("segments"),
+    )
+    .unwrap()
+    .map(|entry| entry.unwrap().path())
+    .find(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "rqidx")
+    })
+    .unwrap();
+    let mut bytes = std::fs::read(&index).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&index, bytes).unwrap();
+    assert!(matches!(broker.stats(), Err(BrokerError::InvalidRecord(_))));
+    assert!(!broker.storage_healthy());
 }
 
 #[tokio::test]
@@ -1577,9 +1947,12 @@ async fn deferred_stats_promote_messages_when_the_deadline_passes() {
         )
         .await
         .unwrap();
-    assert_eq!(broker.stats().topics[0].channels[0].deferred_count, 1);
+    assert_eq!(
+        broker.stats().unwrap().topics[0].channels[0].deferred_count,
+        1
+    );
     tokio::time::sleep(Duration::from_millis(40)).await;
-    let channel = &broker.stats().topics[0].channels[0];
+    let channel = &broker.stats().unwrap().topics[0].channels[0];
     assert_eq!((channel.depth, channel.deferred_count), (1, 0));
 }
 
@@ -1614,6 +1987,7 @@ async fn bounded_gc_rotates_across_topics() {
     assert_eq!(
         broker
             .stats()
+            .unwrap()
             .topics
             .iter()
             .map(|topic| topic.message_count)
@@ -1624,6 +1998,7 @@ async fn bounded_gc_rotates_across_topics() {
     assert_eq!(
         broker
             .stats()
+            .unwrap()
             .topics
             .iter()
             .map(|topic| topic.message_count)
@@ -1655,7 +2030,7 @@ async fn delivery_budget_bounds_slow_consumers_and_cancellation_releases_reserva
         .unwrap();
     let (alpha_messages, alpha_hold) = alpha.into_parts();
     assert_eq!(alpha_messages.len(), 1);
-    assert_eq!(broker.stats().delivery_budget.in_flight_bytes, 64);
+    assert_eq!(broker.stats().unwrap().delivery_budget.in_flight_bytes, 64);
 
     let blocked = tokio::time::timeout(
         Duration::from_millis(20),
@@ -1663,8 +2038,8 @@ async fn delivery_budget_bounds_slow_consumers_and_cancellation_releases_reserva
     )
     .await;
     assert!(blocked.is_err());
-    assert_eq!(broker.stats().delivery_budget.waiters, 0);
-    assert!(broker.stats().delivery_budget.waits_total >= 1);
+    assert_eq!(broker.stats().unwrap().delivery_budget.waiters, 0);
+    assert!(broker.stats().unwrap().delivery_budget.waits_total >= 1);
 
     drop(alpha_messages);
     drop(alpha_hold);
@@ -1676,7 +2051,7 @@ async fn delivery_budget_bounds_slow_consumers_and_cancellation_releases_reserva
     assert_eq!(beta_messages.len(), 1);
     drop(beta_messages);
     drop(beta_hold);
-    assert_eq!(broker.stats().delivery_budget.in_flight_bytes, 0);
+    assert_eq!(broker.stats().unwrap().delivery_budget.in_flight_bytes, 0);
 }
 
 #[tokio::test]
@@ -1763,6 +2138,7 @@ async fn broker_metadata_budget_spills_active_tails_across_topics() {
     assert_eq!(
         broker
             .stats()
+            .unwrap()
             .topics
             .iter()
             .map(|topic| topic.message_count)
@@ -1770,12 +2146,25 @@ async fn broker_metadata_budget_spills_active_tails_across_topics() {
         3_200
     );
     assert!(broker.inner.message_index_cache.resident_bytes() <= 64 * 1024);
+    let active_metadata_allocations: usize = broker
+        .inner
+        .topics
+        .read()
+        .values()
+        .map(|topic| topic.state.lock().active_metadata_allocated_bytes())
+        .sum();
+    assert!(
+        active_metadata_allocations <= config.message_index_cache_bytes,
+        "active metadata buffers retain {active_metadata_allocations} bytes with a {} byte budget",
+        config.message_index_cache_bytes,
+    );
     drop(broker);
 
     let broker = Broker::open(config).unwrap();
     assert_eq!(
         broker
             .stats()
+            .unwrap()
             .topics
             .iter()
             .map(|topic| topic.message_count)
@@ -1804,7 +2193,7 @@ async fn metadata_spill_wakes_a_write_ack_consumer() {
         .await
         .unwrap();
     assert_eq!(
-        broker.filtered_stats(Some("events"), None).topics[0].unsynced_messages,
+        broker.filtered_stats(Some("events"), None).unwrap().topics[0].unsynced_messages,
         64
     );
 
@@ -1828,7 +2217,9 @@ async fn metadata_spill_wakes_a_write_ack_consumer() {
         .publish("other", vec![vec![2u8]; 1_024], Duration::ZERO)
         .await
         .unwrap();
-    let stats = broker.filtered_stats(Some("events"), Some("workers"));
+    let stats = broker
+        .filtered_stats(Some("events"), Some("workers"))
+        .unwrap();
     assert_eq!(stats.topics[0].unsynced_messages, 0);
     assert_eq!(stats.topics[0].last_durable_position, 64);
     assert_eq!(stats.topics[0].channels[0].depth, 64);
@@ -1871,6 +2262,7 @@ async fn concurrent_publishes_wait_for_metadata_spill_instead_of_rejecting() {
     assert_eq!(
         broker
             .stats()
+            .unwrap()
             .topics
             .iter()
             .map(|topic| topic.message_count)
@@ -1969,7 +2361,7 @@ async fn waiting_fetch_rechecks_channel_fence_before_reserving() {
             .unwrap(),
         Err(BrokerError::ChannelTombstoned)
     ));
-    let channel = &broker.stats().topics[0].channels[0];
+    let channel = &broker.stats().unwrap().topics[0].channels[0];
     assert_eq!(channel.depth, 1);
     assert_eq!(channel.in_flight_count, 0);
 }
@@ -2330,7 +2722,7 @@ async fn management_rejects_stale_registry_revisions() {
             actual
         } if expected == stale && actual == created.revision
     ));
-    assert!(!broker.stats().topics[0].paused);
+    assert!(!broker.stats().unwrap().topics[0].paused);
 }
 
 #[tokio::test]
@@ -2872,7 +3264,7 @@ async fn ttl_discard_removes_unrouted_backlog_across_restart() {
         .await
         .unwrap()
         .is_empty());
-    let topic = &broker.stats().topics[0];
+    let topic = &broker.stats().unwrap().topics[0];
     assert_eq!(topic.message_count, 0);
     assert_eq!(topic.ttl_discarded_messages, 1);
 }
@@ -2902,7 +3294,7 @@ async fn ttl_policy_changes_apply_to_backlog_without_reviving_expired_messages()
         )
         .await
         .unwrap();
-    assert_eq!(broker.stats().topics[0].message_count, 1);
+    assert_eq!(broker.stats().unwrap().topics[0].message_count, 1);
 
     broker
         .configure_topic_policy(
@@ -2955,7 +3347,7 @@ async fn ttl_policy_changes_apply_to_backlog_without_reviving_expired_messages()
         .await
         .unwrap()
         .is_none());
-    assert_eq!(broker.stats().topics[0].ttl_discarded_messages, 1);
+    assert_eq!(broker.stats().unwrap().topics[0].ttl_discarded_messages, 1);
 }
 
 #[tokio::test]
@@ -3098,7 +3490,7 @@ async fn ttl_discard_evicts_durable_ephemeral_deferred_requeued_and_in_flight_st
         .await
         .unwrap()
         .remove(0);
-    assert!(broker.stats().topics[0]
+    assert!(broker.stats().unwrap().topics[0]
         .channels
         .iter()
         .any(|channel| channel.deferred_count > 0));
@@ -3106,7 +3498,7 @@ async fn ttl_discard_evicts_durable_ephemeral_deferred_requeued_and_in_flight_st
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     while !broker.expire_due_topics(128).await.unwrap().is_empty() {}
 
-    let topic = &broker.stats().topics[0];
+    let topic = &broker.stats().unwrap().topics[0];
     assert_eq!(topic.message_count, 0);
     assert_eq!(topic.ttl_discarded_messages, 3);
     assert!(topic.channels.iter().all(|channel| {

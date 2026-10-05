@@ -11,14 +11,14 @@
 [NSQ performance boundaries](docs/architecture/nsq-performance.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.10.0 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.0)
+[v0.10.1 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.1)
 
-RustQueue 0.10.0 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.10.1 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.10.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.0).
+> Current release: [v0.10.1](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.1).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -45,7 +45,13 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.10.0
+## What's new in 0.10.1
+
+This patch fixes delayed-message memory growth, legacy checkpoint recovery,
+slow-consumer metadata budgets, heartbeat timing, recovery status, TLS CLI
+startup, and producer-proxy rollout continuity. The optional WebSocket live
+subscription introduced in 0.10.0 remains default-off.
+
 
 - **TTL live WebSocket subscriptions.** The default-off WebSocket endpoint
   streams only existing `TTL_DISCARD` Topics. It is a best-effort feed with no
@@ -59,29 +65,29 @@ your workload before deploying to production.
   capability, while NSQ TCP/HTTP publishing, ACK modes, storage format v7 and
   existing `RELIABLE` behavior remain unchanged.
 
-See the [v0.10.0 release notes](docs/releases/v0.10.0.md) and [NSQ performance
+See the [v0.10.1 release notes](docs/releases/v0.10.1.md) and [NSQ performance
 boundaries](docs/architecture/nsq-performance.md) for the contract and
 benchmark interpretation.
 
-## Download 0.10.0
+## Download 0.10.1
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.10.0-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.10.0-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.10.0-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.10.0.tgz` | Helm Chart |
-| `SHA256SUMS-0.10.0` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.10.1-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.10.1-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.10.1-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.10.1.tgz` | Helm Chart |
+| `SHA256SUMS-0.10.1` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.0/rustqueue-0.10.0-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.0/SHA256SUMS-0.10.0"
-sha256sum --check --ignore-missing SHA256SUMS-0.10.0
-tar -xzf "rustqueue-0.10.0-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.1/rustqueue-0.10.1-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.1/SHA256SUMS-0.10.1"
+sha256sum --check --ignore-missing SHA256SUMS-0.10.1
+tar -xzf "rustqueue-0.10.1-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -144,7 +150,15 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   buffer, and admission charges the input plus bounded encoding metadata.
 - Backlog has no message-count ceiling. Sealed segments keep only constant-size
   summaries in RAM; fixed-size message metadata is paged through one bounded
-  Broker cache. Publish admission is therefore governed by the configured PVC
+  Broker cache. Sealing a segment releases unused message-metadata and record-
+  location buffer capacity before returning its cache budget, so cold Topics
+  do not retain buffers from their former active tails. Consumer scans retain
+  one rewind position and wakeup time per Channel for future DPUB messages,
+  instead of copying every skipped deadline into Channel requeue state.
+  Recovery compacts legacy DPUB scan entries against bounded metadata pages,
+  preserving explicit REQ targets and lost-position fences. Explicit client
+  REQ deadlines remain durable. Publish admission is
+  governed by the configured PVC
   watermarks, not by an arbitrary number of messages.
 - GC locates retention boundaries by monotonic indexes instead of rescanning a
   full backlog every five seconds. A normal tick rotates across at most 128
@@ -152,9 +166,17 @@ operator -> eligible nodes -> StatefulSet ordinal + retained RWO PVC
   reclaimable. Scrub snapshots immutable files under the Topic lock, then
   verifies them lock-free with a default 64 MiB/s I/O limit.
 - Slow consumers share a 512 MiB node-wide delivery working-set budget; each
-  connection can request at most 32 MiB of payload. Cache misses charge both the
-  file-read buffer and delivered body before I/O, and cancelled reads return
-  their memory permits and in-flight reservations.
+  connection can request at most 32 MiB of payload. A separate node-wide
+  in-flight message budget defaults to 262,144 slots
+  (`limits.node_delivery_inflight_messages`) and can be overridden with
+  `RUSTQUEUE_NODE_DELIVERY_INFLIGHT_MESSAGES`. Each reserved message consumes
+  one slot, including an empty message. A slot returns only after both the
+  queue reservation and consumer-session unacknowledged metadata are released;
+  FIN/REQ completion, timeout, cancellation, disconnect, and TTL cleanup
+  release their respective holds. At the limit, later reservations
+  pause until a slot is released. Cache misses charge both the file-read buffer
+  and delivered body before I/O, and cancelled reads return their memory
+  permits and in-flight reservations.
 
 ## Components
 
@@ -337,6 +359,10 @@ This covers official Go and Python clients across direct publishing and
 consumption, lookup, MPUB, DPUB, REQ, TOUCH, RDY, fan-out, sampling,
 ephemeral channels, Snappy, Deflate, TLS, mTLS and external AUTH.
 
+TCP command processing and response writes have a bounded progress timeout.
+Their elapsed time does not consume the client's heartbeat idle window, which
+restarts when the command completes. Idle clients and blocked writes still time out.
+
 ## Kubernetes
 
 ### Standard deployment
@@ -354,7 +380,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.10.0 \
+  --set queue.image=registry.example/rustqueue:0.10.1 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -389,6 +415,9 @@ required hostname anti-affinity. The profile therefore needs three schedulable
 nodes. Each Gateway requests one CPU and 768 MiB, is not CPU-limited, and is
 limited to 1 GiB memory so its fixed 512 MiB in-flight body budget is
 scheduler-backed.
+Custom Kodo Gateway configurations must reserve at least 136 MiB of ingress
+budget: a 128 MiB MPUB body plus 8 MiB of bounded per-message parsing metadata.
+The standard profile's 512 MiB budget already includes this working set.
 The reviewed Kodo source enforces an application maximum of 104857500 bytes
 (100 MiB minus 100 bytes) and sets the go-nsq producer write deadline to three
 seconds. A maximum-size publish therefore needs more than roughly 34 MiB/s of
@@ -548,6 +577,10 @@ the exact target and stage; the last 20 replaced operations remain in
 
 Examples using a locally built `rustqueuectl`:
 
+Kubernetes connection failures return an error and a nonzero exit status.
+`stats` and `scrub` also contact Broker Pod IPs directly, so run them where the
+Pod network is reachable.
+
 ```sh
 rustqueuectl --namespace rustqueue status
 rustqueuectl --namespace rustqueue brokers
@@ -591,7 +624,25 @@ test-only direct Pod placement; production anti-affinity is unchanged. A unit
 fixture covers discovery indexing for 500 brokers. No 500-broker deployment or
 load test is part of the functional gate.
 
-The v0.10.0 CI/CD workflow publishes a Release only after the non-Kubernetes
+For a long-running message ledger, run the Go client in `tests/soak` with the
+Discovery HTTP endpoint and direct Broker TCP endpoints. It creates the new
+Topic's subscriptions directly before waiting for Discovery to index them, so
+startup does not depend on a producer publishing first. For example, with
+three locally exposed Brokers:
+
+```sh
+cd tests/soak
+go run . -lookup localhost:4161 \
+  -tcp localhost:4150,localhost:5150,localhost:6150 -duration 24h -rate 10
+```
+
+The client retains message IDs until the final report, so its memory grows with
+the duration and rate. A low rate bounds that client cost and validates
+long-term integrity; it does not qualify saturation throughput. Inspect the
+report's duplicates, publish errors and unconfirmed deliveries as well as its
+exit status, missing messages and final Broker backlog.
+
+The v0.10.1 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one
@@ -678,8 +729,10 @@ queueing, publish and channel ACK, payload reads, scrub/GC, proxy backend
 calls, and discovery registry polling. Queue aggregates have fixed cardinality
 by default; `[metrics].detailed_queue_metrics` enables bounded
 per-topic/channel series up to `max_detailed_series`.
-Delivery-budget bytes, waiters and cumulative waits are exported as bounded
-aggregate gauges/counters.
+Delivery-budget bytes, in-flight message slots, waiters and cumulative waits are
+exported as bounded aggregate gauges/counters. Native observation includes
+`delivery_budget.in_flight_messages`, and Prometheus exports the slot count as
+`rustqueue_delivery_inflight_messages`.
 `rustqueue_ttl_discarded_messages_total` is label-free. When detailed queue
 metrics are enabled, `rustqueue_topic_ttl_discarded_messages_total` uses the
 same global series budget as the other per-Topic metrics.
@@ -736,11 +789,19 @@ The on-disk layout is:
 ```
 
 Tail short writes are truncated during startup. Sealed segments reopen from an
-atomic recovery index by reading its CRC-protected fixed header and first/last
-queue entries; individual metadata entries carry their own CRC and are paged on
-demand. Full sidecar checksums run in background scrub, so startup is O(segment
-count), not O(message count). Missing or invalid indexes fall back to a full
-segment scan.
+atomic recovery index. Storage record locations use a CRC-protected fixed header;
+queue metadata is validated in bounded pages to recover message ranges and the
+minimum/maximum delivery deadline for each segment. This scans sealed queue
+metadata at startup, but does not retain per-message delayed indexes or read
+sealed payloads. Individual metadata entries carry their own CRC and delivery
+loads pages on demand. Full sidecar checksums run in background scrub. Missing or
+invalid indexes fall back to a full segment scan.
+Delayed backlog statistics use these segment deadline summaries and read bounded
+metadata pages for mixed deadlines. They do not copy a backlog-sized position
+set. The Rust `Broker::stats`, `filtered_stats`, and `metrics_stats` APIs return
+`Result`; metadata read or integrity failures return an error and isolate storage
+rather than report partial counters. HTTP statistics and metrics return an error
+response on such failures; successful response schemas are unchanged.
 Cold payload corruption is isolated by payload-read CRC or background scrub.
 Automatic scrub and normal GC start after a configurable 30-second quiet period
 so a large PVC can become Ready without immediately competing with maintenance

@@ -41,6 +41,10 @@ The interface follows the browser language and operating-system theme on first
 use. Both can be overridden from the header and are stored locally in the
 browser. Chinese and English are supported.
 
+Below the 1056px desktop breakpoint, navigation starts closed and the header
+menu button opens it. Selecting a page, clicking the overlay or pressing Escape
+inside navigation closes it so the page can use the full viewport width.
+
 ## Live trends
 
 The backend polls a lightweight runtime/revision head every two seconds and

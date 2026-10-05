@@ -154,7 +154,7 @@ async fn fetch_observation(
     fences: &rustqueue_queue::ManagementFenceSnapshot,
     fence_revision: &str,
 ) -> Result<CachedObservation> {
-    let origin = format!("http://{}:{port}", broker.pod_ip);
+    let origin = broker.http_origin(port);
     let head_response = http
         .get(format!("{origin}/v1/observe/head"))
         .bearer_auth(token)
@@ -251,6 +251,52 @@ fn requires_full(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use serde_json::{json, Value};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    struct FakeBroker {
+        requests: AsyncMutex<Vec<&'static str>>,
+        synced_fences: AsyncMutex<Vec<rustqueue_queue::ManagementFenceSnapshot>>,
+        head: BrokerObservationHead,
+        observation: BrokerObservation,
+    }
+
+    fn head_json(head: &BrokerObservationHead) -> Value {
+        json!({
+            "schema_version": head.schema_version,
+            "collected_at_ms": head.collected_at_ms,
+            "registry_revision": head.registry_revision,
+            "node": &head.node,
+            "readiness": &head.readiness,
+            "disk": &head.disk,
+            "runtime": &head.runtime,
+            "delivery_budget": &head.delivery_budget,
+            "limits": &head.limits,
+        })
+    }
+
+    async fn fake_head(State(state): State<Arc<FakeBroker>>) -> Json<Value> {
+        state.requests.lock().await.push("head");
+        Json(head_json(&state.head))
+    }
+
+    async fn fake_observation(State(state): State<Arc<FakeBroker>>) -> Json<BrokerObservation> {
+        state.requests.lock().await.push("full");
+        Json(state.observation.clone())
+    }
+
+    async fn fake_fence_sync(
+        State(state): State<Arc<FakeBroker>>,
+        Json(fences): Json<rustqueue_queue::ManagementFenceSnapshot>,
+    ) -> StatusCode {
+        state.requests.lock().await.push("fence_sync");
+        state.synced_fences.lock().await.push(fences);
+        StatusCode::NO_CONTENT
+    }
 
     fn fixture() -> (BrokerView, BrokerObservationHead, CachedObservation) {
         let broker = BrokerView {
@@ -321,5 +367,93 @@ mod tests {
         assert!(requires_fence_sync(Some(&cached), &broker, "fence-1"));
         assert!(requires_fence_sync(Some(&cached), &broker, "fence-2"));
         assert!(requires_fence_sync(None, &broker, "fence-1"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_fetch_observation_runs_head_full_and_fence_sync_requests() {
+        let mut head = BrokerObservationHead {
+            schema_version: 1,
+            collected_at_ms: 11,
+            registry_revision: 4,
+            ..Default::default()
+        };
+        head.node.version = "0.8.1".into();
+        let mut observation = BrokerObservation {
+            schema_version: 1,
+            collected_at_ms: 22,
+            registry_revision: 4,
+            ..Default::default()
+        };
+        observation.node.version = "0.8.1".into();
+        let state = Arc::new(FakeBroker {
+            requests: AsyncMutex::new(Vec::new()),
+            synced_fences: AsyncMutex::new(Vec::new()),
+            head,
+            observation,
+        });
+        let app = Router::new()
+            .route("/v1/observe/head", get(fake_head))
+            .route("/v1/observe", get(fake_observation))
+            .route("/v1/manage/fences/sync", post(fake_fence_sync))
+            .with_state(Arc::clone(&state));
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let broker = BrokerView {
+            uid: "pod-1".into(),
+            name: "queue-0".into(),
+            pod_ip: "::1".into(),
+            ..Default::default()
+        };
+        let fences = rustqueue_queue::ManagementFenceSnapshot {
+            revision: "fence-1".into(),
+            ..Default::default()
+        };
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let cached = fetch_observation(
+            &broker,
+            None,
+            &http,
+            "console-token",
+            port,
+            true,
+            std::time::Duration::from_secs(30),
+            &fences,
+            "fence-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cached.observation.collected_at_ms, 22);
+
+        let merged = fetch_observation(
+            &broker,
+            Some(cached),
+            &http,
+            "console-token",
+            port,
+            true,
+            std::time::Duration::from_secs(30),
+            &fences,
+            "fence-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.observation.collected_at_ms, 11);
+
+        assert_eq!(
+            state.requests.lock().await.as_slice(),
+            ["head", "fence_sync", "full", "head"]
+        );
+        assert_eq!(state.synced_fences.lock().await.as_slice(), [fences]);
+
+        server.abort();
+        let _ = server.await;
     }
 }

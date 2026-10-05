@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         payload_read_workers: config.storage.payload_read_workers,
         payload_read_queue: config.storage.payload_read_queue,
         delivery_inflight_bytes: config.limits.node_delivery_inflight_bytes,
+        delivery_inflight_messages: config.limits.node_delivery_inflight_messages,
         scrub_bytes_per_second: config.storage.scrub_bytes_per_second,
         storage_feature_level: config.storage.feature_level,
         require_management_fence_sync: config.security.console_management_enabled,
