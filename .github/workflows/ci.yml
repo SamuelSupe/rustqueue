@@ -179,6 +179,14 @@ jobs:
               --notes-file "$notes"
             gh release upload "$RELEASE_TAG" "${assets[@]}"
           fi
+          published_artifacts=$(mktemp -d)
+          trap 'rm -rf "$published_artifacts"' EXIT
+          gh release download "$RELEASE_TAG" --dir "$published_artifacts"
+          cmp "release/SHA256SUMS-$version" "$published_artifacts/SHA256SUMS-$version"
+          (
+            cd "$published_artifacts"
+            sha256sum --check "SHA256SUMS-$version"
+          )
           gh release edit "$RELEASE_TAG" \
             --title "RustQueue $version" \
             --notes-file "$notes" \
