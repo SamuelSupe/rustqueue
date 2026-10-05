@@ -83,6 +83,24 @@ Track `rustqueue_publish_unsynced_messages`,
 `rustqueue_publish_unsynced_bytes`, and
 `rustqueue_publish_sync_lag_seconds` alongside throughput and ACK latency.
 
+## Release qualification
+
+Release comparisons use `scripts/benchmark-qualify.sh`. OrbStack remains the
+default environment. When shared host paging prevents calibration, the
+`performance-qualification` GitHub workflow uses a fresh Linux runner and
+records that environment separately. It first runs two interleaved pairs of
+the exact same Broker image in all three profiles, with 30 seconds of warmup
+and 120 seconds of measurement. Each profile must stay within 5 percent
+throughput spread and 10 percent PUB-ACK p99 spread before the ten-pair
+baseline/candidate comparison runs. Broker and load generator each receive
+two CPUs and 2 GiB with swap disabled. Delivery integrity and complete-drain
+checks remain required; calibration failure stops comparison.
+
+The workflow runs when its definition or the qualification script changes in
+a PR, and can also be dispatched with an explicit published baseline tag.
+Its artifacts contain raw measurements, source commits, binary hashes,
+environment details, calibration and the existing regression verdict.
+
 ## Next candidates to measure before changing semantics
 
 1. Profile Channel WAL `FIN`/`REQ` commit time against reservation latency;

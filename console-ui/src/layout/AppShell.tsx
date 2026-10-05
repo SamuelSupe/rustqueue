@@ -10,6 +10,7 @@ import {
 } from '@carbon/react';
 import { Dashboard, DataBase, Language, Moon, Renew, ServerProxy, Settings, StoragePool, Task, Sun } from '@carbon/icons-react';
 import { useState, type ReactNode } from 'react';
+import { version } from '../../package.json';
 import { useI18n } from '../i18n';
 
 export type Page = 'overview' | 'brokers' | 'topics' | 'storage' | 'operations' | 'configuration';
@@ -81,7 +82,7 @@ export function AppShell({ page, onPage, dark, onTheme, onRefresh, children }: {
             onClick={(event) => { event.preventDefault(); onPage(item.id); setNavigationOpen(false); }}
           >{t(`nav.${item.id}`)}</SideNavLink>)}
         </SideNavItems>
-        <div className="sidenav-foot"><span>{t('app.readOnly')}</span><small>v0.10.0</small></div>
+        <div className="sidenav-foot"><span>{t('app.readOnly')}</span><small>v{version}</small></div>
       </SideNav>
       <main id="main-content" className="main-content">{children}</main>
     </div>

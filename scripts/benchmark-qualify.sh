@@ -14,6 +14,8 @@ DRAIN_TIMEOUT_SECONDS="${DRAIN_TIMEOUT_SECONDS:-1800}"
 CASES="${CASES:-raw_write sustainable low_load_latency}"
 QUALIFICATION_DEV="${QUALIFICATION_DEV:-0}"
 KEEP_IMAGES="${KEEP_IMAGES:-0}"
+CALIBRATION_ONLY="${CALIBRATION_ONLY:-0}"
+QUALIFICATION_ENVIRONMENT="${QUALIFICATION_ENVIRONMENT:-orbstack}"
 RESULT_ROOT="$ROOT/benchmarks/results"
 EVIDENCE_OUTPUT="${EVIDENCE_OUTPUT:-$ROOT/benchmarks/qualifications/v0.8.4-orbstack.json}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -100,7 +102,14 @@ done
 
 docker_context="$(docker context show)"
 docker_os="$(docker info --format '{{.OperatingSystem}}')"
-if [[ "$docker_context" != "orbstack" && "$docker_os" != *OrbStack* ]]; then
+platform="OrbStack on macOS"
+if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
+  [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
+    die "github_actions qualification requires a GitHub-hosted runner"
+  platform="GitHub Actions on Linux"
+elif [[ "$QUALIFICATION_ENVIRONMENT" != orbstack ]]; then
+  die "unknown qualification environment $QUALIFICATION_ENVIRONMENT"
+elif [[ "$docker_context" != "orbstack" && "$docker_os" != *OrbStack* ]]; then
   die "Docker must use OrbStack (context=$docker_context, os=$docker_os)"
 fi
 
@@ -108,7 +117,15 @@ baseline_commit="$(git -C "$ROOT" rev-parse --verify "$BASELINE_REF^{commit}")"
 candidate_commit="$(git -C "$ROOT" rev-parse --verify "$CANDIDATE_REF^{commit}")"
 BASELINE_TARGET="$TARGET_ROOT/$baseline_commit"
 CANDIDATE_TARGET="$TARGET_ROOT/$candidate_commit"
-if [[ "$QUALIFICATION_DEV" == 0 ]]; then
+if [[ "$CALIBRATION_ONLY" == 1 ]]; then
+  [[ "$baseline_commit" == "$candidate_commit" ]] || die "A/A requires the same source commit"
+  [[ "$PAIRS" == 2 && "$WARMUP_SECONDS" == 30 && "$MEASUREMENT_SECONDS" == 120 \
+    && "$DRAIN_TIMEOUT_SECONDS" == 1800 \
+    && "$CASES" == "raw_write sustainable low_load_latency" ]] ||
+    die "A/A requires all three profiles, two pairs, 30s warmup, 120s measurement and full drain"
+elif [[ "$CALIBRATION_ONLY" != 0 ]]; then
+  die "CALIBRATION_ONLY must be 0 or 1"
+elif [[ "$QUALIFICATION_DEV" == 0 ]]; then
   [[ "$BASELINE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
     die "baseline reference must be a version tag"
   tag_commit="$(git -C "$ROOT" rev-parse --verify "refs/tags/$BASELINE_REF^{commit}")"
@@ -158,6 +175,7 @@ baseline_version="$(read_workspace_version "$BASELINE_SOURCE")"
 candidate_version="$(read_workspace_version "$CANDIDATE_SOURCE")"
 if [[ "$QUALIFICATION_DEV" == 0 ]]; then
   expected_baseline_version="${BASELINE_REF#v}"
+  [[ "$CALIBRATION_ONLY" != 1 ]] || expected_baseline_version="$RELEASE"
   [[ "$baseline_version" == "$expected_baseline_version" ]] ||
     die "baseline workspace version is $baseline_version, expected $expected_baseline_version"
   [[ "$candidate_version" == "$RELEASE" ]] ||
@@ -183,6 +201,7 @@ build_release() {
   done
   docker run --rm \
     -e RUSTUP_TOOLCHAIN=1.88.0 \
+    -e CARGO_BUILD_JOBS=2 \
     -e CARGO_INCREMENTAL=0 \
     -e CARGO_TARGET_DIR=/target \
     -e "RUSTQUEUE_BUILD_VERSION=$version" \
@@ -195,21 +214,23 @@ build_release() {
     cargo build --locked --release "${binary_args[@]}"
 }
 
-printf 'Compiling exact baseline Broker %s (%s)\n' "$BASELINE_REF" "$baseline_commit"
-build_release "$BASELINE_SOURCE" "$BASELINE_TARGET" "$baseline_version" rustqueued
-cp "$BASELINE_TARGET/release/rustqueued" "$BASELINE_RUNTIME/rustqueued"
-if command -v shasum >/dev/null 2>&1; then
-  baseline_binary_sha256="$(
-    shasum -a 256 "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
-  )"
-else
-  baseline_binary_sha256="$(
-    sha256sum "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
-  )"
+if [[ "$CALIBRATION_ONLY" != 1 ]]; then
+  printf 'Compiling exact baseline Broker %s (%s)\n' "$BASELINE_REF" "$baseline_commit"
+  build_release "$BASELINE_SOURCE" "$BASELINE_TARGET" "$baseline_version" rustqueued
+  cp "$BASELINE_TARGET/release/rustqueued" "$BASELINE_RUNTIME/rustqueued"
+  if command -v shasum >/dev/null 2>&1; then
+    baseline_binary_sha256="$(
+      shasum -a 256 "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
+    )"
+  else
+    baseline_binary_sha256="$(
+      sha256sum "$BASELINE_RUNTIME/rustqueued" | awk '{print $1}'
+    )"
+  fi
+  docker build --target broker \
+    -f "$ROOT/benchmarks/Dockerfile.qualify" \
+    -t "$BASELINE_IMAGE" "$BASELINE_RUNTIME"
 fi
-docker build --target broker \
-  -f "$ROOT/benchmarks/Dockerfile.qualify" \
-  -t "$BASELINE_IMAGE" "$BASELINE_RUNTIME"
 
 printf 'Compiling candidate Broker %s (%s)\n' "$CANDIDATE_REF" "$candidate_commit"
 build_release \
@@ -234,6 +255,10 @@ fi
 docker build --target broker \
   -f "$ROOT/benchmarks/Dockerfile.qualify" \
   -t "$CANDIDATE_IMAGE" "$CANDIDATE_RUNTIME"
+if [[ "$CALIBRATION_ONLY" == 1 ]]; then
+  docker tag "$CANDIDATE_IMAGE" "$BASELINE_IMAGE"
+  baseline_binary_sha256="$candidate_binary_sha256"
+fi
 printf 'Building common load generator and qualification evaluator\n'
 docker build --target tools \
   -f "$ROOT/benchmarks/Dockerfile.qualify" \
@@ -321,7 +346,7 @@ run_variant() {
 
   docker volume create "$ACTIVE_VOLUME" >/dev/null
   docker run -d --name "$ACTIVE_BROKER" --network "$NETWORK" \
-    --cpus 2 --memory 2g \
+    --cpus 2 --memory 2g --memory-swap 2g \
     -e RUSTQUEUE_DATA_PATH=/data \
     -v "$ACTIVE_VOLUME:/data" \
     "$image" >/dev/null
@@ -348,7 +373,7 @@ run_variant() {
     bench_args+=(--rate "$rate")
   fi
   set +e
-  docker run --rm --network "$NETWORK" --cpus 2 --memory 2g \
+  docker run --rm --network "$NETWORK" --cpus 2 --memory 2g --memory-swap 2g \
     --entrypoint /usr/local/bin/rustqueue-bench "$TOOLS_IMAGE" \
     "${bench_args[@]}" >"$report" 2>"$error_log"
   benchmark_status=$?
@@ -552,6 +577,7 @@ macos_version="$(sw_vers -productVersion 2>/dev/null || printf unknown)"
 hardware_model="$(sysctl -n hw.model 2>/dev/null || printf unknown)"
 
 jq -n \
+  --arg platform "$platform" \
   --arg docker_context "$docker_context" \
   --arg docker_os "$docker_os" \
   --arg docker_server_version "$docker_server_version" \
@@ -564,7 +590,7 @@ jq -n \
   --arg hardware_model "$hardware_model" \
   --arg tool_source "$tool_source" \
   '{
-    platform: "OrbStack on macOS",
+    platform: $platform,
     comparison_scope: "same-host relative only",
     macos_version: $macos_version,
     hardware_model: $hardware_model,
@@ -579,8 +605,8 @@ jq -n \
       storage_driver: $docker_storage_driver
     },
     resource_limits: {
-      broker: {cpus: 2, memory_bytes: 2147483648},
-      load_generator: {cpus: 2, memory_bytes: 2147483648}
+      broker: {cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648},
+      load_generator: {cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648}
     },
     tool_source: $tool_source
   }' >"$RUN_DIR/environment-core.json"
@@ -701,6 +727,34 @@ set -e
 
 mkdir -p "$(dirname "$EVIDENCE_OUTPUT")"
 cp "$EVIDENCE_FILE" "$EVIDENCE_OUTPUT"
+if [[ "$CALIBRATION_ONLY" == 1 ]]; then
+  # A valid evaluator document proves the original integrity and drain checks ran.
+  jq -e '.schema_version == 1 and (.runs | length) == 12
+    and (.verdict.hard_failures | length) == 0
+    and .verdict.status == "pass"' "$EVIDENCE_FILE" >/dev/null ||
+    die "A/A evaluator rejected integrity or regression checks"
+  jq '
+    def spread: ((max / min) - 1) * 100;
+    if .baseline.binary_sha256 != .candidate.binary_sha256
+      or .baseline.image_id != .candidate.image_id then error("A/A artifacts differ") else . end
+    | [.runs | group_by(.case)[] | . as $runs | {
+        profile: .[0].case, runs: length,
+        throughput_spread_percent: ([.[] | if .case == "sustainable"
+          then .metrics.receive_messages_per_second else .metrics.publish_messages_per_second end] | spread),
+        p99_spread_percent: ([.[].metrics.pub_ack_p99_us] | spread)
+      }]
+    | {limits_percent: {throughput: 5, p99: 10}, profiles: .,
+       status: (if length == 3 and all(.[];
+         .runs == 4 and .throughput_spread_percent <= 5 and .p99_spread_percent <= 10)
+         then "pass" else "fail" end)}
+  ' "$INPUT_FILE" >"$RUN_DIR/calibration.json"
+  cp "$RUN_DIR/calibration.json" "$EVIDENCE_OUTPUT"
+  if jq -e '.status == "pass"' "$EVIDENCE_OUTPUT" >/dev/null; then
+    qualification_status=0
+  else
+    qualification_status=1
+  fi
+fi
 printf 'Raw qualification artifacts: %s\n' "$RUN_DIR"
 printf 'Compact qualification evidence: %s\n' "$EVIDENCE_OUTPUT"
 exit "$qualification_status"
