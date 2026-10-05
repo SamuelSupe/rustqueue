@@ -95,6 +95,12 @@ throughput spread and 10 percent PUB-ACK p99 spread before the ten-pair
 baseline/candidate comparison runs. Broker and load generator each receive
 two CPUs and 2 GiB with swap disabled. Delivery integrity and complete-drain
 checks remain required; calibration failure stops comparison.
+The Linux runner fixes the Broker to CPUs 0-1 and the load generator to CPUs 2-3,
+so they do not compete for the same cores. Their CPU quotas and effective CPU
+sets are recorded; OrbStack keeps its default CPU placement. Both A/A and A/B
+use the same placement without changing the profiles or acceptance thresholds.
+The workflow allows six hours for calibration, all ten comparison pairs and
+complete consumer drains.
 
 The workflow runs when its definition or the qualification script changes in
 a PR, and can also be dispatched with an explicit published baseline tag.

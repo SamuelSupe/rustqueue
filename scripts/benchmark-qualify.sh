@@ -113,10 +113,20 @@ done
 
 docker_context="$(docker context show)"
 docker_os="$(docker info --format '{{.OperatingSystem}}')"
+docker_cpus="$(docker info --format '{{.NCPU}}')"
+broker_args=(--cpus 2 --memory 2g --memory-swap 2g)
+load_generator_args=(--cpus 2 --memory 2g --memory-swap 2g)
+broker_cpuset=""
+load_generator_cpuset=""
 platform="OrbStack on macOS"
 if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
   [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
     die "github_actions qualification requires a GitHub-hosted runner"
+  [[ "$docker_cpus" -ge 4 ]] || die "GitHub qualification requires at least four CPUs"
+  broker_cpuset="0-1"
+  load_generator_cpuset="2-3"
+  broker_args+=(--cpuset-cpus "$broker_cpuset")
+  load_generator_args+=(--cpuset-cpus "$load_generator_cpuset")
   platform="GitHub Actions on Linux"
 elif [[ "$QUALIFICATION_ENVIRONMENT" != orbstack ]]; then
   die "unknown qualification environment $QUALIFICATION_ENVIRONMENT"
@@ -310,7 +320,7 @@ capture_host_counters() {
   pid=$(docker inspect "$broker" --format '{{.State.Pid}}')
   group=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
   [[ -n "$group" ]] || die "GitHub qualification requires readable cgroup v2 counters"
-  for metric in cpu.stat io.stat memory.events; do
+  for metric in cpu.stat cpu.max cpuset.cpus.effective io.stat memory.events; do
     cat "/sys/fs/cgroup$group/$metric" >"$stem.$metric"
   done
   if [[ -r "/sys/fs/cgroup$group/cpu.pressure" ]]; then
@@ -336,6 +346,8 @@ sample_load_generator_cpu() {
   pid=$(docker inspect "$container" --format '{{.State.Pid}}')
   group=$(awk -F: '$1 == "0" { print $3 }' "/proc/$pid/cgroup")
   [[ -n "$group" ]] || return 1
+  cat "/sys/fs/cgroup$group/cpu.max" >"${output%.tsv}.cpu.max"
+  cat "/sys/fs/cgroup$group/cpuset.cpus.effective" >"${output%.tsv}.cpuset.cpus.effective"
   {
     printf 'timestamp_utc\tusage_usec\tuser_usec\tsystem_usec\tnr_periods\tnr_throttled\tthrottled_usec\n'
     while [[ -r "/sys/fs/cgroup$group/cpu.stat" ]]; do
@@ -413,7 +425,7 @@ run_variant() {
 
   docker volume create "$ACTIVE_VOLUME" >/dev/null
   docker run -d --name "$ACTIVE_BROKER" --network "$NETWORK" \
-    --cpus 2 --memory 2g --memory-swap 2g \
+    "${broker_args[@]}" \
     -e RUSTQUEUE_DATA_PATH=/data \
     -v "$ACTIVE_VOLUME:/data" \
     "$image" >/dev/null
@@ -451,7 +463,7 @@ run_variant() {
   fi
   ACTIVE_LOAD_GENERATOR="$PREFIX-load$SEQUENCE"
   docker run -d --name "$ACTIVE_LOAD_GENERATOR" --network "$NETWORK" \
-    --cpus 2 --memory 2g --memory-swap 2g \
+    "${load_generator_args[@]}" \
     --entrypoint /usr/local/bin/rustqueue-bench "$TOOLS_IMAGE" \
     "${bench_args[@]}" >/dev/null
   if [[ "$QUALIFICATION_ENVIRONMENT" == github_actions ]]; then
@@ -662,7 +674,6 @@ baseline_image_id="$(docker image inspect "$BASELINE_IMAGE" --format '{{.Id}}')"
 candidate_image_id="$(docker image inspect "$CANDIDATE_IMAGE" --format '{{.Id}}')"
 docker_server_version="$(docker version --format '{{.Server.Version}}')"
 docker_architecture="$(docker info --format '{{.Architecture}}')"
-docker_cpus="$(docker info --format '{{.NCPU}}')"
 docker_memory_bytes="$(docker info --format '{{.MemTotal}}')"
 docker_storage_driver="$(docker info --format '{{.Driver}}')"
 orbstack_version="$(orbctl version 2>/dev/null | head -n 1 || printf unknown)"
@@ -679,6 +690,8 @@ jq -n \
   --arg docker_server_version "$docker_server_version" \
   --arg docker_architecture "$docker_architecture" \
   --argjson docker_cpus "$docker_cpus" \
+  --arg broker_cpuset "$broker_cpuset" \
+  --arg load_generator_cpuset "$load_generator_cpuset" \
   --argjson docker_memory_bytes "$docker_memory_bytes" \
   --arg docker_storage_driver "$docker_storage_driver" \
   --arg orbstack_version "$orbstack_version" \
@@ -702,8 +715,14 @@ jq -n \
       storage_driver: $docker_storage_driver
     },
     resource_limits: {
-      broker: {cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648},
-      load_generator: {cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648}
+      broker: {
+        cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648,
+        cpuset_cpus: (if $broker_cpuset == "" then null else $broker_cpuset end)
+      },
+      load_generator: {
+        cpus: 2, memory_bytes: 2147483648, memory_swap_bytes: 2147483648,
+        cpuset_cpus: (if $load_generator_cpuset == "" then null else $load_generator_cpuset end)
+      }
     },
     tool_source: $tool_source
   }' >"$RUN_DIR/environment-core.json"
