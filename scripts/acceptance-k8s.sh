@@ -320,6 +320,36 @@ run_console_management_acceptance() {
   run_curl console-publish-after-recreate -fsS -X POST --data-binary recreated \
     "http://$QUEUE-proxy:4151/pub?topic=$topic" >/dev/null
 
+  local mode ttl_seconds owner
+  for mode in TTL_DISCARD RELIABLE; do
+    ttl_seconds=""
+    [[ "$mode" != TTL_DISCARD ]] || ttl_seconds=30
+    preview=$(console_preview "$base" "$origin" "$cookie" "$csrf" topic delete "$topic" "")
+    token=$(jq -er '.action_token' <<<"$preview")
+    curl -fsS -b "$cookie" -H "Origin: $origin" -H 'Content-Type: application/json' \
+      -H "X-RustQueue-CSRF: $csrf" \
+      --data "$(console_apply_body topic delete "$topic" "" "$token" "$topic")" \
+      "$base/api/v1/management/apply" >/dev/null
+    wait_managed_resource rustqueuetopics "$topic" "" TOMBSTONED
+    wait_console_topic "$base" "$topic" TOMBSTONED
+
+    preview=$(console_preview "$base" "$origin" "$cookie" "$csrf" topic create "$topic" "" "$mode" "$ttl_seconds")
+    token=$(jq -er '.action_token' <<<"$preview")
+    owner=$(jq -er '.impact.owners[0]' <<<"$preview")
+    curl -fsS -b "$cookie" -H "Origin: $origin" -H 'Content-Type: application/json' \
+      -H "X-RustQueue-CSRF: $csrf" \
+      --data "$(console_apply_body topic create "$topic" "" "$token" "" "$mode" "$ttl_seconds")" \
+      "$base/api/v1/management/apply" >/dev/null
+    wait_managed_resource rustqueuetopics "$topic" "" ACTIVE
+    wait_console_topic "$base" "$topic" ACTIVE
+    kubectl -n "$NAMESPACE" exec "$owner" -c broker -- \
+      curl -fsS "http://127.0.0.1:4151/v1/stats?topic=$topic" | \
+      jq -e --arg topic "$topic" --arg mode "$mode" --arg ttl "$ttl_seconds" \
+        'any(.topics[]; .name == $topic and .delivery_mode == $mode
+          and .message_ttl_seconds == (if $ttl == "" then null else ($ttl | tonumber) end))' \
+        >/dev/null
+  done
+
   # Simulate a Console crash after persisting the operation but before calling a broker.
   local operation_now resource
   operation_now=$(date +%s000)
@@ -374,18 +404,24 @@ run_console_management_acceptance() {
 
 console_preview() {
   local base=$1 origin=$2 cookie=$3 csrf=$4 kind=$5 action=$6 topic=$7 channel=$8
+  local mode=${9:-} ttl=${10:-}
   curl -fsS -b "$cookie" -H "Origin: $origin" -H 'Content-Type: application/json' \
     -H "X-RustQueue-CSRF: $csrf" \
     --data "$(jq -cn --arg kind "$kind" --arg action "$action" --arg topic "$topic" \
-      --arg channel "$channel" '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end)}')" \
+      --arg channel "$channel" --arg mode "$mode" --arg ttl "$ttl" \
+      '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end)}
+       + (if $mode == "" then {} else {delivery_mode:$mode,message_ttl_seconds:(if $ttl == "" then null else ($ttl | tonumber) end)} end)')" \
     "$base/api/v1/management/preview"
 }
 
 console_apply_body() {
   local kind=$1 action=$2 topic=$3 channel=$4 token=$5 confirmation=$6
+  local mode=${7:-} ttl=${8:-}
   jq -cn --arg kind "$kind" --arg action "$action" --arg topic "$topic" \
     --arg channel "$channel" --arg token "$token" --arg confirmation "$confirmation" \
-    '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end),action_token:$token,confirmation:$confirmation}'
+    --arg mode "$mode" --arg ttl "$ttl" \
+    '{kind:$kind,action:$action,topic:$topic,channel:(if $channel == "" then null else $channel end),action_token:$token,confirmation:$confirmation}
+     + (if $mode == "" then {} else {delivery_mode:$mode,message_ttl_seconds:(if $ttl == "" then null else ($ttl | tonumber) end)} end)'
 }
 
 require kubectl

@@ -101,6 +101,8 @@ preview and require the exact resource name. Deletion first persists a
 tombstone, then synchronizes the fence to all brokers before removing data.
 The default tombstone lifetime is 10 minutes and can be changed with
 `console.management.tombstoneSeconds`.
+Explicitly recreating a deleted Topic applies the newly selected delivery mode
+and TTL. Choosing `RELIABLE` clears the previous TTL.
 
 The Console selects a healthy, non-maintenance, disk-eligible broker for new
 Topics. A mutation first persists an operation ID and owner progress in the
