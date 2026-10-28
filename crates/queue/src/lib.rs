@@ -5,6 +5,7 @@ mod channel_store;
 mod delivery_budget;
 mod delivery_guard;
 mod eviction;
+mod io_backend;
 mod management;
 mod management_ops;
 mod metadata;

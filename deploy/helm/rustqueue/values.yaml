@@ -5,7 +5,7 @@ operator:
   replicas: 2
   image:
     repository: rustqueue-operator
-    tag: "0.10.1"
+    tag: "0.11.0"
     pullPolicy: IfNotPresent
   log: rustqueue_operator=info
   resources:
@@ -20,7 +20,7 @@ operator:
 queue:
   create: true
   name: rustqueue
-  image: rustqueue:0.10.1
+  image: rustqueue:0.11.0
   imagePullPolicy: IfNotPresent
   minBrokers: 1
   maxBrokers: 500
@@ -28,6 +28,10 @@ queue:
   storageClassName: local-path
   storageSize: 100Gi
   storageFeatureLevel: 1
+  # Linux io_uring must be permitted by the broker's container security policy.
+  ioUringEnabled: false
+  # Optional profile installed under each node's kubelet seccomp directory.
+  brokerSeccompProfilePath: ""
   messageIndexCacheBytes: 67108864
   maintenanceStartupDelaySeconds: 30
   nodeDeliveryInflightBytes: 536870912

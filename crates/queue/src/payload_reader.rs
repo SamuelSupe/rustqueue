@@ -13,6 +13,9 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
+#[cfg(target_os = "linux")]
+mod uring;
+
 type ReadFailure = (io::ErrorKind, String);
 type ReadResult = Result<Vec<Vec<u8>>, ReadFailure>;
 type ReadResponse = (ReadResult, Option<DeliveryHold>);
@@ -65,7 +68,15 @@ impl PayloadReader {
         queue_depth: usize,
         latency: Arc<LatencyHistogram>,
         storage_healthy: Arc<AtomicBool>,
-    ) -> Arc<Self> {
+        io_uring_enabled: bool,
+    ) -> io::Result<Arc<Self>> {
+        #[cfg(not(target_os = "linux"))]
+        if io_uring_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "io_uring requires Linux",
+            ));
+        }
         let (sender, receiver) = sync_channel(queue_depth.max(1));
         let receiver = Arc::new(Mutex::new(receiver));
         let active_paths = Arc::new(Mutex::new(HashMap::new()));
@@ -86,12 +97,24 @@ impl PayloadReader {
             let receiver = Arc::clone(&receiver);
             let files = Arc::clone(&files);
             let storage_healthy = Arc::clone(&storage_healthy);
+            let (ready, started) = sync_channel::<io::Result<()>>(1);
             std::thread::Builder::new()
                 .name(format!("rustqueue-payload-{index}"))
-                .spawn(move || worker(receiver, files, storage_healthy))
-                .expect("payload reader worker must start");
+                .spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    if io_uring_enabled {
+                        uring::worker(receiver, files, storage_healthy, ready);
+                        return;
+                    }
+                    if ready.send(Ok(())).is_ok() {
+                        worker(receiver, files, storage_healthy);
+                    }
+                })?;
+            started
+                .recv()
+                .map_err(|_| io::Error::other("payload reader failed to start"))??;
         }
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             cache: Mutex::new(PayloadCache {
                 values: HashMap::new(),
                 order: VecDeque::new(),
@@ -102,7 +125,7 @@ impl PayloadReader {
             sender,
             active_paths,
             latency,
-        })
+        }))
     }
 
     #[cfg(test)]
@@ -299,20 +322,18 @@ fn worker(
     loop {
         let job = receiver.lock().recv();
         let Ok(job) = job else { return };
-        let ReadJob {
-            payloads,
-            _lease: lease,
-            hold,
-            response,
-        } = job;
-        let result =
-            read_payloads(&files, &payloads).map_err(|error| (error.kind(), error.to_string()));
-        if result.is_err() {
-            storage_healthy.store(false, Ordering::Release);
-        }
-        drop(lease);
-        let _ = response.send((result, hold));
+        let result = read_payloads(&files, &job.payloads);
+        complete_job(job, result, &storage_healthy);
     }
+}
+
+fn complete_job(job: ReadJob, result: io::Result<Vec<Vec<u8>>>, storage_healthy: &AtomicBool) {
+    if result.is_err() {
+        storage_healthy.store(false, Ordering::Release);
+    }
+    let result = result.map_err(|error| (error.kind(), error.to_string()));
+    drop(job._lease);
+    let _ = job.response.send((result, job.hold));
 }
 
 fn read_payloads(files: &Mutex<FileCache>, payloads: &[PayloadRef]) -> io::Result<Vec<Vec<u8>>> {
@@ -342,6 +363,24 @@ fn read_file_group(
     indices: &[usize],
     output: &mut [Option<Vec<u8>>],
 ) -> io::Result<()> {
+    for range in read_ranges(payloads, indices)? {
+        let mut bytes = vec![0; range.len];
+        file.read_exact_at(&mut bytes, range.offset)?;
+        collect_payloads(&range, bytes, payloads, output)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ReadRange {
+    offset: u64,
+    len: usize,
+    indices: Vec<usize>,
+}
+
+#[cfg(unix)]
+fn read_ranges(payloads: &[PayloadRef], indices: &[usize]) -> io::Result<Vec<ReadRange>> {
+    let mut ranges = Vec::new();
     let mut cursor = 0;
     while cursor < indices.len() {
         let start_cursor = cursor;
@@ -359,16 +398,36 @@ fn read_file_group(
             end = end.max(candidate_end);
             cursor += 1;
         }
-        let mut bytes = vec![0; usize::try_from(end - start).map_err(io::Error::other)?];
-        file.read_exact_at(&mut bytes, start)?;
-        for index in &indices[start_cursor..cursor] {
-            let payload = &payloads[*index];
-            let from = usize::try_from(payload.offset - start).map_err(io::Error::other)?;
-            let to = from + payload.len as usize;
-            let body = bytes[from..to].to_vec();
-            verify_payload(payload, &body)?;
-            output[*index] = Some(body);
-        }
+        ranges.push(ReadRange {
+            offset: start,
+            len: usize::try_from(end - start).map_err(io::Error::other)?,
+            indices: indices[start_cursor..cursor].to_vec(),
+        });
+    }
+    Ok(ranges)
+}
+
+#[cfg(unix)]
+fn collect_payloads(
+    range: &ReadRange,
+    bytes: Vec<u8>,
+    payloads: &[PayloadRef],
+    output: &mut [Option<Vec<u8>>],
+) -> io::Result<()> {
+    if range.len > MAX_COALESCED_READ as usize && range.indices.len() == 1 {
+        let index = range.indices[0];
+        // Oversized bodies cannot share a coalesced range. Transfer their
+        // verified buffer to avoid temporarily doubling a large allocation.
+        verify_payload(&payloads[index], &bytes)?;
+        output[index] = Some(bytes);
+        return Ok(());
+    }
+    for index in &range.indices {
+        let payload = &payloads[*index];
+        let from = usize::try_from(payload.offset - range.offset).map_err(io::Error::other)?;
+        let body = bytes[from..from + payload.len as usize].to_vec();
+        verify_payload(payload, &body)?;
+        output[*index] = Some(body);
     }
     Ok(())
 }
@@ -459,7 +518,9 @@ mod tests {
                 queue_depth,
                 Arc::new(LatencyHistogram::default()),
                 Arc::clone(&storage_healthy),
-            ),
+                std::env::var_os("RUSTQUEUE_TEST_IO_URING").is_some(),
+            )
+            .unwrap(),
             storage_healthy,
         )
     }
@@ -549,10 +610,101 @@ mod tests {
             len: 3,
             crc32c: crc32c::crc32c(b"good"),
         };
-        let (reader, storage_healthy) = reader(1024, 4);
+        let good_path = root.path().join("good");
+        std::fs::write(&good_path, b"good").unwrap();
+        let good = PayloadRef {
+            path: Arc::new(good_path),
+            offset: 0,
+            len: 4,
+            crc32c: crc32c::crc32c(b"good"),
+        };
+        let large_path = root.path().join("large");
+        let large_body = vec![0x5a; MAX_COALESCED_READ as usize + 17];
+        std::fs::write(&large_path, &large_body).unwrap();
+        let large = PayloadRef {
+            path: Arc::new(large_path),
+            offset: 0,
+            len: large_body.len() as u32,
+            crc32c: crc32c::crc32c(&large_body) ^ 1,
+        };
+        for batch in [vec![payload.clone()], vec![good, payload], vec![large]] {
+            let (reader, storage_healthy) = reader(1024, 4);
+            let error = reader.read_many(&batch).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!storage_healthy.load(Ordering::Acquire));
+        }
+    }
 
-        assert!(reader.read_many(&[payload]).await.is_err());
-        assert!(!storage_healthy.load(Ordering::Acquire));
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sparse_multi_file_reads_preserve_order_across_batches_and_large_payloads() {
+        let root = tempdir().unwrap();
+        let paths: Vec<_> = (0..2)
+            .map(|index| Arc::new(root.path().join(index.to_string())))
+            .collect();
+        let files: Vec<_> = paths
+            .iter()
+            .map(|path| File::create(path.as_ref()).unwrap())
+            .collect();
+        let mut payloads = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..150 {
+            let body = format!("payload-{index}").into_bytes();
+            let offset = (index / 2 * 131_072) as u64;
+            files[index % 2].write_all_at(&body, offset).unwrap();
+            payloads.push(PayloadRef {
+                path: Arc::clone(&paths[index % 2]),
+                offset,
+                len: body.len() as u32,
+                crc32c: crc32c::crc32c(&body),
+            });
+            expected.push(body);
+        }
+        let large = vec![0x5a; MAX_COALESCED_READ as usize + 17];
+        let offset = 32 * 1024 * 1024;
+        files[0].write_all_at(&large, offset).unwrap();
+        payloads.push(PayloadRef {
+            path: Arc::clone(&paths[0]),
+            offset,
+            len: large.len() as u32,
+            crc32c: crc32c::crc32c(&large),
+        });
+        expected.push(large);
+        payloads.reverse();
+        expected.reverse();
+        let (reader, healthy) = reader(1, 4);
+        let actual = reader.read_many(&payloads).await.unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.as_ref(), expected);
+        }
+        assert!(healthy.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn truncated_payload_fails_closed_instead_of_returning_a_partial_body() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("payload");
+        std::fs::write(&path, b"short").unwrap();
+        let payload = PayloadRef {
+            path: Arc::new(path),
+            offset: 0,
+            len: 10,
+            crc32c: 0,
+        };
+        let good_path = root.path().join("good");
+        std::fs::write(&good_path, b"good").unwrap();
+        let good = PayloadRef {
+            path: Arc::new(good_path),
+            offset: 0,
+            len: 4,
+            crc32c: crc32c::crc32c(b"good"),
+        };
+        for batch in [vec![payload.clone()], vec![good, payload]] {
+            let (reader, healthy) = reader(1, 4);
+            let error = reader.read_many(&batch).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            assert!(!healthy.load(Ordering::Acquire));
+        }
     }
 
     #[cfg(unix)]

@@ -202,6 +202,8 @@ mod tests {
                 storage_class_name: "ssd".into(),
                 storage_size: "10Gi".into(),
                 storage_feature_level: 1,
+                io_uring_enabled: false,
+                broker_seccomp_profile_path: None,
                 message_index_cache_bytes: 1024,
                 maintenance_startup_delay_seconds: 30,
                 node_delivery_inflight_bytes: 4096,

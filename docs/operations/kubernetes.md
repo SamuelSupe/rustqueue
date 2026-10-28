@@ -187,7 +187,7 @@ Canary approval is optional:
 ```sh
 helm upgrade rustqueue deploy/helm/rustqueue \
   --namespace rustqueue \
-  --set queue.image=registry.example/rustqueue:0.10.1 \
+  --set queue.image=registry.example/rustqueue:0.11.0 \
   --set queue.rollout.requireCanaryApproval=true
 
 rustqueuectl -n rustqueue rollout approve
@@ -199,7 +199,7 @@ Useful controls:
 rustqueuectl -n rustqueue rollout pause
 rustqueuectl -n rustqueue rollout resume
 rustqueuectl -n rustqueue rollout retry
-rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.10.0
+rustqueuectl -n rustqueue rollout rollback registry.example/rustqueue:0.10.1
 rustqueuectl -n rustqueue rollout forward
 ```
 
@@ -252,6 +252,26 @@ Operator CRDs are installed. Treat these default alerts as follows:
   Stats shards before trusting Kodo depth or channel-idleness observations;
 - sustained throttling or high fsync p99: investigate PVC latency/capacity and
   producer arrival rate.
+
+### Optional io_uring storage I/O
+
+Set Helm `queue.ioUringEnabled=true` or the RustQueue resource's
+`spec.ioUringEnabled: true` to enable io_uring on Broker pods. The default is
+false. The Operator renders this into `[storage].io_uring_enabled`; this is a
+restart-required configuration change. Apply the updated CRD before using the
+new field on an existing installation.
+
+Nodes need Linux 5.10+ and the Broker's container security policy must allow
+io_uring setup, enter, and register operations. The chart does not weaken the
+pod security policy automatically. If RuntimeDefault blocks these calls,
+install a profile allowing them on every eligible node and set Helm
+`queue.brokerSeccompProfilePath=rustqueue/io-uring.json` (or
+`spec.brokerSeccompProfilePath`). This is a relative path under the kubelet's
+seccomp directory, rendered as a `Localhost` profile for Broker pods only.
+Omitting it keeps `RuntimeDefault`. A denied or unavailable io_uring runtime fails Broker
+startup with an explicit error; disable the setting to use portable I/O.
+Verify `rustqueue_io_uring_enabled 1` on each Broker's `/metrics` after rollout.
+See [implementation, durability, and validation](../architecture/io-uring.md).
 
 The bundled rules select the current Helm namespace and queue Services, so a
 healthy RustQueue release cannot mask a failed release in the same Prometheus.

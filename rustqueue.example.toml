@@ -24,6 +24,9 @@ allowed_origins = []
 
 [storage]
 data_path = "/data"
+# Linux 5.10+ with io_uring allowed by the container policy. Startup fails if
+# requested but unavailable; false keeps the portable I/O backend.
+io_uring_enabled = false
 feature_level = 1
 max_segment_bytes = 104857600
 scrub_interval_seconds = 3600

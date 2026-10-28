@@ -12,6 +12,7 @@ fn config(path: &Path) -> BrokerConfig {
         node_id: 41,
         max_segment_bytes: 256,
         max_message_bytes: 1024,
+        io_uring_enabled: std::env::var_os("RUSTQUEUE_TEST_IO_URING").is_some(),
         bootstrap_retention: Duration::ZERO,
         ..BrokerConfig::default()
     }
@@ -108,13 +109,26 @@ async fn sigkill_channel_wal_boundaries_are_at_least_once() {
         ("channel_group_after_fsync_before_reply", true),
     ] {
         let root = tempfile::tempdir().unwrap();
+        {
+            let broker = Broker::open(config(root.path())).unwrap();
+            broker.create_channel("events", "audit").await.unwrap();
+        }
         publish_fixture(root.path()).await;
-        spawn_until_marker(root.path(), "finish", failpoint);
-        let recovered = bodies(root.path()).await;
-        if must_be_finished {
-            assert!(!recovered.contains(b"acknowledged".as_slice()));
-        } else {
-            assert!(recovered.len() <= 1);
+        spawn_until_marker(root.path(), "finish_fanout", failpoint);
+        let broker = Broker::open(config(root.path())).unwrap();
+        for channel in ["workers", "audit"] {
+            let recovered = broker
+                .fetch_batch("events", channel, 16, 16 * 1024, Duration::ZERO, None)
+                .await
+                .unwrap();
+            if must_be_finished {
+                assert!(
+                    recovered.is_empty(),
+                    "every WAL in the sync group must be durable"
+                );
+            } else {
+                assert!(recovered.len() <= 1);
+            }
         }
     }
 }

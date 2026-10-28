@@ -400,6 +400,7 @@ mod tests {
     #[test]
     fn registry_exposes_channel_names_instead_of_internal_stats() {
         let topics = registry_topics(&BrokerStats {
+            io_uring_enabled: false,
             publish_group_commit: Default::default(),
             channel_group_commit: Default::default(),
             latency: Default::default(),

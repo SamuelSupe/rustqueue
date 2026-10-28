@@ -234,9 +234,11 @@ impl Broker {
             rustqueue_storage::crash_failpoint("ttl_discard_after_wal_append_before_fsync");
             let syncs = state.prepare_channel_wal_syncs(prepared.channels.iter())?;
             drop(state);
-            let sync_result = syncs
-                .into_iter()
-                .try_for_each(|wal| wal.sync_data().map_err(BrokerError::from));
+            let sync_result = broker
+                .inner
+                .sync_backend
+                .sync_data(syncs)
+                .map_err(BrokerError::from);
             if let Err(error) = sync_result {
                 handle
                     .state

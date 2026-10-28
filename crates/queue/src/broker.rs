@@ -20,6 +20,7 @@ mod stats;
 mod topics;
 
 use crate::delivery_budget::DeliveryBudget;
+use crate::io_backend::SyncBackend;
 use crate::management::FenceCatalog;
 use crate::management_ops::OperationCatalog;
 use crate::metadata::{load_optional, load_topic_manifest, store_atomic, BrokerMeta};
@@ -112,6 +113,9 @@ pub struct BrokerConfig {
     pub message_index_cache_bytes: usize,
     pub payload_read_workers: usize,
     pub payload_read_queue: usize,
+    /// Opt into Linux io_uring reads and group syncs. Opening fails if requested
+    /// support is unavailable; false retains portable I/O and the same disk format.
+    pub io_uring_enabled: bool,
     pub delivery_inflight_bytes: usize,
     pub delivery_inflight_messages: usize,
     pub scrub_bytes_per_second: u64,
@@ -140,6 +144,7 @@ impl Default for BrokerConfig {
             message_index_cache_bytes: 64 * 1024 * 1024,
             payload_read_workers: 0,
             payload_read_queue: 4096,
+            io_uring_enabled: false,
             delivery_inflight_bytes: 512 * 1024 * 1024,
             delivery_inflight_messages: 262_144,
             scrub_bytes_per_second: 64 * 1024 * 1024,
@@ -224,6 +229,7 @@ struct BrokerInner {
     topics: RwLock<HashMap<String, Arc<TopicHandle>>>,
     retired_topics: Mutex<HashMap<String, Arc<TopicHandle>>>,
     payload_reader: Arc<PayloadReader>,
+    sync_backend: SyncBackend,
     delivery_budget: DeliveryBudget,
     message_index_cache: Arc<MessageIndexCache>,
     metadata_spill: Mutex<()>,
@@ -304,6 +310,7 @@ impl Broker {
                 "delivery byte budget must fit u32 and every message readable at the active storage feature level".into(),
             ));
         }
+        let sync_backend = SyncBackend::new(config.io_uring_enabled)?;
         ensure_data_format(&config.data_path)
             .map_err(|error| BrokerError::InvalidRecord(error.to_string()))?;
         let compatibility = prepare_compatibility(&config.data_path, config.storage_feature_level)
@@ -344,7 +351,8 @@ impl Broker {
             config.payload_read_queue,
             Arc::clone(&metrics.payload_read),
             Arc::clone(&storage_healthy),
-        );
+            config.io_uring_enabled,
+        )?;
         let message_index_cache = MessageIndexCache::new(
             config.message_index_cache_bytes,
             config.payload_read_workers,
@@ -420,6 +428,7 @@ impl Broker {
                 topics: RwLock::new(topics),
                 retired_topics: Mutex::new(HashMap::new()),
                 payload_reader,
+                sync_backend,
                 delivery_budget,
                 message_index_cache,
                 metadata_spill: Mutex::new(()),

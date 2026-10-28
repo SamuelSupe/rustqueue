@@ -79,6 +79,7 @@ impl Broker {
             aggregate.add_topic(topic);
         }
         BrokerStats {
+            io_uring_enabled: self.inner.config.io_uring_enabled,
             publish_group_commit: self.inner.publish_groups.stats(),
             channel_group_commit: self.inner.channel_groups.stats(),
             latency: self.inner.metrics.snapshot(),

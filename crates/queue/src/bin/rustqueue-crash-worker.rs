@@ -8,12 +8,13 @@ fn config(path: &Path) -> BrokerConfig {
         node_id: 41,
         max_segment_bytes: 256,
         max_message_bytes: 1024,
+        io_uring_enabled: std::env::var_os("RUSTQUEUE_TEST_IO_URING").is_some(),
         bootstrap_retention: Duration::ZERO,
         ..BrokerConfig::default()
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let mut arguments = std::env::args().skip(1);
     let scenario = arguments
@@ -35,6 +36,19 @@ async fn main() -> anyhow::Result<()> {
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("missing message to finish"))?;
             broker.finish("events", "workers", message.id).await?;
+        }
+        "finish_fanout" => {
+            let first = broker
+                .next_message("events", "workers", None)
+                .await?
+                .unwrap();
+            let second = broker.next_message("events", "audit", None).await?.unwrap();
+            let (first, second) = tokio::join!(
+                broker.finish("events", "workers", first.id),
+                broker.finish("events", "audit", second.id),
+            );
+            first?;
+            second?;
         }
         "checkpoint" => broker.checkpoint().await?,
         "gc" => {

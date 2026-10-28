@@ -29,6 +29,11 @@ pub struct RustQueueSpec {
     pub storage_size: String,
     #[serde(default = "default_storage_feature_level")]
     pub storage_feature_level: u32,
+    #[serde(default)]
+    pub io_uring_enabled: bool,
+    /// Node-local seccomp profile path; omitted keeps RuntimeDefault.
+    #[serde(default)]
+    pub broker_seccomp_profile_path: Option<String>,
     #[serde(default = "default_message_index_cache_bytes")]
     pub message_index_cache_bytes: usize,
     #[serde(default = "default_maintenance_startup_delay")]

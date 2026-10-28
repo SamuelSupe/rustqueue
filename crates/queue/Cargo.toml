@@ -24,6 +24,13 @@ rustqueue-storage = { path = "../storage" }
 rustqueue-protocol = { path = "../protocol" }
 rustqueue-telemetry.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = "0.5.0"
+
 [dev-dependencies]
 libc.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "io_uring"
+harness = false

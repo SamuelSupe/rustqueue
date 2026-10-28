@@ -241,9 +241,10 @@ impl Broker {
         drop(topic_state);
         let sync_result = {
             let _timer = self.inner.metrics.channel_fsync.timer();
-            syncs
-                .into_iter()
-                .try_for_each(|wal| wal.sync_data().map_err(BrokerError::from))
+            self.inner
+                .sync_backend
+                .sync_data(syncs)
+                .map_err(BrokerError::from)
         };
         if let Err(error) = sync_result {
             handle
