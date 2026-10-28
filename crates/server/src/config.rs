@@ -80,6 +80,7 @@ pub struct NetworkConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct StorageConfig {
     pub data_path: PathBuf,
+    pub io_uring_enabled: bool,
     pub feature_level: u32,
     pub max_segment_bytes: u64,
     pub scrub_interval_seconds: u64,
@@ -240,6 +241,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             data_path: "data".into(),
+            io_uring_enabled: false,
             feature_level: rustqueue_storage::BASE_STORAGE_FEATURE_LEVEL,
             max_segment_bytes: 100 * 1024 * 1024,
             scrub_interval_seconds: 3600,
@@ -354,6 +356,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.storage.io_uring_enabled && !cfg!(target_os = "linux") {
+            bail!("storage.io_uring_enabled requires Linux");
+        }
         if self.node.id == 0 || self.node.id > u16::MAX as u64 {
             bail!("node.id must be in 1..=65535");
         }

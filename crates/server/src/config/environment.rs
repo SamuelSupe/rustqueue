@@ -63,6 +63,10 @@ impl Config {
             &mut self.storage.feature_level,
         )?;
         set_from_env(
+            "RUSTQUEUE_IO_URING_ENABLED",
+            &mut self.storage.io_uring_enabled,
+        )?;
+        set_from_env(
             "RUSTQUEUE_SCRUB_BYTES_PER_SECOND",
             &mut self.storage.scrub_bytes_per_second,
         )?;

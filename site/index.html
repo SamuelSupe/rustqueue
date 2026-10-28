@@ -388,6 +388,13 @@
             <span>03</span>
             <p>Unexpected duplicates invalidate a benchmark result.</p>
           </div>
+          <div>
+            <span>04</span>
+            <p>
+              Linux io_uring is optional and defaults to off in 0.11.0.
+              <a href="https://github.com/SamuelSupe/rustqueue/blob/main/docs/architecture/io-uring.md" rel="noreferrer">Configuration and benchmarks</a>.
+            </p>
+          </div>
         </div>
       </section>
 
@@ -411,7 +418,7 @@
             </div>
             <pre><code id="helm-command">helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.10.0 \
+  --set queue.image=registry.example/rustqueue:0.11.0 \
   --set queue.storageClassName=ssd-rwo</code></pre>
           </div>
         </div>

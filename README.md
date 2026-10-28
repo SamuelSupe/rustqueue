@@ -11,14 +11,14 @@
 [NSQ performance boundaries](docs/architecture/nsq-performance.md) ·
 [Kubernetes operations](docs/operations/kubernetes.md) ·
 [Console operations](docs/operations/console.md) ·
-[v0.10.1 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.1)
+[v0.11.0 release](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.11.0)
 
-RustQueue 0.10.1 is a Kubernetes-native, NSQ V2-compatible message queue for
+RustQueue 0.11.0 is a Kubernetes-native, NSQ V2-compatible message queue for
 trusted internal networks. It is written in Rust and uses a deliberately
 simple share-nothing model: each Broker owns one durable RWO PVC, while
 Kubernetes provides scheduling, rollout and discovery.
 
-> Current release: [v0.10.1](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.10.1).
+> Current release: [v0.11.0](https://github.com/SamuelSupe/rustqueue/releases/tag/v0.11.0).
 > RustQueue is a production candidate for workloads that accept single-PVC
 > durability and at-least-once delivery. It does not replicate messages between
 > Brokers and is not an HA replacement for a replicated log.
@@ -45,49 +45,44 @@ messages stored on that Broker are lost. Configure disk pressure protection,
 monitor the exported metrics, and choose PVC/storage failure policies that fit
 your workload before deploying to production.
 
-## What's new in 0.10.1
+## What's new in 0.11.0
 
-This patch fixes delayed-message memory growth, legacy checkpoint recovery,
-slow-consumer metadata budgets, heartbeat timing, recovery status, TLS CLI
-startup, and producer-proxy rollout continuity. The optional WebSocket live
-subscription introduced in 0.10.0 remains default-off.
+- **Optional Linux io_uring storage I/O.** Enable it through TOML, an environment
+  variable, or Helm for concurrent independent payload reads and multi-Channel
+  WAL syncs. It defaults to off; unavailable kernel/container support produces
+  an explicit startup error.
+- **Bounded reads and fewer large copies.** Existing worker, queue, descriptor,
+  buffer and delivery budgets remain in force. Isolated bodies above 2 MiB
+  reuse their verified read buffer instead of allocating and copying it again.
+- **Visible configuration and compatible recovery.** Startup logs, Broker stats
+  and Prometheus expose the selected backend. The v7 disk format, CRC checks,
+  durable ACK contract and restart with io_uring disabled remain compatible.
 
+Performance depends on storage and workload. Exploratory runs showed a benefit
+for large-body reads, but no reliable general TCP gain; io_uring remains opt-in.
+See the [v0.11.0 release notes](docs/releases/v0.11.0.md),
+[io_uring configuration and validation](docs/architecture/io-uring.md), and
+[NSQ performance boundaries](docs/architecture/nsq-performance.md).
 
-- **TTL live WebSocket subscriptions.** The default-off WebSocket endpoint
-  streams only existing `TTL_DISCARD` Topics. It is a best-effort feed with no
-  replay, reconnect resume or client ACK; consumers use Discovery `/lookup`
-  and connect to every returned Topic owner.
-- **Bounded live delivery.** Each connection uses one ephemeral Channel and at
-  most one reservation. Frame memory, total connections and per-Topic
-  connections are bounded; a slow or expired write closes the connection and
-  releases the reservation.
-- **Existing protocol compatibility.** Topic TTL discard remains the v0.9.0
-  capability, while NSQ TCP/HTTP publishing, ACK modes, storage format v7 and
-  existing `RELIABLE` behavior remain unchanged.
-
-See the [v0.10.1 release notes](docs/releases/v0.10.1.md) and [NSQ performance
-boundaries](docs/architecture/nsq-performance.md) for the contract and
-benchmark interpretation.
-
-## Download 0.10.1
+## Download 0.11.0
 
 Every release contains native Linux binaries, the Console UI, source, the Helm
 Chart and a checksum manifest:
 
 | Asset | Contents |
 | --- | --- |
-| `rustqueue-0.10.1-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
-| `rustqueue-0.10.1-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
-| `rustqueue-0.10.1-source.tar.gz` | Source archive for the tagged commit |
-| `rustqueue-0.10.1.tgz` | Helm Chart |
-| `SHA256SUMS-0.10.1` | SHA-256 checksums for every downloadable artifact |
+| `rustqueue-0.11.0-linux-x86_64.tar.gz` | Linux x86_64 binaries, Console UI and example configuration |
+| `rustqueue-0.11.0-linux-aarch64.tar.gz` | Linux ARM64 binaries, Console UI and example configuration |
+| `rustqueue-0.11.0-source.tar.gz` | Source archive for the tagged commit |
+| `rustqueue-0.11.0.tgz` | Helm Chart |
+| `SHA256SUMS-0.11.0` | SHA-256 checksums for every downloadable artifact |
 
 ```sh
 arch="$(uname -m)"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.1/rustqueue-0.10.1-linux-${arch}.tar.gz"
-curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.10.1/SHA256SUMS-0.10.1"
-sha256sum --check --ignore-missing SHA256SUMS-0.10.1
-tar -xzf "rustqueue-0.10.1-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.11.0/rustqueue-0.11.0-linux-${arch}.tar.gz"
+curl -LO "https://github.com/SamuelSupe/rustqueue/releases/download/v0.11.0/SHA256SUMS-0.11.0"
+sha256sum --check --ignore-missing SHA256SUMS-0.11.0
+tar -xzf "rustqueue-0.11.0-linux-${arch}.tar.gz"
 ```
 
 ## Architecture
@@ -380,7 +375,7 @@ kubectl label node worker-1 rustqueue.io/eligible=true
 
 helm upgrade --install rustqueue deploy/helm/rustqueue \
   --namespace rustqueue --create-namespace \
-  --set queue.image=registry.example/rustqueue:0.10.1 \
+  --set queue.image=registry.example/rustqueue:0.11.0 \
   --set queue.storageClassName=ssd-rwo
 ```
 
@@ -642,7 +637,7 @@ long-term integrity; it does not qualify saturation throughput. Inspect the
 report's duplicates, publish errors and unconfirmed deliveries as well as its
 exit status, missing messages and final Broker backlog.
 
-The v0.10.1 CI/CD workflow publishes a Release only after the non-Kubernetes
+The v0.11.0 CI/CD workflow publishes a Release only after the non-Kubernetes
 release gate, both native Linux builds, packaging and checksum verification
 succeed. The v0.8.0 Kodo compatibility baseline additionally passed the
 unmodified Kodo source replay, an exact 104,857,500-byte `PUB`/`DPUB` with one
@@ -737,6 +732,15 @@ exported as bounded aggregate gauges/counters. Native observation includes
 metrics are enabled, `rustqueue_topic_ttl_discarded_messages_total` uses the
 same global series budget as the other per-Topic metrics.
 
+Linux deployments can opt into `[storage].io_uring_enabled = true` (or
+`RUSTQUEUE_IO_URING_ENABLED=true`) for concurrent payload reads and multi-Channel
+WAL data syncs. Single contiguous reads and single-file syncs keep their cheaper
+portable path. The default is `false`. Enabling it requires
+Linux 5.10+ and a container policy permitting io_uring; unavailable support
+fails startup explicitly. `rustqueue_io_uring_enabled` reports the active mode.
+The ACK contract and disk format are unchanged; restarting with `false` returns
+to the portable backend. See [io_uring configuration and validation](docs/architecture/io-uring.md).
+
 `[queue].publish_ack_mode` defaults to `"durable"`: successful publish commands
 follow local segment `fsync`. `"write_ack"` returns after append while consumers
 remain bounded by `last_durable_position`; `"nsq_relaxed"` also exposes the
@@ -830,7 +834,7 @@ non-Kubernetes gate runs in GitHub Actions.
 
 ## Non-goals
 
-RustQueue 0.10 does not provide message replication, backups, exactly-once
+RustQueue 0.11 does not provide message replication, backups, exactly-once
 delivery, a global channel catalog, online data migration, cross-region
 replication, reliable WebSocket replay/resume/ACK semantics, or Broker/PVC
 lifecycle controls in Console.

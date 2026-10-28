@@ -89,6 +89,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
         "messageIndexCacheBytes": cluster.spec.message_index_cache_bytes,
         "eligibleNodeSelector": cluster.spec.eligible_node_selector,
         "brokerScheduling": &cluster.spec.broker_scheduling,
+        "brokerSeccompProfilePath": &cluster.spec.broker_seccomp_profile_path,
         "brokerResources": &cluster.spec.broker_resources,
     }))?;
     let revision_digest = Sha256::digest(revision_contract);
@@ -154,6 +155,10 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
             json!({"name": "client-tls", "mountPath": "/run/tls/rustqueue", "readOnly": true}),
         );
     }
+    let broker_seccomp = match &cluster.spec.broker_seccomp_profile_path {
+        Some(path) => json!({"type": "Localhost", "localhostProfile": path}),
+        None => json!({"type": "RuntimeDefault"}),
+    };
     let brokers = typed(json!({
         "apiVersion": "apps/v1", "kind": "StatefulSet",
         "metadata": metadata(&name, "broker"),
@@ -175,7 +180,7 @@ pub fn build(input: BuildInput<'_>) -> anyhow::Result<ResourceSet> {
                     "securityContext": {
                         "runAsNonRoot": true, "runAsUser": 65532, "runAsGroup": 65532,
                         "fsGroup": 65532, "fsGroupChangePolicy": "OnRootMismatch",
-                        "seccompProfile": {"type": "RuntimeDefault"}
+                        "seccompProfile": broker_seccomp
                     },
                     "nodeSelector": node_selector,
                     "affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [{
@@ -562,8 +567,9 @@ fn broker_config(cluster: &RustQueue, secret_name: &str) -> String {
         String::new()
     };
     let mut output = format!(
-        "{kodo_network}{websocket}[storage]\ndata_path = \"/data\"\nfeature_level = {}\nmax_segment_bytes = {max_segment_bytes}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\nmaintenance_startup_delay_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\npublish_ack_mode = \"{}\"\nrelaxed_sync_messages = {}\nrelaxed_sync_bytes = {}\nrelaxed_sync_interval_ms = {}\n\n[limits]\nmax_body_bytes = {max_body_bytes}\nnode_publish_inflight_bytes = {node_publish_inflight_bytes}\nconnection_publish_inflight_bytes = {connection_publish_inflight_bytes}\nnode_delivery_inflight_bytes = {}\nconnection_delivery_inflight_bytes = {}\ndisconnect_on_retriable_publish_error = false\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\n{publish_token}registry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\n{kodo_cleanup_token}console_management_enabled = {}\nkodo_cleanup_enabled = {}\n# secret: {secret_name}\n",
+        "{kodo_network}{websocket}[storage]\ndata_path = \"/data\"\nfeature_level = {}\nio_uring_enabled = {}\nmax_segment_bytes = {max_segment_bytes}\nmin_free_bytes = {}\ndisk_high_watermark_percent = {}\ndisk_low_watermark_percent = {}\nprotective_eviction_enabled = {}\ndisk_pressure_grace_seconds = {}\nmaintenance_startup_delay_seconds = {}\n\n[queue]\nbootstrap_retention_seconds = {}\nmax_message_bytes = {}\nmax_topics = {}\nmax_publish_workers = {}\npublish_worker_idle_seconds = {}\npublish_ack_mode = \"{}\"\nrelaxed_sync_messages = {}\nrelaxed_sync_bytes = {}\nrelaxed_sync_interval_ms = {}\n\n[limits]\nmax_body_bytes = {max_body_bytes}\nnode_publish_inflight_bytes = {node_publish_inflight_bytes}\nconnection_publish_inflight_bytes = {connection_publish_inflight_bytes}\nnode_delivery_inflight_bytes = {}\nconnection_delivery_inflight_bytes = {}\ndisconnect_on_retriable_publish_error = false\n\n[metrics]\ndetailed_queue_metrics = {}\nmax_detailed_series = {}\n\n[security]\nadmin_token_file = \"/run/secrets/rustqueue/admin-token\"\n{publish_token}registry_token_file = \"/run/secrets/rustqueue/registry-token\"\nconsole_token_file = \"/run/secrets/rustqueue/console-token\"\n{kodo_cleanup_token}console_management_enabled = {}\nkodo_cleanup_enabled = {}\n# secret: {secret_name}\n",
         cluster.spec.storage_feature_level,
+        cluster.spec.io_uring_enabled,
         cluster.spec.min_free_bytes,
         cluster.spec.disk_high_watermark_percent,
         cluster.spec.disk_low_watermark_percent,
@@ -668,6 +674,8 @@ mod tests {
                 storage_class_name: "ssd".into(),
                 storage_size: "100Gi".into(),
                 storage_feature_level: 1,
+                io_uring_enabled: false,
+                broker_seccomp_profile_path: None,
                 message_index_cache_bytes: 64 * 1024 * 1024,
                 maintenance_startup_delay_seconds: 30,
                 node_delivery_inflight_bytes: 512 * 1024 * 1024,
@@ -724,8 +732,11 @@ mod tests {
 
     #[test]
     fn renders_one_share_nothing_statefulset_and_retained_pvcs() {
+        let mut cluster = cluster();
+        cluster.spec.io_uring_enabled = true;
+        cluster.spec.broker_seccomp_profile_path = Some("rustqueue/io-uring.json".into());
         let resources = build(BuildInput {
-            cluster: &cluster(),
+            cluster: &cluster,
             replicas: 3,
             kodo_gateway_replicas: 0,
             advertise_kodo_gateways: false,
@@ -745,6 +756,7 @@ mod tests {
             .and_then(|data| data.get("rustqueue.toml"))
             .is_some_and(|config| {
                 config.contains("console_token_file")
+                    && config.contains("\nio_uring_enabled = true\n")
                     && config.contains("detailed_queue_metrics = false")
                     && config.contains("max_detailed_series = 1000")
                     && config.contains("publish_ack_mode = \"durable\"")
@@ -775,6 +787,22 @@ mod tests {
             json!([{"namespaceSelector": {}}])
         );
         let spec = resources.brokers.spec.unwrap();
+        let seccomp = spec
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .security_context
+            .as_ref()
+            .unwrap()
+            .seccomp_profile
+            .as_ref()
+            .unwrap();
+        assert_eq!(seccomp.type_, "Localhost");
+        assert_eq!(
+            seccomp.localhost_profile.as_deref(),
+            Some("rustqueue/io-uring.json")
+        );
         assert_eq!(spec.replicas, Some(3));
         assert_eq!(spec.service_name.as_deref(), Some("queue-brokers"));
         assert_eq!(spec.update_strategy.unwrap().type_, Some("OnDelete".into()));
@@ -1492,6 +1520,11 @@ mod tests {
         let resources_changed = render(&cluster, "queue-auth");
         assert_ne!(original, resources_changed);
         assert_ne!(resources_changed, render(&cluster, "replacement-auth"));
+        cluster.spec.io_uring_enabled = true;
+        let io_changed = render(&cluster, "queue-auth");
+        assert_ne!(resources_changed, io_changed);
+        cluster.spec.broker_seccomp_profile_path = Some("rustqueue/io-uring.json".into());
+        assert_ne!(io_changed, render(&cluster, "queue-auth"));
         assert_eq!(original.len(), 32);
     }
 }

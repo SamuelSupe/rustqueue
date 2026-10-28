@@ -82,12 +82,17 @@ async fn main() -> anyhow::Result<()> {
         message_index_cache_bytes: config.storage.message_index_cache_bytes,
         payload_read_workers: config.storage.payload_read_workers,
         payload_read_queue: config.storage.payload_read_queue,
+        io_uring_enabled: config.storage.io_uring_enabled,
         delivery_inflight_bytes: config.limits.node_delivery_inflight_bytes,
         delivery_inflight_messages: config.limits.node_delivery_inflight_messages,
         scrub_bytes_per_second: config.storage.scrub_bytes_per_second,
         storage_feature_level: config.storage.feature_level,
         require_management_fence_sync: config.security.console_management_enabled,
     })?);
+    tracing::info!(
+        io_uring_enabled = config.storage.io_uring_enabled,
+        "storage I/O initialized"
+    );
     loop {
         let reports = broker
             .expire_due_topics(usize::MAX)

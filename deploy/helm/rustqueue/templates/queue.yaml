@@ -23,6 +23,10 @@ spec:
   eligibleNodeSelector: {{ .Values.queue.eligibleNodeSelector | quote }}
   storageClassName: {{ .Values.queue.storageClassName | quote }}
   storageSize: {{ .Values.queue.storageSize | quote }}
+  ioUringEnabled: {{ .Values.queue.ioUringEnabled }}
+  {{- if .Values.queue.brokerSeccompProfilePath }}
+  brokerSeccompProfilePath: {{ .Values.queue.brokerSeccompProfilePath | quote }}
+  {{- end }}
   storageFeatureLevel: {{ ternary 2 .Values.queue.storageFeatureLevel .Values.queue.kodoCompatibility.enabled }}
   messageIndexCacheBytes: {{ .Values.queue.messageIndexCacheBytes | int64 }}
   maintenanceStartupDelaySeconds: {{ .Values.queue.maintenanceStartupDelaySeconds | int64 }}

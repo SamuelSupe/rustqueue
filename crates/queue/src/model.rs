@@ -101,6 +101,8 @@ pub(crate) struct MessageMeta {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BrokerStats {
+    #[serde(default)]
+    pub io_uring_enabled: bool,
     pub publish_group_commit: PublishGroupCommitStats,
     #[serde(default)]
     pub channel_group_commit: ChannelGroupCommitStats,

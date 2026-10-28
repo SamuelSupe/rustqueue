@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "release": "0.11.0",
+  "date": "2026-10-28",
+  "status": "exploratory_not_performance_qualification",
+  "comparison": "Initial optional io_uring implementation versus the final oversized-read-buffer optimization; io_uring enabled in both. This is not a v0.10.1 versus v0.11.0 comparison.",
+  "environment": {
+    "runtime": "OrbStack",
+    "architecture": "aarch64",
+    "rust": "1.88.0",
+    "server_cpu_set": "8-11",
+    "tcp_client_cpu_set": "12-15",
+    "publish_ack_mode": "durable"
+  },
+  "method": {
+    "read_pairs_per_case": 15,
+    "read_application_cache_bytes": 1,
+    "linux_page_cache": "retained",
+    "read_measurement": "fetch only; publish and body verification excluded; no FIN timing",
+    "tcp_pairs_per_case": 3,
+    "tcp_warmup_seconds": 5,
+    "tcp_measurement_seconds": 10,
+    "tcp_message_bytes": 1024
+  },
+  "results": [
+    {
+      "case": "read_1k_single",
+      "medians": {
+        "before": {
+          "read_messages_per_second": 42047.35894588339,
+          "fetch_p99_us": 39
+        },
+        "selected": {
+          "read_messages_per_second": 42794.315981846295,
+          "fetch_p99_us": 39
+        }
+      },
+      "median_throughput_change_percent": 1.7764660009306876,
+      "paired_change_median_percent": -5.906578479806591,
+      "positive_pairs": 6,
+      "pairs": 15
+    },
+    {
+      "case": "read_1k_batch64",
+      "medians": {
+        "before": {
+          "read_messages_per_second": 794457.899707691,
+          "fetch_p99_us": 115
+        },
+        "selected": {
+          "read_messages_per_second": 807145.2652843466,
+          "fetch_p99_us": 121
+        }
+      },
+      "median_throughput_change_percent": 1.5969840039760097,
+      "paired_change_median_percent": 3.3526924721396067,
+      "positive_pairs": 9,
+      "pairs": 15
+    },
+    {
+      "case": "read_4m_single",
+      "medians": {
+        "before": {
+          "read_messages_per_second": 1386.2775247027073,
+          "fetch_p99_us": 1015
+        },
+        "selected": {
+          "read_messages_per_second": 1499.861028501578,
+          "fetch_p99_us": 1146
+        }
+      },
+      "median_throughput_change_percent": 8.193417391169856,
+      "paired_change_median_percent": 6.042822952224203,
+      "positive_pairs": 11,
+      "pairs": 15
+    },
+    {
+      "case": "tcp_overlay_hot",
+      "medians": {
+        "before": {
+          "receive_messages_per_second": 5048.471556687931,
+          "pub_ack_p99_us": 9783,
+          "cpu_seconds": 5.21,
+          "peak_rss_kib": 93864
+        },
+        "selected": {
+          "receive_messages_per_second": 4107.923047129859,
+          "pub_ack_p99_us": 7575,
+          "cpu_seconds": 5.2299999999999995,
+          "peak_rss_kib": 80728
+        }
+      },
+      "median_throughput_change_percent": -18.630361664850557,
+      "paired_change_median_percent": -25.735013780266446,
+      "positive_pairs": 1,
+      "pairs": 3
+    },
+    {
+      "case": "tcp_volume_uncached",
+      "medians": {
+        "before": {
+          "receive_messages_per_second": 12630.705674465737,
+          "pub_ack_p99_us": 4779,
+          "cpu_seconds": 12.75,
+          "peak_rss_kib": 34344
+        },
+        "selected": {
+          "receive_messages_per_second": 12532.46075584886,
+          "pub_ack_p99_us": 4651,
+          "cpu_seconds": 12.01,
+          "peak_rss_kib": 35776
+        }
+      },
+      "median_throughput_change_percent": -0.7778260466910214,
+      "paired_change_median_percent": -0.7778260466910214,
+      "positive_pairs": 1,
+      "pairs": 3
+    }
+  ],
+  "delivery_integrity": {
+    "tcp_runs": 12,
+    "tcp_missing_messages": 0,
+    "tcp_duplicate_messages": 0,
+    "read_runs": 90,
+    "all_read_ids_and_bodies_verified": true
+  },
+  "limitations": [
+    "Shared OrbStack Linux VM on macOS; production storage and long-term operation were not qualified.",
+    "Linux page cache was retained. Read results measure fetch only, excluding publishing, FIN and body-verification time.",
+    "The 4 MiB read throughput median improved 8.2 percent; read p99 increased from 1015 to 1146 microseconds.",
+    "Single-hot-Topic TCP throughput median regressed 18.6 percent in the final short comparison; four-Topic throughput was approximately flat.",
+    "No universal throughput or tail-latency improvement is claimed. Default-off behavior is retained."
+  ]
+}

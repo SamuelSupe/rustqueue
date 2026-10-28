@@ -11,7 +11,8 @@ UI_COREPACK := rustqueue-console-corepack
 UI_DOCKER_ARGS ?=
 BUILD_VERSION ?=
 MAX_STORAGE_FEATURE_LEVEL ?=
-RUN := docker run --rm -e RUSTUP_TOOLCHAIN=1.88.0 -e CARGO_INCREMENTAL=0 \
+RUST_DOCKER_ARGS ?=
+RUN := docker run --rm $(RUST_DOCKER_ARGS) -e RUSTUP_TOOLCHAIN=1.88.0 -e CARGO_INCREMENTAL=0 \
 	-e RUSTQUEUE_BUILD_VERSION=$(BUILD_VERSION) \
 	-e RUSTQUEUE_MAX_STORAGE_FEATURE_LEVEL=$(MAX_STORAGE_FEATURE_LEVEL) \
 	-e PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -20,6 +21,14 @@ RUN := docker run --rm -e RUSTUP_TOOLCHAIN=1.88.0 -e CARGO_INCREMENTAL=0 \
 
 test:
 	$(RUN) cargo test --locked --workspace --features rustqueue-queue/crash-injection
+
+.PHONY: test-io-uring
+# Requires Linux/container policy permitting io_uring; never silently skips it.
+test-io-uring:
+	$(RUN) env RUSTQUEUE_TEST_IO_URING=1 cargo test --locked -p rustqueue-queue --lib payload_reader::
+	$(RUN) env RUSTQUEUE_TEST_IO_URING=1 cargo test --locked -p rustqueue-queue --lib io_backend::
+	$(RUN) env RUSTQUEUE_TEST_IO_URING=1 cargo test --locked -p rustqueue-queue --features crash-injection --test recovery --test crash_boundaries
+	$(RUN) cargo test --locked -p rustqueue-queue --test recovery io_uring_can_be_disabled -- --ignored
 
 check:
 	$(RUN) cargo check --locked --workspace --all-features

@@ -5,6 +5,12 @@ This comparison uses NSQ `v1.3.0`, the version used by
 durability and scheduling behavior: equal TCP commands do not imply equal work
 before an acknowledgement is returned.
 
+RustQueue also offers an opt-in [io_uring storage backend](io-uring.md).
+Compare it against the portable backend with the same acknowledgement mode,
+PVC, cache limits, payload distribution, producer/consumer counts, and CPU
+allocation. Record `rustqueue_io_uring_enabled` with results; an io_uring
+comparison must not change the durability profile.
+
 ## What RustQueue 0.8.3 changes
 
 RustQueue now keeps each Channel's in-flight deadlines in an ordered index.

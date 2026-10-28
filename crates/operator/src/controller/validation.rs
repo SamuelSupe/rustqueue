@@ -62,6 +62,15 @@ pub(super) fn validate(cluster: &RustQueue, active_feature_floor: u32) -> anyhow
     if cluster.spec.storage_feature_level == 0 {
         bail!("storageFeatureLevel must be greater than zero");
     }
+    if let Some(profile) = &cluster.spec.broker_seccomp_profile_path {
+        if profile.is_empty()
+            || profile
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            bail!("brokerSeccompProfilePath must be a relative node-local profile path without traversal");
+        }
+    }
     if cluster.spec.disk_low_watermark_percent >= cluster.spec.disk_high_watermark_percent
         || cluster.spec.disk_high_watermark_percent > 100
     {
@@ -357,6 +366,17 @@ mod tests {
         }))
         .unwrap();
 
+        assert!(validate(&cluster, 2).is_ok());
+        for path in [
+            "/absolute.json",
+            "../outside.json",
+            "nested/../outside.json",
+            "",
+        ] {
+            cluster.spec.broker_seccomp_profile_path = Some(path.into());
+            assert!(validate(&cluster, 2).is_err());
+        }
+        cluster.spec.broker_seccomp_profile_path = Some("rustqueue/io-uring.json".into());
         assert!(validate(&cluster, 2).is_ok());
         cluster.spec.broker_resources.cpu_request = "999m".into();
         assert!(validate(&cluster, 2)

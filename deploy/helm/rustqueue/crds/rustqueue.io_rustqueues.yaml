@@ -39,6 +39,8 @@ spec:
                 storageClassName: {type: string, default: local-path}
                 storageSize: {type: string, default: 100Gi}
                 storageFeatureLevel: {type: integer, format: int32, minimum: 1, default: 1}
+                ioUringEnabled: {type: boolean, default: false}
+                brokerSeccompProfilePath: {type: string, minLength: 1}
                 messageIndexCacheBytes: {type: integer, format: int64, minimum: 1, default: 67108864}
                 maintenanceStartupDelaySeconds: {type: integer, format: int64, minimum: 0, maximum: 3600, default: 30}
                 nodeDeliveryInflightBytes: {type: integer, format: int64, minimum: 1, maximum: 4294967295, default: 536870912}

@@ -8,8 +8,64 @@ fn config(path: &std::path::Path) -> BrokerConfig {
         node_id: 37,
         max_segment_bytes: 256,
         max_message_bytes: 1024,
+        io_uring_enabled: std::env::var_os("RUSTQUEUE_TEST_IO_URING").is_some(),
         bootstrap_retention: Duration::from_secs(60),
         ..BrokerConfig::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux with io_uring permitted; exercised by make test-io-uring"]
+async fn io_uring_can_be_disabled_across_restart_without_changing_delivery_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cfg = config(root.path());
+    cfg.io_uring_enabled = true;
+    cfg.entry_cache_bytes = 1;
+    let broker = Broker::open(cfg.clone()).unwrap();
+    assert!(broker.stats().unwrap().io_uring_enabled);
+    broker.create_channel("events", "a").await.unwrap();
+    broker.create_channel("events", "b").await.unwrap();
+    let ids = broker
+        .publish(
+            "events",
+            vec![b"one".to_vec(), b"two".to_vec()],
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    for channel in ["a", "b"] {
+        let delivered = broker
+            .fetch_batch("events", channel, 2, 1024, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|message| message.body.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"one".as_slice(), b"two".as_slice()]
+        );
+    }
+    let (a, b) = tokio::join!(
+        broker.finish("events", "a", ids[0]),
+        broker.finish("events", "b", ids[0])
+    );
+    a.unwrap();
+    b.unwrap();
+    drop(broker);
+
+    cfg.io_uring_enabled = false;
+    let broker = Broker::open(cfg).unwrap();
+    assert!(!broker.stats().unwrap().io_uring_enabled);
+    for channel in ["a", "b"] {
+        let delivered = broker
+            .fetch_batch("events", channel, 2, 1024, Duration::ZERO, None)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].id, ids[1]);
+        assert_eq!(delivered[0].body.as_ref(), b"two");
     }
 }
 

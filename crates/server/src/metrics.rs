@@ -86,7 +86,9 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
     let channel_ack_gap = stats.aggregate.channel_ack_gap;
     let sync_lag_seconds = stats.aggregate.sync_lag_ms as f64 / 1_000.0;
     let mut output = format!(
-        "# TYPE rustqueue_publish_group_commits_total counter\n\
+        "# TYPE rustqueue_io_uring_enabled gauge\n\
+         rustqueue_io_uring_enabled {}\n\
+         # TYPE rustqueue_publish_group_commits_total counter\n\
          rustqueue_publish_group_commits_total {}\n\
          # TYPE rustqueue_publish_group_requests_total counter\n\
          rustqueue_publish_group_requests_total {}\n\
@@ -140,6 +142,7 @@ pub fn render_broker(stats: &BrokerStats, config: &MetricsConfig) -> String {
          rustqueue_delivery_budget_waiters {}\n\
          # TYPE rustqueue_delivery_budget_waits_total counter\n\
          rustqueue_delivery_budget_waits_total {}\n",
+        u8::from(stats.io_uring_enabled),
         stats.publish_group_commit.commits,
         stats.publish_group_commit.requests,
         stats.publish_group_commit.max_batch_requests,

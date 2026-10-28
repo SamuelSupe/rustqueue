@@ -1,7 +1,7 @@
 # RustQueue format v7 share-nothing architecture
 
 Status: accepted implementation contract
-Target release: 0.10.0
+Target release: 0.11.0
 Data format: v7, clean directories only
 
 ## 1. Goal
@@ -455,6 +455,13 @@ write an audit record. There is no quorum because there is no replica.
 Reader references are acquired while holding the topic lock. GC, protective
 eviction, and topic deletion inspect those leases under the same lock order, so
 a segment cannot disappear between delivery reservation and payload read.
+
+Linux Brokers may opt into `storage.io_uring_enabled` for concurrent coalesced
+payload reads and multi-Channel WAL syncs. Single contiguous reads and
+single-file syncs keep the portable path. Submitted I/O retains the same
+reader leases, byte budgets, commit gates, CRC checks, and durability boundary.
+The setting changes neither the disk format nor recovery behavior; see
+[io_uring configuration and validation](io-uring.md).
 
 The normal GC retention plan uses sealed-segment timestamp, message-ID,
 position, and log-index summaries plus the bounded active tail. It does not

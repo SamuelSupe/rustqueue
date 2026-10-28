@@ -5,6 +5,14 @@ fn example_configuration_is_valid() {
     let config: Config =
         toml::from_str(include_str!("../../../../rustqueue.example.toml")).unwrap();
     config.validate().unwrap();
+    assert!(!config.storage.io_uring_enabled);
+}
+
+#[test]
+fn io_uring_configuration_is_opt_in_and_linux_only() {
+    let config: Config = toml::from_str("[storage]\nio_uring_enabled = true").unwrap();
+    assert!(config.storage.io_uring_enabled);
+    assert_eq!(config.validate().is_ok(), cfg!(target_os = "linux"));
 }
 
 #[test]
